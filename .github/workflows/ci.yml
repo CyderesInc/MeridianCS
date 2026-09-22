@@ -1,0 +1,78 @@
+# The offline suite has been CI-safe by design since its first commit (deterministic, no network,
+# exit 0/1) — but nothing ran it automatically, and that is exactly how v2.7.0 shipped broken: the
+# frontmatter length check existed, and no merge ever executed it. This workflow closes that gap.
+#
+# Both OSes on purpose: the suite has platform-conditional paths that a single runner never
+# exercises — POSIX 0600 permission assertions and fcntl locking run only on Linux; the msvcrt
+# byte-range lock, cp1252 console handling, and Windows path behavior run only on Windows.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  offline-suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Offline test suite
+        run: python evals/test_connect.py
+
+  docs-pii:
+    # The three PDFs ship inside the package and one of them goes to customers, so a real name,
+    # stack FQDN or IP reaching a generator is a data-handling incident rather than a typo. This was
+    # a manual pre-regeneration step, and a manual step that has to be remembered every time is one
+    # that eventually isn't. The script reads generator SOURCE, never the PDF: Chrome subsets the
+    # embedded brand fonts, so a grep over the finished PDF passes silently whatever the page says.
+    #
+    # Now repo-wide, not just the three generators. The narrow scope was not enough: a sweep over
+    # every tracked text file found a real demo-stack username, a real asset id, and rendered
+    # demo-tenant data in SKILL.md's own example -- which ships in every release. All of it sat in
+    # files this job never opened. Licence compliance (LICENSE/NOTICE/OFL texts present in the
+    # package) and SBOM currency are asserted by the offline suite above, on both OSes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Documentation generators carry no real identifiers
+        run: python scripts/check-docs-pii.py
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pre-commit/action@v3.0.1
+
+  package:
+    # The zip is how anyone outside a working tree gets the skill, so a PR that breaks the build
+    # or its determinism should fail here, not at release time. The version is a placeholder;
+    # real releases still build locally per CLAUDE.md and verify against the published asset.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Package builds and is deterministic
+        run: |
+          python scripts/make-package.py --version 0.0.0
+          sha1=$(sha256sum meridiancs.v0.0.0.skill.zip | cut -d' ' -f1)
+          mv meridiancs.v0.0.0.skill.zip /tmp/first.zip
+          python scripts/make-package.py --version 0.0.0
+          sha2=$(sha256sum meridiancs.v0.0.0.skill.zip | cut -d' ' -f1)
+          echo "build1=$sha1  build2=$sha2"
+          test "$sha1" = "$sha2"

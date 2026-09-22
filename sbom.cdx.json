@@ -1,0 +1,200 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "bom-ref": "meridiancs",
+      "name": "meridiancs",
+      "description": "Claude Code skill providing a natural-language interface to a Meridian (formerly Lucidum) stack via its API v2. Contains no third-party source code; the implementation depends only on the Python 3 standard library. The only redistributed third-party artifacts are the four SIL OFL 1.1 font binaries listed in this document.",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "copyright": "Copyright 2026 Cyderes",
+      "supplier": {
+        "name": "Cyderes"
+      }
+    },
+    "supplier": {
+      "name": "Cyderes"
+    },
+    "licenses": [
+      {
+        "license": {
+          "id": "Apache-2.0"
+        }
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "file",
+      "bom-ref": "assets/fonts/SpaceGrotesk-Regular.ttf",
+      "name": "assets/fonts/SpaceGrotesk-Regular.ttf",
+      "description": "Space Grotesk font binary, embedded as a data URI in generated PDF reports.",
+      "copyright": "Copyright 2020 The Space Grotesk Project Authors",
+      "licenses": [
+        {
+          "license": {
+            "id": "OFL-1.1",
+            "url": "https://openfontlicense.org"
+          }
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "637578d47b0e70e02b3eb5056847dd9add17bd683234d28f5d11a6cf66ff2725"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/floriankarsten/space-grotesk"
+        },
+        {
+          "type": "license",
+          "url": "https://github.com/floriankarsten/space-grotesk",
+          "comment": "Full licence text redistributed with this software at assets/fonts/SpaceGrotesk-OFL.txt"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "assets/fonts/SpaceGrotesk-Medium.ttf",
+      "name": "assets/fonts/SpaceGrotesk-Medium.ttf",
+      "description": "Space Grotesk font binary, embedded as a data URI in generated PDF reports.",
+      "copyright": "Copyright 2020 The Space Grotesk Project Authors",
+      "licenses": [
+        {
+          "license": {
+            "id": "OFL-1.1",
+            "url": "https://openfontlicense.org"
+          }
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d8135bce6603398f3d0cdb478a018d7fa869b0168d037a9408cad23e030bfa7a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/floriankarsten/space-grotesk"
+        },
+        {
+          "type": "license",
+          "url": "https://github.com/floriankarsten/space-grotesk",
+          "comment": "Full licence text redistributed with this software at assets/fonts/SpaceGrotesk-OFL.txt"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "assets/fonts/SpaceGrotesk-Bold.ttf",
+      "name": "assets/fonts/SpaceGrotesk-Bold.ttf",
+      "description": "Space Grotesk font binary, embedded as a data URI in generated PDF reports.",
+      "copyright": "Copyright 2020 The Space Grotesk Project Authors",
+      "licenses": [
+        {
+          "license": {
+            "id": "OFL-1.1",
+            "url": "https://openfontlicense.org"
+          }
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8fb63865c6afd083723dc1775548306b7751f20397bebcb79646032c598c81b9"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/floriankarsten/space-grotesk"
+        },
+        {
+          "type": "license",
+          "url": "https://github.com/floriankarsten/space-grotesk",
+          "comment": "Full licence text redistributed with this software at assets/fonts/SpaceGrotesk-OFL.txt"
+        }
+      ]
+    },
+    {
+      "type": "file",
+      "bom-ref": "assets/fonts/SpaceMono-Regular.ttf",
+      "name": "assets/fonts/SpaceMono-Regular.ttf",
+      "description": "Space Mono font binary, embedded as a data URI in generated PDF reports.",
+      "copyright": "Copyright 2016 The Space Mono Project Authors",
+      "licenses": [
+        {
+          "license": {
+            "id": "OFL-1.1",
+            "url": "https://openfontlicense.org"
+          }
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "508a2a382b46a55be24d9edb70ce7d59be695cd5808e641fda24c40864b0d5d2"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/googlefonts/spacemono"
+        },
+        {
+          "type": "license",
+          "url": "https://github.com/googlefonts/spacemono",
+          "comment": "Full licence text redistributed with this software at assets/fonts/SpaceMono-OFL.txt"
+        }
+      ]
+    },
+    {
+      "type": "platform",
+      "bom-ref": "prereq/python3",
+      "name": "Python",
+      "version": ">=3.8",
+      "scope": "required",
+      "description": "Interpreter for scripts/meridian.py. Standard library only -- this software installs no Python packages and has no dependency manifest.",
+      "licenses": [
+        {
+          "license": {
+            "id": "PSF-2.0"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://www.python.org/"
+        }
+      ]
+    },
+    {
+      "type": "application",
+      "bom-ref": "prereq/chromium",
+      "name": "Chromium-based browser",
+      "scope": "optional",
+      "description": "Google Chrome or Microsoft Edge, invoked as an external process for HTML-to-PDF rendering in the `report` verb. Never bundled; without one, reports fall back to HTML output.",
+      "licenses": [
+        {
+          "license": {
+            "name": "NOASSERTION -- vendor's own terms; not redistributed by this project"
+          }
+        }
+      ]
+    }
+  ],
+  "serialNumber": "urn:uuid:b3862eaf-0475-5ac2-b452-e4a54fb4d157"
+}

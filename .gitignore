@@ -1,0 +1,35 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Built skill package — distribute via a GitHub Release, not in source
+*.skill.zip
+
+# Local Meridian credentials / cached state (live in ~/.meridian, but guard anyway)
+.meridian/
+config.json
+.ratelimit
+fields.*.json
+
+# Sensitive: generated risk-profile PDFs (contain personal data — never commit)
+*.pdf
+# The report verb's HTML fallback (no browser / conversion failed) and its print-to-PDF temp file
+# carry the exact same personal data as the PDF, so they get the exact same rule. No exceptions
+# needed: nothing HTML is committed.
+*.html
+# ...except these three, which are documentation and contain no stack data. Regenerate with
+# `python scripts/make-guide.py` / `make-impact.py` / `make-brief.py`; keep them free of real names
+# (use <person>). The brief and the guide ship to customers, so that rule is not optional there.
+!Cyderes-Meridian-Skill-Guide.pdf
+!Cyderes-Meridian-Skill-Enhancements.pdf
+!Cyderes-MeridianCS-Brief.pdf
+
+# Local tool venv (see CLAUDE.md Testing). Not ignoring it would let a venv be committed,
+# and make-package.py packages `git ls-files` -- it would ship inside a customer skill.
+.venv*/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~

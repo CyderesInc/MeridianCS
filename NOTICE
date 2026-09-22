@@ -1,0 +1,95 @@
+meridiancs — a Claude Code skill for the Meridian (Lucidum) API v2
+Copyright 2026 Cyderes
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+================================================================================
+AUTHORSHIP
+================================================================================
+
+This software was developed by Cyderes personnel with the assistance of AI
+coding tools. Commits in the development history carry a "Co-Authored-By"
+trailer naming an AI assistant; that records the tool assistance and does not
+denote a third-party author or confer any third-party rights. Copyright in the
+work is held by Cyderes.
+
+Public distributions of this software are derived snapshots, built by
+scripts/make-public.py from the repository the work was authored in, and do
+not carry that development history. The paragraph above describes that
+repository; it is not a claim about the commit log shipped alongside it.
+
+
+================================================================================
+TRADEMARKS
+================================================================================
+
+The Apache License, Version 2.0 grants copyright and patent rights. It does NOT
+grant any right to use the trade names, trademarks, service marks, or product
+names of the licensor (section 6). Nothing in this repository should be read as
+such a grant.
+
+"Cyderes", "Meridian" and "Lucidum", together with their associated wordmarks
+and logos, are trademarks of Cyderes. Cyderes acquired Lucidum by merger in
+October 2025 and holds sole and exclusive title to the Lucidum marks and the
+goodwill associated with them. Meridian is the name under which Cyderes
+delivers the platform formerly branded Lucidum. This software is a first-party
+client for that platform, published by the owner of the platform and of these
+marks.
+
+Redistributing this software, modified or unmodified, conveys no right to use
+the Cyderes, Meridian or Lucidum names or marks — to name a derivative work, to
+describe a product or service, or in any manner suggesting that Cyderes
+endorses it.
+
+Cyderes brand assets — wordmark artwork and the Cyderes Brand Style Guide
+palette and typography — are NOT licensed for redistribution or reuse under the
+Apache License and are excluded from public distributions of this project. The
+reason is authenticity rather than licensing: with the wordmarks present,
+anyone could generate an authentic-looking Cyderes-branded risk report. A build
+produced without them falls back to neutral, unbranded styling; see
+scripts/make-public.py.
+
+
+================================================================================
+THIRD-PARTY COMPONENTS
+================================================================================
+
+This distribution contains no third-party source code. The implementation
+depends only on the Python 3 standard library.
+
+The following font binaries are redistributed under the SIL Open Font License,
+Version 1.1, which permits bundling, embedding, and redistribution. The full
+license text accompanies each font, as OFL section 2 requires.
+
+  Space Grotesk (Regular, Medium, Bold)
+    assets/fonts/SpaceGrotesk-Regular.ttf
+    assets/fonts/SpaceGrotesk-Medium.ttf
+    assets/fonts/SpaceGrotesk-Bold.ttf
+    Copyright 2020 The Space Grotesk Project Authors
+    https://github.com/floriankarsten/space-grotesk
+    License: SIL OFL 1.1 — assets/fonts/SpaceGrotesk-OFL.txt
+
+  Space Mono (Regular)
+    assets/fonts/SpaceMono-Regular.ttf
+    Copyright 2016 The Space Mono Project Authors
+    https://github.com/googlefonts/spacemono
+    License: SIL OFL 1.1 — assets/fonts/SpaceMono-OFL.txt
+
+Neither font declares a Reserved Font Name, so OFL section 3 imposes no naming
+restriction on derivatives here. Both are redistributed unmodified.
+
+The OFL applies to the font files only. It is not a copyleft license over this
+project's source, and it places no restriction on documents these fonts are
+embedded in — see the OFL preamble and section 5.
+
+
+================================================================================
+RUNTIME PREREQUISITES (not redistributed)
+================================================================================
+
+  Python 3.8+          Python Software Foundation License — required
+  Chromium browser     vendor's own license — optional, HTML-to-PDF rendering
+                       only; invoked as an external process, never bundled
+
+A machine-readable inventory of the above is in sbom.cdx.json (CycloneDX).

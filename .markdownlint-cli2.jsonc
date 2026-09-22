@@ -1,0 +1,15 @@
+{
+  "config": {
+    "default": true,
+    "MD013": false, // long-form prose lines are intentional, see above
+    "MD025": false, // design/trends.md legitimately runs two top-level sections
+    "MD028": false, // adjacent-but-distinct blockquote callouts (SKILL.md, README.md)
+    "MD033": false, // inline HTML used deliberately in a few places
+    "MD041": false, // references/welcome.md is echoed verbatim at launch: a heading would
+                    // be displayed to the user, and the file must hold only the greeting
+    "MD049": false, // emphasis style is mixed intentionally
+    "MD060": false // table column style not worth enforcing here
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["node_modules"]
+}
