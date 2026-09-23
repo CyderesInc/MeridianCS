@@ -143,7 +143,7 @@ stores. **There is no backfill** — a trend can only answer what was already be
   not the timer; per-OS setup and gotchas in `references/scheduling.md`):
 
   ```bash
-  python scripts/meridian.py digest --snapshot > digest.json
+  python scripts/meridian.py digest --snapshot > <out-dir>/digest.json
   ```
 
   It appends to the history at **zero extra API calls**, and `digest.json` still pipes to `report`.
@@ -192,11 +192,14 @@ stores. **There is no backfill** — a trend can only answer what was already be
 
 ## Reports (branded PDF)
 
+`<scratch>` is the session scratchpad (intermediate JSON) and `<out-dir>` the user's own folder
+(the deliverable). Neither may be the skill folder: self-update deletes whatever is saved there.
+
 - "Give me a PDF of the top 10 riskiest assets" →
 
   ```bash
-  python scripts/meridian.py top --table asset --field Risk_Score --top 10 --select "Asset_Name,Risk_Score,Risk_Level,IP_Address,OS,Count_KEV" > top.json
-  python scripts/meridian.py report --input top.json --out "Cyderes-Top10-Assets.pdf" --title "Top 10 Riskiest Assets" --date <today>
+  python scripts/meridian.py top --table asset --field Risk_Score --top 10 --select "Asset_Name,Risk_Score,Risk_Level,IP_Address,OS,Count_KEV" > <scratch>/top.json
+  python scripts/meridian.py report --input <scratch>/top.json --out "<out-dir>/Cyderes-Top10-Assets.pdf" --title "Top 10 Riskiest Assets" --date <today>
   ```
 
 - Works for `list` and `summary` output too — pipe the JSON to `report`. Add `--html` for HTML instead of PDF.
@@ -213,15 +216,15 @@ stores. **There is no backfill** — a trend can only answer what was already be
 - "Send me a weekly posture report" →
 
   ```bash
-  python scripts/meridian.py digest > digest.json
-  python scripts/meridian.py report --input digest.json --out "Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"
+  python scripts/meridian.py digest > <scratch>/digest.json
+  python scripts/meridian.py report --input <scratch>/digest.json --out "<out-dir>/Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"
   ```
 
   Drive it from Task Scheduler (Windows), `launchd` (macOS), `cron`/`systemd` (Linux), or Claude Code
   scheduling — the skill provides the one command, not the timer; see `references/scheduling.md` for
   per-OS setup and the silent-failure gotchas each one has.
-- "Give me that in Excel" → add `--format csv --out <file>.csv` to `top` / `list` / `summary`. The JSON envelope still prints — pass on its `truncated` / `complete` / `unaccountedRecords` rather than letting the file imply the set is whole.
-- "Export everything matching X" → `meridian.py list --table asset --where "<clause>" --all --format csv --out x.csv`
+- "Give me that in Excel" → add `--format csv --out <out-dir>/<file>.csv` to `top` / `list` / `summary`. The JSON envelope still prints — pass on its `truncated` / `complete` / `unaccountedRecords` rather than letting the file imply the set is whole.
+- "Export everything matching X" → `meridian.py list --table asset --where "<clause>" --all --format csv --out <out-dir>/x.csv`
 
 ## Operations
 

@@ -212,8 +212,11 @@ python scripts/meridian.py alerts notify --force              # send even if not
   `_SMTP_USER`, `_SMTP_PASS`, `_STARTTLS`).
 - **The Meridian token never reaches a third-party URL**: delivery does not go through the API
   transport at all — no Authorization header, no pooled connection.
-- The Teams payload shape is **unverified** against a current Teams webhook; confirm it against a real
-  flow before relying on it.
+- **Teams expects a Workflows webhook** (Microsoft retired the old connector webhooks), and the
+  payload is the one its default template needs: a `message` with an Adaptive Card in `attachments`.
+  That template accepts any other body with **HTTP 202 and posts nothing**, so a 202 is not proof of
+  delivery — the card appearing in the channel is. The shape is Microsoft's documented one but still
+  **unverified** against a live flow.
 
 Running this on a schedule (and the heartbeat-log pattern for noticing a job that stopped) is in
 [scheduling.md](scheduling.md).
@@ -240,7 +243,7 @@ Code, and a daemon inside a CLI would be the wrong place for it. `digest` exists
 is a single command:
 
 ```bash
-python scripts/meridian.py digest > digest.json &&   python scripts/meridian.py report --input digest.json --out "Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"
+python scripts/meridian.py digest > "$HOME/meridian-reports/digest.json" && python scripts/meridian.py report --input "$HOME/meridian-reports/digest.json" --out "$HOME/meridian-reports/Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"
 ```
 
 Full per-OS setup (Windows Task Scheduler, macOS `launchd`, Linux `cron`/`systemd`) and the

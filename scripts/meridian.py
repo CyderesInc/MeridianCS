@@ -1110,6 +1110,30 @@ def out_path_problem(path, suffixes):
     return None
 
 
+def out_in_skill_dir(path):
+    """A warning when an output file would land inside the skill's own folder, else None.
+
+    The commands in SKILL.md run from the skill folder (`python scripts/meridian.py`), so every
+    relative `--out` lands in it -- and self-update moves every entry out of that folder and deletes
+    the old tree, so a report or export saved there is gone at the next update, silently. Until then
+    it is customer PII in a directory that is a git working tree on a maintainer's machine.
+
+    A warning, not a refusal: the scheduling recipes shipped through v2.25.0 `cd` into the skill
+    folder and write there, and a refusal would turn a scheduled job that loses old reports into one
+    that produces none. The model reads stderr and moves the file; a scheduled job keeps running.
+    """
+    try:
+        target = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        root = os.path.normcase(INSTALL_REAL)
+        if os.path.commonpath([target, root]) != root:
+            return None
+    except ValueError:      # different drives on Windows: certainly not inside
+        return None
+    return ("warning: --out %r is inside the skill folder (%s). Self-update replaces that folder and "
+            "deletes anything saved in it, and customer data does not belong there. Write outputs to "
+            "the user's own folder instead." % (path, INSTALL_DIR))
+
+
 def emit(payload, rowkey, fmt=None, out_path=None):
     """Print a verb's result as JSON, or write its rows as CSV.
 
@@ -1179,6 +1203,13 @@ def _is_credential_endpoint(endpoint):
     the spelling that happens to work is a guard that fails open the day the server relaxes. Empty
     path segments are dropped for the same reason (`connector//profile`).
     """
+    return _canonical_path(endpoint) in _CREDENTIAL_ENDPOINTS
+
+
+def _canonical_path(endpoint):
+    """The endpoint's path the way the server will read it: decoded, lower-cased, no empty or dot
+    segments, no query. Both `api` guards compare this, never the raw argument -- see
+    _is_credential_endpoint for the spellings that got past a raw comparison."""
     path = _normalize_endpoint(endpoint).split("?", 1)[0].split("#", 1)[0]
     for _ in range(3):
         nxt = urllib.parse.unquote(path)
@@ -1186,7 +1217,33 @@ def _is_credential_endpoint(endpoint):
             break
         path = nxt
     path = "/" + "/".join(seg for seg in path.split("/") if seg not in ("", "."))
-    return path.rstrip("/").lower() in _CREDENTIAL_ENDPOINTS
+    return path.rstrip("/").lower()
+
+
+# POST is how this API takes a read query, so a POST is not by itself a write. These are the ones
+# that change nothing; every other POST, and every PUT/PATCH/DELETE, can change the stack.
+_READ_POST_ENDPOINTS = ("/cmdb/v2/data/cmdb", "/cmdb/v2/data/ldg", "/cmdb/v2/smartlabel/search")
+
+
+def api_write_problem(method, endpoint, allow_write=False):
+    """Why this `api` call needs --allow-write, or None if it can run as-is.
+
+    SKILL.md and api-reference.md both said "POST/PUT/DELETE change the stack -- confirm with the
+    user first", and nothing enforced it: `api -X PUT CMDB/v2/connector/profile/service` disables a
+    connector's services in one call, and `api -X DELETE` removes whatever it names. A flag the
+    caller has to add is what turns that sentence into a step -- the model cannot reach the write
+    without deciding to, and the refusal says what to confirm. Reads stay unflagged: GET, HEAD, and
+    the POSTs in _READ_POST_ENDPOINTS, compared canonically so a spelling cannot turn a write into a
+    "read". Unknown POSTs count as writes; the cost of that is one extra flag on a read nobody has
+    listed yet, and the cost of the other default is an unconfirmed change to a customer's stack.
+    """
+    m = (method or "GET").upper()
+    if allow_write or m in ("GET", "HEAD"):
+        return None
+    if m == "POST" and _canonical_path(endpoint) in _READ_POST_ENDPOINTS:
+        return None
+    return ("`api -X %s %s` can change the stack. Confirm this specific change with the user, then "
+            "re-run with --allow-write." % (m, endpoint))
 
 
 def cmd_api(a):
@@ -1198,6 +1255,9 @@ def cmd_api(a):
     if _is_credential_endpoint(a.endpoint):
         die("That endpoint returns connector credentials (service accounts, hosts, config secrets). "
             "Use `connectors`, which reads it through a credential-stripping allow-list.")
+    problem = api_write_problem(a.method, a.endpoint, getattr(a, "allow_write", False))
+    if problem:
+        die(problem, 2)
     body = None
     if a.body_file:
         with open(a.body_file, encoding="utf-8-sig") as f:
@@ -4147,25 +4207,56 @@ def render_alerts_slack(v):
     return {"text": "\n".join(lines)}
 
 
-def render_alerts_teams(v):
-    """Payload for a Teams webhook.
+def _teams_esc(s):
+    """Neutralise Adaptive Card markdown links in text that came from the customer's environment.
 
-    Microsoft retired the legacy Office 365 Connector MessageCard format; a Teams "webhook" today is
-    almost always a Power Automate flow triggered by "When a Teams webhook request is received", whose
-    Adaptive Card layout is authored inside the flow, not dictated by whatever posts to it -- there is
-    no fixed schema to target. So this sends the same {title, text} shape as Slack, the two fields
-    most such flow templates expect to map onto the card, rather than fabricating a MessageCard shape
-    Teams may simply reject. UNVERIFIED against a real flow -- confirm the actual card mapping once one
-    exists; this is one pure function to adjust, nothing else in the pipeline needs to change.
+    A TextBlock renders markdown, so a connector named `[Reset your password](https://…)` would arrive
+    as a clickable link inside an alert -- in the one message a team is primed to act on. Breaking the
+    `](` adjacency is enough: the text still reads the same, and no link forms.
+    """
+    return str(s).replace("](", "] (")
+
+
+def render_alerts_teams(v):
+    """Payload for a Teams Workflows webhook: a `message` with one Adaptive Card attachment.
+
+    Microsoft retired the Office 365 Connector webhooks; a Teams webhook today is a Workflows (Power
+    Automate) flow on the "When a Teams webhook request is received" trigger. Its default template,
+    "Post to a channel when a webhook request is received", loops over `attachments` and posts each one
+    with "Post card in a chat or channel" -- so a body without them is accepted with **HTTP 202 and
+    posts nothing**. That is what the first version sent (`{title, text}`, a guess made before any flow
+    existed): every Teams alert would have been recorded as delivered, and because delivery is
+    on-change only, never retried. The envelope below is the shape Microsoft documents for this
+    trigger (Teams platform docs, "Create an Incoming Webhook") and the one its Q&A answers give for
+    the silent-202 case. A top-level `text` is kept for a flow built from scratch that reads that field
+    instead -- the template ignores it.
+
+    Still not verified against a live flow, and it cannot be from here: that needs a Teams channel
+    with a Workflows webhook. A 202 is also not proof of a post -- the trigger acknowledges before the
+    flow runs -- so the check is the card appearing in the channel.
     """
     head, span = _alert_head_span(v)
-    body = ["%s *%s* — %s" % (dot, rule, text) for kind, dot, rule, text in _alert_rows(v)]
+    headline = "%s%s" % (" · ".join(head), span)
+    blocks = [{"type": "TextBlock", "text": headline, "weight": "Bolder", "size": "Medium", "wrap": True}]
+    lines = []
+    for kind, dot, rule, text in _alert_rows(v):
+        line = "%s **%s** — %s" % (dot, _teams_esc(rule), _teams_esc(text))
+        lines.append(line)
+        blocks.append({"type": "TextBlock", "text": line, "wrap": True})
+    notes = []
     if v.get("coverageChanged"):
-        body.append("⚠️ Connector health changed across this window; judge relevance before reading "
-                    "any movement as real.")
+        notes.append("⚠️ Connector health changed across this window; judge relevance before reading "
+                     "any movement as real.")
     if v.get("note"):
-        body.append(v["note"])
-    return {"title": "%s%s" % (" · ".join(head), span), "text": "\n\n".join(body)}
+        notes.append(_teams_esc(v["note"]))
+    for n in notes:
+        blocks.append({"type": "TextBlock", "text": n, "wrap": True, "isSubtle": True})
+    card = {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
+            "version": "1.4", "body": blocks, "msteams": {"width": "Full"}}
+    return {"type": "message",
+            "text": "\n\n".join([headline] + lines + notes),
+            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive",
+                             "contentUrl": None, "content": card}]}
 
 
 def render_alerts_email(v):
@@ -4902,6 +4993,33 @@ def _sev_class(level):
     return "s-low"
 
 
+def _which_trusted(name):
+    """`shutil.which(name)` without the two ways it runs a file someone left in a folder.
+
+    On Windows `shutil.which` searches the CURRENT directory before PATH, and tries every PATHEXT
+    extension -- so a `chrome.bat` in whatever folder the assistant's shell is in was found as the
+    browser, and `report` executed it with a PDF path as its argument. Verified with Python 3.14:
+    `_find_browser()` returned `.\\chrome.BAT`. (It hid on the maintainer's machine because the
+    assistant's shell sets NoDefaultCurrentDirectoryInExePath=1, which suppresses the cwd search; an
+    ordinary shell does not.) A `.bat`/`.cmd` also runs through cmd.exe, whose argument parsing is
+    its own injection surface.
+
+    So: only absolute PATH entries (an empty or relative one means "the current directory" by
+    another name), and on Windows only `.exe`. No browser ships as a batch file, so nothing real is
+    lost.
+    """
+    exts = (".exe",) if os.name == "nt" else ("",)
+    for d in os.get_exec_path():
+        d = d.strip().strip('"')
+        if not d or not os.path.isabs(d):
+            continue
+        for ext in exts:
+            cand = os.path.join(d, name + ext)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+    return None
+
+
 def _find_browser():
     """Locate a Chromium binary for print-to-PDF.
 
@@ -4912,10 +5030,9 @@ def _find_browser():
     adding --no-first-run/--disable-extensions/--disable-sync and friends measured 2557ms against
     2551ms. Only a persistent browser process would move it, and that means a daemon.
     """
-    import shutil
     found = None
     for c in ["chrome", "google-chrome", "chromium", "chromium-browser", "msedge", "microsoft-edge"]:
-        found = shutil.which(c)
+        found = _which_trusted(c)
         if found:
             break
     if not found:
@@ -5550,8 +5667,13 @@ def _digest_html(data):
     brk = data.get("breakdown") or {}
     sec = []
 
+    # Escaped, because everything this formats lands in HTML that nothing else escapes: the stat
+    # cards interpolate it raw and _simple_table does not escape cells. A number is safe; anything
+    # else is whatever the API returned, and a string there was injected into the report verbatim.
     def n(v):
-        return "{:,}".format(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else (v if v is not None else "—")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return "{:,}".format(v)
+        return "—" if v is None else _esc(v)
 
     # A digest is read unattended, so the arrow matters: it is the only thing that says direction.
     def delta(now, avg):
@@ -5585,11 +5707,12 @@ def _digest_html(data):
                   _esc(_short(f.get("message"), 90))] for f in fails[:6]]))
 
     if brk.get("groups"):
-        label = "Breakdown by %s" % brk.get("by")
+        # Escaped piecewise: n() already escapes, so escaping the joined label would do it twice.
+        label = _esc("Breakdown by %s" % brk.get("by"))
         if brk.get("complete") is False:
             un = brk.get("unaccountedRecords") or brk.get("overcountedRecords")
             label += " — incomplete, %s records unaccounted" % n(un)
-        sec.append("<div class='section-label'>%s</div>" % _esc(label) + _rows_html(brk["groups"]))
+        sec.append("<div class='section-label'>%s</div>" % label + _rows_html(brk["groups"]))
 
     for key, title in [("topUsers", "Riskiest users"), ("topAssets", "Riskiest assets")]:
         blk = data.get(key) or {}
@@ -6795,9 +6918,10 @@ def _preflight_coverage(cov, detail=10):
     * **Every delivering row that still carries `lastIngest.status`** -- these are `_brief_connectors`'
       `max_detail` biggest ingesters, and they are precisely the rows the delivering table draws with
       their Records and Last-ingest columns. Rolling one up would blank a cell §1.5 prints.
-    * **`summary`, `failures[]`, `warningGroups[]`, `otherSources[]` and every count, verbatim.**
-      warningGroups is how §1.5 rule 2 answers "what was the warning" for a row it does print, and
-      the tally has to stay as-is for design/trends.md's comparison.
+    * **`summary`, `otherSources[]` and every count, verbatim**, and every fact in `failures[]` and
+      `warningGroups[]` (re-referenced by `_index_warning_groups`, never dropped). warningGroups is
+      how §1.5 rule 2 answers "what was the warning" for a row it does print, and the tally has to
+      stay as-is for design/trends.md's comparison.
 
     A rolled-up row keeps `connector`, `profile`, its record count and `warned`. Names, because §1.5
     requires the rollup line to name connectors and says a bare count is not actionable; `profile`,
@@ -6808,6 +6932,9 @@ def _preflight_coverage(cov, detail=10):
     Dropped from a rolled-up row: the service tallies and `health`. Both are implied for a row in this
     set -- it is here *because* it has no `failures[]` entry and is not `failing` -- and neither
     appears in the rollup line.
+
+    Then `_index_warning_groups` states each warning cause once, by id, instead of repeating
+    connector names inside `warningGroups[]` and messages inside `failures[]`.
 
     Presentation only, and at one boundary only: `cmd_connect`'s. `digest`/`snapshot` call
     `summarize_connectors()` in-process and never see this, so `_snapshot_coverage`'s
@@ -6834,21 +6961,92 @@ def _preflight_coverage(cov, detail=10):
             slim["warned"] = row["warned"]
         rolled.append(slim)
 
-    if not rolled:
-        return cov
     out = dict(cov)
-    out["connectors"] = keep
-    out["delivering"] = rolled
-    out["deliveringRolledUp"] = len(rolled)
+    if rolled:
+        out["connectors"] = keep
+        out["delivering"] = rolled
+        out["deliveringRolledUp"] = len(rolled)
+        # Said in the payload as well as in this docstring: the reader of a preflight block is a
+        # model deciding whether it has the whole picture, and "40 rows are over there in a shorter
+        # form" is not something it should have to infer from a key name.
+        out["deliveringNote"] = (
+            "%d connectors with no failure and no elided-detail row are in `delivering[]` with their "
+            "record counts and `warned` markers -- named, not dropped. Run `connectors` for full rows."
+            % len(rolled))
+    indexed = _index_warning_groups(out)
+    if not rolled and not indexed:
+        return cov
     out["shape"] = "preflight"
-    # Said in the payload as well as in this docstring: the reader of a preflight block is a model
-    # deciding whether it has the whole picture, and "40 rows are over there in a shorter form" is
-    # not something it should have to infer from a key name.
-    out["deliveringNote"] = (
-        "%d connectors with no failure and no elided-detail row are in `delivering[]` with their "
-        "record counts and `warned` markers -- named, not dropped. Run `connectors` for full rows."
-        % len(rolled))
     return out
+
+
+def _index_warning_groups(out):
+    """State each warning cause once: groups get an `id`, and whatever names a cause points at it.
+
+    Measured on the local 51-connector stack, after the rollup above: `warningGroups[].connectors`
+    repeated 84 mentions of 51 connector idents -- 3,857 chars, the largest single block left in the
+    preflight -- because every name already appears on its own row in `connectors[]`/`delivering[]`.
+    And 7 of 10 `failures[]` messages were byte-identical to a warning group's message, since an
+    ingestion run that fails is both a hard failure and a `fail`-severity cause. Each group now
+    carries `id` ("w1", ...) and no member list; each row and each such failure carries
+    `warningIds`. Measured on the same stack and data: 18,810 -> 15,693 chars (-16.6%), and the
+    original groups and failure messages rebuild exactly from the ids.
+
+    Only when it is smaller. A reference costs ~22 chars per row, a name ~4 plus its length, so on a
+    stack of short idents ("Okta (Prod)") the index would grow the block it exists to shrink. The
+    two serialisations are compared and the smaller one kept; SKILL.md reads either (a group's
+    `connectors[]` is the `connectors` verb's shape anyway).
+
+    Lossless or not at all. The member lists are rebuilt from rows, so a group ident that matches no
+    row would silently lose its membership -- in that case nothing is indexed and the block passes
+    through verbatim. `warned` stays on every row that has it: a row with `warned` and no
+    `warningIds` is still one whose cause lost the `warningGroups` cap, never a clean run.
+
+    Copies everything it changes. The caller's `cov` is summarize_connectors()' own result, and
+    _snapshot_coverage must be able to derive the same coverage from it afterwards.
+    """
+    groups = out.get("warningGroups")
+    if (not isinstance(groups, list) or not groups
+            or not all(isinstance(g, dict) and isinstance(g.get("connectors"), list) for g in groups)):
+        return False
+    row_lists = {k: out[k] for k in ("connectors", "delivering") if isinstance(out.get(k), list)}
+    idents = {_coverage_ident(r) for rows in row_lists.values() for r in rows}
+
+    ids, by_message, slim = {}, {}, []
+    for i, g in enumerate(groups, 1):
+        gid = "w%d" % i
+        if not set(g["connectors"]) <= idents:
+            return False
+        slim.append(dict({"id": gid}, **{k: v for k, v in g.items() if k != "connectors"}))
+        for name in g["connectors"]:
+            ids.setdefault(name, []).append(gid)
+        # Groups are sorted fail-first, so a message carried at both severities resolves to the fail
+        # one -- the right reading for a hard failure.
+        by_message.setdefault(g.get("message"), gid)
+
+    new = {"warningGroups": slim}
+    for key, rows in row_lists.items():
+        new[key] = [dict(r, warningIds=ids[_coverage_ident(r)]) if _coverage_ident(r) in ids else r
+                    for r in rows]
+    if isinstance(out.get("failures"), list):
+        fails = []
+        for f in out["failures"]:
+            gid = by_message.get(f.get("message")) if isinstance(f, dict) and f.get("message") else None
+            if gid:
+                f = {k: v for k, v in f.items() if k != "message"}
+                f["warningIds"] = [gid]
+            fails.append(f)
+        new["failures"] = fails
+    new["warningIdsNote"] = (
+        "Each cause is quoted once, in warningGroups[] by `id`; rows in connectors[]/delivering[] and "
+        "entries in failures[] point to theirs via `warningIds`. `warned` with no `warningIds` means "
+        "the cause was not quoted (warningsUndetailed), not a clean run.")
+    # The note counts against the index: it only exists because the index does.
+    size = lambda d: len(json.dumps({k: d.get(k) for k in new if k in d}))
+    if size(new) >= size(out):
+        return False
+    out.update(new)
+    return True
 
 
 def cmd_connectors(a):
@@ -7155,6 +7353,7 @@ UPDATE_ASSET_SUFFIX = ".skill.zip"
 UPDATE_TIMEOUT = 10
 UPDATE_MAX_JSON_BYTES = 4 * 1024 * 1024
 UPDATE_MAX_ASSET_BYTES = 64 * 1024 * 1024      # the package is <1MB; this is a runaway-download stop
+UPDATE_MAX_REDIRECTS = 5    # a release download is one hop (github.com -> *.githubusercontent.com)
 UPDATE_MAX_UNPACKED_BYTES = 256 * 1024 * 1024  # ... and this is the zip-bomb stop
 UPDATE_MAX_MEMBERS = 2000
 UPDATE_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -7178,6 +7377,37 @@ def _github_host(url, api=False):
     ok = (host == "github.com" or host.endswith(".github.com")
           or host.endswith(".githubusercontent.com"))
     return host if ok else None
+
+
+def _update_open(req):
+    """urlopen for the self-update path, with EVERY redirect hop held to _github_host.
+
+    _gh_get and _download_asset checked the URL they were handed and then let urlopen follow
+    redirects wherever they pointed -- another host, or plain http://, since urllib follows both. A
+    release download is always redirected (github.com -> a *.githubusercontent.com storage host), so
+    the check that mattered was the one on the hop nobody looked at. Now each hop must pass the same
+    rule as the first URL, and the chain is capped at UPDATE_MAX_REDIRECTS; the final URL is checked
+    again after the fact, so a redirect path this handler somehow did not see still cannot land.
+    Signed releases make a malicious package fail verification anyway; this keeps the bytes being
+    verified coming only from where they claim to.
+    """
+    import urllib.request
+
+    class _HeldRedirect(urllib.request.HTTPRedirectHandler):
+        max_redirections = UPDATE_MAX_REDIRECTS
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not _github_host(newurl):
+                raise ValueError("refusing a redirect to %r - self-update only follows https "
+                                 "github.com hosts" % newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    resp = urllib.request.build_opener(_HeldRedirect).open(req, timeout=UPDATE_TIMEOUT)
+    if not _github_host(resp.geturl()):
+        resp.close()
+        raise ValueError("self-update fetch ended at %r, which is not an https github.com host"
+                         % resp.geturl())
+    return resp
 
 
 def update_repo():
@@ -7277,7 +7507,7 @@ def _gh_get(url, accept="application/vnd.github+json", max_bytes=UPDATE_MAX_JSON
         "User-Agent": UPDATE_UA,
         "X-GitHub-Api-Version": "2022-11-28",
     })
-    with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as resp:
+    with _update_open(req) as resp:
         data = resp.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise ValueError("response exceeded %d bytes" % max_bytes)
@@ -7570,7 +7800,7 @@ def _download_asset(url, dest):
     req = urllib.request.Request(url, headers={"Accept": "application/octet-stream",
                                                "User-Agent": UPDATE_UA})
     got = 0
-    with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as resp, open(dest, "wb") as f:
+    with _update_open(req) as resp, open(dest, "wb") as f:
         while True:
             chunk = resp.read(65536)
             if not chunk:
@@ -7823,6 +8053,9 @@ def main():
     s.add_argument("-X", "--method", default="GET", help="HTTP method (default GET)")
     s.add_argument("--body", help="request body as a JSON string")
     s.add_argument("--body-file", help="read the JSON body from this file (avoids shell quoting)")
+    s.add_argument("--allow-write", action="store_true",
+                   help="permit a call that can change the stack (PUT/PATCH/DELETE, or a POST that is "
+                        "not a read query) -- only after the user confirms that change")
     s.set_defaults(func=cmd_api)
 
     s = sub.add_parser("refresh-fields", help="re-read this stack's real field names into the cache")
@@ -8074,6 +8307,9 @@ def main():
         problem = out_path_problem(out, suffixes)
         if problem:
             die(problem, 2)
+        warning = out_in_skill_dir(out)
+        if warning:
+            print(warning, file=sys.stderr)
     try:
         args.func(args)
     except Exception as e:  # noqa

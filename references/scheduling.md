@@ -9,13 +9,15 @@ Code, and a daemon inside a CLI would be the wrong place for it. `digest` exists
 is a single command:
 
 ```bash
-python scripts/meridian.py digest > digest.json &&   python scripts/meridian.py report --input digest.json --out "Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"
+python scripts/meridian.py digest > "$HOME/meridian-reports/digest.json" && python scripts/meridian.py report --input "$HOME/meridian-reports/digest.json" --out "$HOME/meridian-reports/Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"
 ```
 
 Drive that from Windows Task Scheduler, macOS `launchd`, Linux `cron`/`systemd`, or Claude Code's own
 scheduling — all four are supported today; none of it is skill code, just the OS running the command
-above on a timer. Note the output carries customer PII, so a scheduled job must write somewhere
-appropriate — see the data-handling rules.
+above on a timer. The outputs go to a folder **outside the skill** (`~/meridian-reports` here; create
+it once): self-update replaces the skill folder and deletes anything saved inside it, and `--out`
+refuses a directory that does not exist. They also carry customer PII, so pick somewhere appropriate —
+see the data-handling rules.
 
 ## Windows Task Scheduler: two defaults that silently skip runs
 
@@ -78,7 +80,7 @@ tool holding a user-scoped bearer token, the same reason the Windows section abo
   <array>
     <string>/bin/bash</string>
     <string>-c</string>
-    <string>cd /path/to/meridiancs &amp;&amp; python3 scripts/meridian.py digest &gt; digest.json &amp;&amp; python3 scripts/meridian.py report --input digest.json --out Weekly-Posture.pdf --title "Weekly Meridian Posture Digest"</string>
+    <string>cd /path/to/meridiancs &amp;&amp; python3 scripts/meridian.py digest &gt; "$HOME/meridian-reports/digest.json" &amp;&amp; python3 scripts/meridian.py report --input "$HOME/meridian-reports/digest.json" --out "$HOME/meridian-reports/Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
@@ -118,7 +120,7 @@ Plain `cron` works but carries two of its own silent-failure traps:
   mail:
 
   ```cron
-  0 9 * * * cd /path/to/meridiancs && /usr/bin/python3 scripts/meridian.py digest > digest.json && /usr/bin/python3 scripts/meridian.py report --input digest.json --out Weekly-Posture.pdf --title "Weekly Meridian Posture Digest" >> ~/meridian-digest.log 2>&1
+  0 9 * * * cd /path/to/meridiancs && /usr/bin/python3 scripts/meridian.py digest > "$HOME/meridian-reports/digest.json" && /usr/bin/python3 scripts/meridian.py report --input "$HOME/meridian-reports/digest.json" --out "$HOME/meridian-reports/Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest" >> ~/meridian-digest.log 2>&1
   ```
 
 Plain `cron` also has no wake-catch-up, same gap as `launchd`. Where that matters — a laptop that's
@@ -131,7 +133,7 @@ analogue of Windows' `StartWhenAvailable`: a missed run fires as soon as the sys
 [Service]
 Type=oneshot
 WorkingDirectory=/path/to/meridiancs
-ExecStart=/bin/bash -c 'python3 scripts/meridian.py digest > digest.json && python3 scripts/meridian.py report --input digest.json --out Weekly-Posture.pdf --title "Weekly Meridian Posture Digest"'
+ExecStart=/bin/bash -c 'python3 scripts/meridian.py digest > %h/meridian-reports/digest.json && python3 scripts/meridian.py report --input %h/meridian-reports/digest.json --out %h/meridian-reports/Weekly-Posture.pdf --title "Weekly Meridian Posture Digest"'
 ```
 
 `~/.config/systemd/user/meridian-digest.timer`:

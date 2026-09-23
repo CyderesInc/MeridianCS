@@ -21,9 +21,12 @@ for print-to-PDF and falls back to writing branded HTML when none is found.
   `assets/cyderes-report.css`. Usage:
 
   ```bash
-  python meridian.py top --table asset --field Risk_Score --top 10 --select "Asset_Name,Risk_Score,Risk_Level,IP_Address,OS,Count_KEV" > top.json
-  python meridian.py report --input top.json --out "Cyderes-Top10-Assets.pdf" --title "Top 10 Riskiest Assets" --date 2026-07-22
+  python meridian.py top --table asset --field Risk_Score --top 10 --select "Asset_Name,Risk_Score,Risk_Level,IP_Address,OS,Count_KEV" > <scratch>/top.json
+  python meridian.py report --input <scratch>/top.json --out "<out-dir>/Cyderes-Top10-Assets.pdf" --title "Top 10 Riskiest Assets" --date 2026-07-22
   ```
+
+  `<scratch>` is the session scratchpad and `<out-dir>` the user's own folder — never the skill
+  folder, which self-update replaces (deleting anything saved in it).
 
   It renders the branded HTML then converts to PDF via headless Chrome/Edge (auto-detected). If no
   browser is found it writes the branded `.html` instead; pass `--html` to force HTML. Handles the
@@ -34,9 +37,9 @@ for print-to-PDF and falls back to writing branded HTML when none is found.
     exploitability detail arrive as one thing to hand over:
 
     ```bash
-    python meridian.py profile --type user  --name AEXAMPLE > u.json
-    python meridian.py profile --type asset --name 13837M3          > a1.json
-    python meridian.py report --input u.json a1.json --out "Cyderes-Profile.pdf" \
+    python meridian.py profile --type user  --name AEXAMPLE > <scratch>/u.json
+    python meridian.py profile --type asset --name 13837M3          > <scratch>/a1.json
+    python meridian.py report --input <scratch>/u.json <scratch>/a1.json --out "<out-dir>/Cyderes-Profile.pdf" \
       --title "Identity Risk, Blast Radius & Linked Assets"
     ```
 
@@ -73,6 +76,6 @@ for print-to-PDF and falls back to writing branded HTML when none is found.
     to give someone a blast-radius picture is just:
 
     ```bash
-    python meridian.py profile --name "<person>" > prof.json
-    python meridian.py report --input prof.json --out "Cyderes-BlastRadius.pdf" --title "Risk & Blast-Radius Profile" --date 2026-07-23
+    python meridian.py profile --name "<person>" > <scratch>/prof.json
+    python meridian.py report --input <scratch>/prof.json --out "<out-dir>/Cyderes-BlastRadius.pdf" --title "Risk & Blast-Radius Profile" --date 2026-07-23
     ```

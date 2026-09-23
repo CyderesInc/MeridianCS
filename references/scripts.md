@@ -72,6 +72,17 @@ rung cache (`topcache.<fqdn>.json`), cached field names (`fields.<fqdn>.json`) a
     restores every row, as does the `connectors` verb. It is applied at `cmd_connect`'s output
     boundary only: `digest`/`snapshot` call `summarize_connectors()` in-process and never see it, so
     `_snapshot_coverage`'s `len(failingNames) == failing` is untouched.
+  - **The preflight also states each warning cause once.** After the rollup,
+    `warningGroups[].connectors` still repeated names every row already carries (84 mentions of 51
+    idents, 3,857 chars), and 7 of 10 `failures[]` messages were byte-identical to a group's, since a
+    failed ingestion run is both. So each group gets an `id` and loses its member list, and rows and
+    those failures carry `warningIds` instead. Measured live: 18,810 → 15,693 chars (−16.6%), and
+    the original groups and failure messages rebuild exactly from the ids. Two guards: it only
+    applies when the result is smaller (a reference costs ~22 chars, so short idents like
+    `Okta (Prod)` would grow the block), and a group naming a connector no row carries leaves the
+    whole block verbatim rather than lose that membership. This one did need a §1.5 table row
+    (`warningIds`). The digest is why it lives here and not in brief: its renderer reads
+    `failures[].message`.
   - The runs endpoint is paginated at 20/page (~31 pages); `size=2000` returns the lot in **one**
     call — don't loop pages. It also accepts `sort=_time%2Cdesc`, and a smaller sorted window is
     ~0.4s faster — **don't**: the window spans only the last few days on a stack that ingests daily,

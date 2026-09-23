@@ -101,6 +101,10 @@ Things not to change without reading why:
   files present, and a `VERSION.json` matching the release tag. That last check is what stops a
   mislabelled release from installing and then reporting `current` forever, since the stamp is the
   only thing the next check reads.
+- **Every redirect hop is held to the same host rule** (`_update_open`), capped at
+  `UPDATE_MAX_REDIRECTS`. A release download is always redirected, from github.com to a
+  `*.githubusercontent.com` storage host. Before review finding L2 was fixed, only the first URL was
+  checked, and urllib followed the redirect anywhere, plain `http://` included.
 - **The swap is staged and reversible**: download to a temp dir *beside* the install (same
   filesystem, so the move is a rename, not a copy), extract, run the staged copy's own `--help` as a
   smoke test, move the live tree aside, move the new one in, and only then delete the old — restoring

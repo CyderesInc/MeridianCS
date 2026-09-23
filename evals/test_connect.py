@@ -57,11 +57,12 @@ _failed = 0
 def derived_tree():
     """True when the suite is running inside make-public.py's OUTPUT rather than the source repo.
 
-    Three tests here assert properties OF the derivation -- that this tree is branded [29], that
-    the .public.md sources exist and are in sync [30], that deriving produces a clean audit [32].
-    None of them can hold in the derived tree itself, which has no brand assets, no variants and
-    no design/ record. The public repository runs this same suite, so they skip there instead of
-    failing 17 assertions that describe work already done correctly.
+    Four tests here assert properties OF the derivation -- that this tree is branded [29], that
+    the .public.md sources exist and are in sync [30], that deriving produces a clean audit [32],
+    and that publishing a derivation commits before it builds [36]. None of them can hold in the
+    derived tree itself, which has no brand assets, no variants and no design/ record. The public
+    repository runs this same suite, so they skip there instead of failing assertions that
+    describe work already done correctly (17 of them before [36] existed).
 
     Joint signal, for the same reason check-docs-pii.py uses one: an absent design/ on its own,
     or an absent variant on its own, is a source-repo defect that has to stay loud. Only the
@@ -602,8 +603,12 @@ def test_preflight_coverage(m):
       * a rolled row that warned stays marked warned -- the same rule brief keeps, and the one
         mistake this shape could cause that brief could not: §1.5 reads a blank warning cell as
         "the run was actually clean";
-      * summary/failures/warningGroups pass through verbatim, since warningGroups is how §1.5 rule 2
-        answers "what was the warning" and the tally has to stay as-is for the trend comparison.
+      * summary passes through verbatim, and failures/warningGroups losslessly: each cause is quoted
+        once, by `id`, and the rows and failures it covers point at it with `warningIds`. Rebuilding
+        the original groups and failure messages from those ids has to give back exactly the input,
+        since warningGroups is how §1.5 rule 2 answers "what was the warning". Measured on the local
+        51-connector stack, the repetition this removes was 84 mentions of 51 names plus 7 of 10
+        failure messages, and the block went 18,810 -> 15,693 chars;
 
     And the invariant one layer down: this is presentation, applied at cmd_connect's boundary only.
     digest/snapshot call summarize_connectors() in-process, so _snapshot_coverage must see exactly
@@ -689,8 +694,12 @@ def test_preflight_coverage(m):
 
     # --- the blocks §1.5 reads for causes and headline numbers pass through untouched ----------
     check("summary is verbatim", pre["summary"], baseline["summary"])
-    check("failures are verbatim", pre["failures"], baseline["failures"])
-    check("warningGroups are verbatim", pre["warningGroups"], baseline["warningGroups"])
+    check("the input is not mutated", brief, baseline)
+    # This fixture's idents are short ("Conn02 (P02)"), which makes a `warningIds` reference dearer
+    # than the name it replaces -- so it is exactly the block the index has to leave alone.
+    check("a block the warning index would grow is left verbatim",
+          (pre["warningGroups"], pre["failures"], "warningIdsNote" in pre),
+          (baseline["warningGroups"], baseline["failures"], False))
 
     # --- the trend layer must not be able to tell this happened -------------------------------
     # _snapshot_coverage runs off summarize_connectors() in-process, never off this verb's stdout.
@@ -718,6 +727,81 @@ def test_preflight_coverage(m):
     # when none did.
     small = m._preflight_coverage({"connectors": baseline["connectors"][:2], "failures": []})
     check("...and so does a population smaller than the detail window", "delivering" in small, False)
+
+    # --- the warning index: live-shaped idents, a failure dedupe, an elided cause -------------
+    # Hand-built to the live stack's proportions: idents ~50 chars (measured average 46), one cause
+    # spanning most connectors, and an ingestion failure -- which is both a failures[] entry and a
+    # fail-severity group with the byte-identical message, the duplication measured on 7 of 10 live
+    # failures. Rows carry no lastIngest, so every one but the failing row rolls into delivering[].
+    long_msg = ("AccessDeniedException: User is not authorized to perform organizations:ListAccounts "
+                "because no identity-based policy allows the action on this resource")
+    idents = [("Amazon Web Services (AWS)", "AWS_Account_%02d_Prod_Connector" % i) for i in range(9)]
+    hand = {
+        "summary": {"connectorsEnabled": 10},
+        "connectors": [{"connector": c, "profile": p, "health": "degraded",
+                        "warned": "fail" if i == 0 else "warn"} for i, (c, p) in enumerate(idents)]
+                      + [{"connector": "Okta", "profile": "Prod", "health": "ok"}],
+        "failures": [{"connector": idents[0][0], "profile": idents[0][1], "kind": "ingestion",
+                      "status": "Error", "message": long_msg},
+                     {"connector": "Intune", "profile": "Corp", "kind": "connection-test",
+                      "status": "FAIL", "message": "401 Unauthorized"}],
+        # idents[8] warned, but its cause is the one the cap dropped.
+        "warningGroups": [{"severity": "fail", "message": long_msg,
+                           "connectors": ["%s (%s)" % idents[0]], "connectorCount": 1},
+                          {"severity": "warn", "message": "Rate limited, retried",
+                           "connectors": ["%s (%s)" % x for x in idents[:8]], "connectorCount": 8}],
+        "warningGroupsTruncated": 1, "warningsUndetailed": 1,
+    }
+    hand_copy = json.loads(json.dumps(hand))
+    h = m._preflight_coverage(hand)
+    check("a live-shaped block is indexed", "warningIdsNote" in h, True)
+    check("every warning group has an id and no member list",
+          all(g.get("id") and "connectors" not in g for g in h["warningGroups"]), True)
+    rebuilt, fails = _rebuild_warnings(m, h)
+    check("warningGroups rebuild exactly from warningIds", rebuilt, _norm_groups(hand_copy["warningGroups"]))
+    check("failures rebuild exactly", fails, hand_copy["failures"])
+    rows = {m._coverage_ident(r): r for r in h["connectors"] + h.get("delivering", [])}
+    first, elided = "%s (%s)" % idents[0], "%s (%s)" % idents[8]
+    check("a row in two groups points at both", rows[first].get("warningIds"), ["w1", "w2"])
+    check("a failure repeating a group's message points at it instead",
+          (h["failures"][0].get("warningIds"), "message" in h["failures"][0]), (["w1"], False))
+    check("a failure with its own message keeps it",
+          (h["failures"][1].get("message"), "warningIds" in h["failures"][1]), ("401 Unauthorized", False))
+    # The one mistake this shape could add: an elided cause read as a clean run.
+    check("an elided cause keeps warned and gets no warningIds",
+          (rows[elided].get("warned"), "warningIds" in rows[elided]), ("warn", False))
+    check("a row with no cause carries no warningIds", "warningIds" in rows["Okta (Prod)"], False)
+    check("the hand-built input is not mutated", hand, hand_copy)
+    # A group naming a connector no row carries cannot be rebuilt from rows, so indexing it would
+    # silently drop that membership. The whole block has to pass through instead.
+    orphan = json.loads(json.dumps(hand_copy))
+    orphan["warningGroups"][1]["connectors"].append("Gone (x)")
+    o = m._preflight_coverage(orphan)
+    check("an unmatched group member leaves the block verbatim",
+          (o.get("warningGroups"), o.get("failures"), "warningIdsNote" in o),
+          (orphan["warningGroups"], orphan["failures"], False))
+
+
+def _norm_groups(groups):
+    """Groups with member order ignored: the preflight splits rows across two lists, so the order
+    names came back in carries no meaning -- membership is what has to survive."""
+    return [dict(g, connectors=sorted(g["connectors"])) for g in groups]
+
+
+def _rebuild_warnings(m, pre):
+    """Undo _index_warning_groups: (groups with member lists, failures with messages)."""
+    groups = {g["id"]: dict({k: v for k, v in g.items() if k != "id"}, connectors=[])
+              for g in pre["warningGroups"]}
+    for r in pre["connectors"] + pre.get("delivering", []):
+        for gid in r.get("warningIds") or []:
+            groups[gid]["connectors"].append(m._coverage_ident(r))
+    fails = []
+    for f in pre["failures"]:
+        f = dict(f)
+        if "warningIds" in f:
+            f["message"] = groups[f.pop("warningIds")[0]]["message"]
+        fails.append(f)
+    return _norm_groups(list(groups.values())), fails
 
 
 def test_result_cache(m):
@@ -4161,8 +4245,23 @@ def test_alerts_notify(m):
         check("the subject names the stack", "s.example" in subject, True)
         slack_payload = m.render_alerts_slack(nasty)
         check("slack payload is a single text field", set(slack_payload), {"text"})
+        # The Workflows template posts each entry of `attachments` as a card; a body without them is
+        # accepted with HTTP 202 and posts nothing, which is what the old {title, text} shape did.
         teams_payload = m.render_alerts_teams(nasty)
-        check("teams payload has title and text", set(teams_payload), {"title", "text"})
+        att = (teams_payload.get("attachments") or [{}])[0]
+        card = att.get("content") or {}
+        check("teams payload is a message with one Adaptive Card attachment",
+              (teams_payload.get("type"), len(teams_payload.get("attachments") or []),
+               att.get("contentType"), card.get("type")),
+              ("message", 1, "application/vnd.microsoft.card.adaptive", "AdaptiveCard"))
+        card_text = " ".join(b.get("text", "") for b in card.get("body") or [])
+        check("...whose card carries the rule", "&amp; Co" in card_text or "& Co" in card_text, True)
+        check("...with a top-level text fallback for a flow that reads that field",
+              "& Co" in teams_payload.get("text", ""), True)
+        linky = m.render_alerts_teams(mkv(firing=["[Reset your password](https://evil.example/x)"]))
+        check("a markdown link in customer text does not form a link",
+              "](" in json.dumps(linky["attachments"][0]["content"]), False)
+        check("...and the payload fits Teams' 28 KB message limit", len(json.dumps(teams_payload)) < 28000, True)
 
         # --- env-var-only config resolution -----------------------------------------------------------
         real_env = dict(os.environ)
@@ -4641,6 +4740,9 @@ def test_alert_routing():
     # The Teams shape is a documented guess. If that caveat is ever dropped the doc starts asserting
     # something nobody verified.
     check("...and that the Teams payload is still flagged unverified", "unverified" in doc.lower(), True)
+    # A Workflows webhook answers 202 before the flow runs, whatever it then does with the body, so
+    # a doc that let 202 read as "delivered" would bless the silent failure the old shape had.
+    check("...and that a 202 is not proof of delivery", "a 202 is not proof of" in " ".join(doc.split()), True)
 
 
 def test_skill_rule_survival():
@@ -6286,6 +6388,334 @@ def test_whats_new(m):
         check("SKILL.md still says: %s" % rule[:48], rule in skill, True)
 
 
+def test_publish_public():
+    """publish-public.py makes the release commit BEFORE it builds, so the stamp names that commit.
+
+    Through v2.25.0 the build ran on the synced-but-uncommitted clone with --allow-dirty and the
+    operator committed afterwards, so every public package's VERSION.json named the PREVIOUS public
+    commit plus `dirty: true` (the v2.24.2 asset names the v2.24.0 seed). Driven end to end against a
+    throwaway clone of a local bare repo, so nothing here touches the network or the real clone.
+    """
+    print("[36] publish-public: release commit precedes the build; tip and no-op checks hold (offline)")
+    if derived_tree():
+        print("  SKIP  derived public tree - publishing derives from the internal tree it lacks")
+        return
+    import zipfile
+    root = os.path.dirname(HERE)
+    script = os.path.join(root, "scripts", "publish-public.py")
+    with open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8-sig") as f:
+        version = re.search(r"^##\s+\[?v?(\d+\.\d+\.\d+)", f.read(), re.M).group(1)
+
+    def git(cwd, *args):
+        return subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True)
+
+    def rev(cwd, ref="HEAD"):
+        return git(cwd, "rev-parse", ref).stdout.strip()
+
+    def publish(clone, ver=version):
+        # --allow-dirty applies to the INTERNAL tree only, so the suite runs on a working copy with
+        # edits in it. The clone-side build is what this test is about, and it takes no such flag.
+        return subprocess.run([sys.executable, script, "--version", ver, "--clone", clone,
+                               "--allow-dirty"], capture_output=True, text=True, cwd=root)
+
+    def force_rm(func, path, _exc):
+        os.chmod(path, 0o700)   # git's object files are read-only, which Windows refuses to delete
+        func(path)
+
+    tmp = tempfile.mkdtemp(prefix="pubtest-")
+    try:
+        # The URL guard wants the public repo's name in the remote, so the bare repo carries it.
+        origin = os.path.join(tmp, "CyderesInc", "MeridianCS.git")
+        clone = os.path.join(tmp, "clone")
+        os.makedirs(origin)
+        git(origin, "init", "--quiet", "--bare")
+        # Forward slashes, so the remote URL reads CyderesInc/MeridianCS on Windows too.
+        git(tmp, "clone", "--quiet", origin.replace(os.sep, "/"), clone)
+        for k, v in (("user.name", "test"), ("user.email", "test@example.com"),
+                     ("commit.gpgsign", "false")):
+            git(clone, "config", k, v)
+        git(clone, "symbolic-ref", "HEAD", "refs/heads/main")
+        with open(os.path.join(clone, "README.md"), "w") as f:
+            f.write("seed\n")
+        git(clone, "add", "-A")
+        git(clone, "commit", "--quiet", "-m", "seed")
+        git(clone, "push", "--quiet", "-u", "origin", "main")
+        seed = rev(clone)
+        check("fixture: a seeded clone tracking its bare origin",
+              bool(seed) and rev(clone, "@{u}") == seed, True)
+
+        r = publish(clone)
+        out = r.stdout + r.stderr
+        check("a changed public tree builds and verifies (exit 0)", r.returncode, 0)
+        if r.returncode:
+            print(out[-2000:])
+        head = rev(clone)
+        check("... the release commit is made in the clone",
+              git(clone, "rev-list", "--count", "@{u}..HEAD").stdout.strip(), "1")
+        check("... on top of the published tip", rev(clone, "HEAD~1"), seed)
+        check("... and never pushed", rev(origin, "main"), seed)
+        check("... leaving the clone clean", git(clone, "status", "--porcelain").stdout.strip(), "")
+        stamp = {}
+        pkg = os.path.join(clone, "meridiancs.v%s.skill.zip" % version)
+        if os.path.exists(pkg):
+            with zipfile.ZipFile(pkg) as z:
+                stamp = json.loads(z.read("meridiancs/VERSION.json"))
+        # Both halves: with no commit made, HEAD is still the seed and "stamp == HEAD" holds
+        # vacuously -- which is exactly the v2.24.2 stamp.
+        check("the stamp names the release commit, not the one before it",
+              (stamp.get("commit") == head, stamp.get("commit") != seed), (True, True))
+        check("... and is not marked dirty", "dirty" in stamp, False)
+        check("the next steps no longer ask the operator to commit", "git commit" in out, False)
+        check("... still hand over the push", "git push origin HEAD" in out, True)
+        check("... and target the release at the stamped commit", ("--target %s" % head) in out, True)
+
+        # An unpushed release commit is exactly the state the run above leaves behind.
+        r = publish(clone)
+        check("a rerun over an unpushed release commit is refused (exit 2)", r.returncode, 2)
+        check("... without adding a second one", rev(clone), head)
+
+        # The previous release's package now sits in the clone, ignored by .gitignore. Walking the
+        # directory counted it as a difference, so the no-op check could never fire after a release.
+        git(clone, "push", "--quiet", "origin", "main")
+        r = publish(clone)
+        check("once pushed, an unchanged public tree is a no-op",
+              (r.returncode, "byte-identical" in r.stdout), (0, True))
+        check("... that commits nothing", rev(clone), head)
+
+        # A failure after the commit has to take it back, or the next run is refused as "ahead".
+        with open(os.path.join(clone, "stale.txt"), "w") as f:
+            f.write("drift\n")
+        git(clone, "add", "-A")
+        git(clone, "commit", "--quiet", "-m", "drift")
+        git(clone, "push", "--quiet", "origin", "main")
+        drift = rev(clone)
+        r = publish(clone, "0.0.1")   # no CHANGELOG entry, so make-package.py refuses the build
+        check("a build failing after the commit exits non-zero", r.returncode != 0, True)
+        check("... and undoes its release commit", rev(clone), drift)
+        check("... leaving the sync staged for inspection",
+              "stale.txt" in git(clone, "diff", "--cached", "--name-only").stdout, True)
+    finally:
+        shutil.rmtree(tmp, onerror=force_rm)
+
+
+def test_low_findings(m):
+    """The 2026-09-22 review's low findings L4, L5, L6 and L8 -- each asserted against the old code.
+
+    L4  the browser lookup ran whatever `chrome.bat` sat in the current directory;
+    L5  outputs written from the skill folder are deleted by the next self-update, unwarned;
+    L6  `api` would PUT/DELETE on the model's say-so alone, and SKILL.md's untrusted-input list
+        left out the two sources most able to carry someone else's text;
+    L8  the digest report interpolated non-numeric API values into HTML unescaped.
+    """
+    print("[42] review low findings: browser lookup, output location, api writes, digest escaping (offline)")
+    root = os.path.dirname(HERE)
+
+    # --- L4: only absolute PATH entries, and on Windows only .exe -------------------------------
+    tmp = tempfile.mkdtemp(prefix="l4-")
+    here, saved_path = os.getcwd(), os.environ.get("PATH", "")
+    # The assistant's own shell sets this, which suppresses the Windows cwd search and hid the bug
+    # on the machine it was found from. An ordinary shell does not, so the test must not either.
+    saved_nodef = os.environ.pop("NoDefaultCurrentDirectoryInExePath", None)
+    try:
+        exe = ".exe" if os.name == "nt" else ""
+        planted, trusted = os.path.join(tmp, "work"), os.path.join(tmp, "bin")
+        os.makedirs(planted); os.makedirs(trusted)
+
+        def touch(path):
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(path, 0o755)
+
+        for name in ("chrome.bat", "chrome.cmd", "chrome" + exe):
+            touch(os.path.join(planted, name))
+        os.chdir(planted)
+        # An empty entry is POSIX's spelling of "the current directory"; Windows searches it anyway.
+        os.environ["PATH"] = os.pathsep.join(["", ".", trusted])
+        found = m._find_browser()
+        check("a browser planted in the current directory is not picked",
+              found is None or (os.path.isabs(found) and os.path.dirname(found) != planted), True)
+        check("...not even via an empty or relative PATH entry", m._which_trusted("chrome"), None)
+        touch(os.path.join(trusted, "chrome" + exe))
+        check("a browser in an absolute PATH directory is still found",
+              m._which_trusted("chrome"), os.path.join(trusted, "chrome" + exe))
+        if os.name == "nt":
+            os.remove(os.path.join(trusted, "chrome.exe"))
+            touch(os.path.join(trusted, "chrome.bat"))
+            check("...but on Windows only as an .exe", m._which_trusted("chrome"), None)
+    finally:
+        os.chdir(here)
+        os.environ["PATH"] = saved_path
+        if saved_nodef is not None:
+            os.environ["NoDefaultCurrentDirectoryInExePath"] = saved_nodef
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- L5: an output inside the skill folder is warned about ----------------------------------
+    inside = os.path.join(m.INSTALL_DIR, "Weekly-Posture.pdf")
+    warn = m.out_in_skill_dir(inside)
+    check("an --out inside the skill folder is warned about", bool(warn), True)
+    check("...saying what will happen to it", "deletes" in (warn or ""), True)
+    check("...including a relative one from the scripts/ directory",
+          bool(m.out_in_skill_dir(os.path.relpath(os.path.join(m.INSTALL_DIR, "scripts", "x.csv")))), True)
+    check("an --out elsewhere is not", m.out_in_skill_dir(os.path.join(tempfile.gettempdir(), "x.pdf")), None)
+    # End to end: the warning is emitted before dispatch, and report then fails on its missing
+    # input -- so nothing is written into the skill folder by this test.
+    r = subprocess.run([sys.executable, os.path.join(root, "scripts", "meridian.py"), "report",
+                        "--input", os.path.join(tempfile.gettempdir(), "no-such-input.json"),
+                        "--out", inside], capture_output=True, text=True, cwd=root)
+    check("the CLI prints the warning on stderr", "skill folder" in r.stderr, True)
+    check("...and wrote nothing there", os.path.exists(inside), False)
+    ignored = subprocess.run(["git", "check-ignore", "-q", "top.json"], cwd=root).returncode == 0
+    check("a stray output JSON at the root is gitignored", ignored, True)
+    check("...but the tracked SBOM is not",
+          subprocess.run(["git", "check-ignore", "-q", "sbom.cdx.json"], cwd=root).returncode, 1)
+
+    # --- L6: writes need --allow-write; the untrusted list names every free-text source ---------
+    for method, ep in (("PUT", "CMDB/v2/connector/profile/service"), ("DELETE", "CMDB/v2/smartlabel?id=1"),
+                       ("PATCH", "CMDB/v2/data/cmdb"), ("POST", "CMDB/v2/connector/test/async"),
+                       ("POST", "CMDB/v2/data/cmdb/../../connector/test/async")):
+        check("api -X %s %s needs --allow-write" % (method, ep), bool(m.api_write_problem(method, ep)), True)
+        check("...and runs with it", m.api_write_problem(method, ep, True), None)
+    for method, ep in (("GET", "CMDB/v2/connector"), ("POST", "CMDB/v2/data/cmdb"),
+                       ("POST", "/CMDB/v2/data/ldg"), ("POST", "CMDB/v2/data/cmd%62"),
+                       ("post", "CMDB/v2/smartlabel/search")):
+        check("api -X %s %s is a read" % (method, ep), m.api_write_problem(method, ep), None)
+    import contextlib, io
+    calls, real_call = [], m.call
+    m.call = lambda method, endpoint, body=None, retries=1: calls.append(method) or {}
+    try:
+        class A:
+            method, endpoint, body, body_file = "PUT", "CMDB/v2/connector/profile/service", None, None
+        refused = False
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                m.cmd_api(A())
+        except SystemExit:
+            refused = True
+        check("cmd_api refuses the PUT before anything reaches the wire", (refused, calls), (True, []))
+        A.allow_write = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.cmd_api(A())
+        check("...and sends it once allowed", calls, ["PUT"])
+    finally:
+        m.call = real_call
+    with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as f:
+        skill = " ".join(f.read().split())
+    untrusted = skill[skill.find("### Meridian records are untrusted input"):][:700]
+    check("SKILL.md's untrusted-input list names connector messages", "connector messages" in untrusted, True)
+    check("...and raw api responses", "raw `api` responses" in untrusted, True)
+    check("SKILL.md tells the model when --allow-write may be added",
+          "Add the flag only after the user confirms that change" in skill, True)
+    check("SKILL.md keeps outputs out of the skill folder",
+          "Never write an output" in skill and "inside the skill folder" in skill, True)
+
+    # --- L8: the digest escapes what it did not compute -----------------------------------------
+    evil = "<img src=x onerror=alert(1)>"
+    data = {"headline": {"assets": evil, "users": 5},
+            "connectors": {"summary": {"connectorsEnabled": 1, "failing": evil},
+                           "failures": [{"service": "S", "serviceCount": evil, "message": "m"}]},
+            "breakdown": {"by": "A&B", "complete": False, "unaccountedRecords": evil,
+                          "groups": [{"value": "x", "count": 1}]}}
+    _, cards, body = m._digest_html(data)
+    html = cards + body
+    check("a string value from the API is escaped in the digest", "<img" in html, False)
+    check("...rendered as text rather than dropped", "&lt;img" in html, True)
+    check("...and the breakdown label is escaped exactly once",
+          ("A&amp;B" in html, "&amp;amp;" in html, "&amp;lt;" in html), (True, False, False))
+
+
+def test_update_redirects(m):
+    """Review finding L2: every redirect on the self-update path is held to the https-github rule.
+
+    Driven through urllib's real redirect machinery, with a fake HTTPS handler serving canned
+    responses -- so what is tested is the chain _gh_get and _download_asset actually run, not a
+    handler called by hand. Nothing here touches the network.
+    """
+    print("[44] self-update follows redirects only to https github hosts (offline)")
+    import email.message, io, urllib.request, urllib.response
+
+    routes = {}
+
+    class FakeHTTPS(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            code, location, body = routes.get(req.full_url, (404, None, b"not found"))
+            hdrs = email.message.Message()
+            if location:
+                hdrs["Location"] = location
+            resp = urllib.response.addinfourl(io.BytesIO(body), hdrs, req.full_url, code)
+            resp.msg = "fake"
+            return resp
+
+    class FakeHTTP(urllib.request.HTTPHandler):
+        def http_open(self, req):          # a downgrade that got past the check would land here
+            resp = urllib.response.addinfourl(io.BytesIO(b"PLAINTEXT"), email.message.Message(),
+                                              req.full_url, 200)
+            resp.msg = "fake"
+            return resp
+
+    real_build = urllib.request.build_opener
+    urllib.request.build_opener = lambda *h: real_build(*(h + (FakeHTTPS, FakeHTTP)))
+    # A regression back to plain urlopen() would use urllib's cached global opener, which the patch
+    # above never reaches -- so clear it too, and a regressed fetch fails here instead of going to the
+    # network. Restored in the finally.
+    saved_opener = urllib.request._opener
+    urllib.request._opener = None
+    tmp = tempfile.mkdtemp(prefix="l2-")
+    try:
+        start = "https://github.com/o/r/releases/download/v1/p.skill.zip"
+        store = "https://release-assets.githubusercontent.com/p.skill.zip"
+
+        def attempt(fn):
+            try:
+                return fn(), None
+            except Exception as e:  # noqa
+                return None, str(e)
+
+        routes.clear()
+        routes.update({start: (302, store, b""), store: (200, None, b"PKG")})
+        dest = os.path.join(tmp, "ok.zip")
+        got, err = attempt(lambda: m._download_asset(start, dest))
+        check("a redirect to a github storage host is followed", (got, err), (3, None))
+
+        dest = os.path.join(tmp, "evil.zip")
+        routes[start] = (302, "https://evil.example/p.skill.zip", b"")
+        routes["https://evil.example/p.skill.zip"] = (200, None, b"EVIL")
+        got, err = attempt(lambda: m._download_asset(start, dest))
+        check("a redirect to another host is refused", (got, "refusing a redirect" in (err or "")),
+              (None, True))
+        check("...before anything is written", os.path.exists(dest), False)
+
+        routes[start] = (302, "http://release-assets.githubusercontent.com/p.skill.zip", b"")
+        got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "http.zip")))
+        check("a downgrade to plain http is refused", (got, "refusing a redirect" in (err or "")),
+              (None, True))
+
+        # A later hop, not just the first: the check has to hold along the whole chain.
+        hop = "https://objects.githubusercontent.com/hop"
+        routes[start] = (302, hop, b"")
+        routes[hop] = (302, "https://evil.example/p.skill.zip", b"")
+        got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "hop.zip")))
+        check("...on the second hop as well as the first", got, None)
+
+        chain = ["https://objects.githubusercontent.com/%d" % i for i in range(m.UPDATE_MAX_REDIRECTS + 2)]
+        routes[start] = (302, chain[0], b"")
+        for a, b in zip(chain, chain[1:]):
+            routes[a] = (302, b, b"")
+        got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "long.zip")))
+        check("a redirect chain past UPDATE_MAX_REDIRECTS is refused", (got is None, bool(err)), (True, True))
+
+        api = "https://api.github.com/repos/o/r/releases/latest"
+        routes[api] = (302, "https://evil.example/latest.json", b"")
+        routes["https://evil.example/latest.json"] = (200, None, b'{"tag_name":"v99.0.0"}')
+        got, err = attempt(lambda: m._gh_get(api))
+        check("the release lookup refuses an off-github redirect too", got, None)
+        routes[api] = (200, None, b'{"tag_name":"v1.0.0"}')
+        check("...and still reads a direct answer", attempt(lambda: m._gh_get(api))[0], b'{"tag_name":"v1.0.0"}')
+    finally:
+        urllib.request.build_opener = real_build
+        urllib.request._opener = saved_opener
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     live = "--live" in sys.argv
     print("Meridian connect preflight — smoke tests\n" + "-" * 42)
@@ -6343,6 +6773,9 @@ def main():
     test_selfupdate_held_dir(m)
     test_whats_new(m)
     test_package_stamp()
+    test_publish_public()
+    test_low_findings(m)
+    test_update_redirects(m)
     test_licensing()
     test_brand_fallback(m)
     test_public_variants()

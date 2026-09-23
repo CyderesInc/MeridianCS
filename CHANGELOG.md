@@ -3,6 +3,25 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.26.0 - 2026-09-23
+
+- **Teams alerts now arrive.** They were sent in a format the standard Teams Workflows webhook
+  accepts and then silently drops, so no alert ever reached the channel. They now arrive as a card.
+- **Keep reports and exports out of the skill's folder:** updates replace it and delete anything
+  saved there. If you scheduled a report from the old examples, point it at `~/meridian-reports`.
+  The skill now warns if one would land there.
+- **A raw API call that could change your stack now needs `--allow-write`.** The skill adds it only
+  after you confirm that specific change. Queries are unaffected.
+- **Update downloads can't be redirected away from GitHub.** Every redirect on the way to a
+  release is checked, not only the first address, and a switch to unencrypted `http` is refused.
+- **Reports can't be hijacked by a file in the current folder.** To build a PDF, the skill now runs
+  only a browser installed as a real program, never a script that happens to sit in the working
+  folder.
+- **Digest reports escape the values they show**, so text from your stack can no longer inject
+  markup into one.
+- **The connector summary at the start of each session takes up less of the conversation.** Each
+  warning is stated once, and every connector it affects points back to it.
+
 ## 2.25.0 - 2026-09-23
 
 - **The skill now tells you what changed when it updates.** The first session on a new version

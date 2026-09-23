@@ -24,6 +24,15 @@ fields.*.json
 !Cyderes-Meridian-Skill-Enhancements.pdf
 !Cyderes-MeridianCS-Brief.pdf
 
+# Outputs a verb wrote into the skill folder: `> top.json`, `--format csv --out x.csv`. They carry
+# the same personal data as the PDFs, and `git add -A` (the shipping flow) would commit them. Root
+# and scripts/ only, because those are the two directories the commands run from; tracked JSON
+# elsewhere (evals/, design/, references/) is unaffected. sbom.cdx.json is generated and tracked.
+/*.json
+!/sbom.cdx.json
+/scripts/*.json
+*.csv
+
 # Local tool venv (see CLAUDE.md Testing). Not ignoring it would let a venv be committed,
 # and make-package.py packages `git ls-files` -- it would ship inside a customer skill.
 .venv*/
