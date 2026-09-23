@@ -7327,6 +7327,135 @@ def _write_updatecheck(rec):
         pass
 
 
+# What's new: CHANGELOG.md ships in every package, so the release an install just moved to always
+# carries its own notes. Users never open the skill folder, so the notes only reach anyone if the
+# skill says them -- once, in the first session on a new version. `.lastseen` records the last
+# version announced; it is separate from `.updatecheck` because every updater, old ones included,
+# rewrites that file with the NEW version straight after an apply, erasing the one fact needed here.
+WHATS_NEW_MAX_VERSIONS = 3     # an install that skipped ten releases gets the newest three, and a count
+WHATS_NEW_MAX_ITEMS = 4        # per version; the full list is one "what's new?" away in CHANGELOG.md
+WHATS_NEW_ITEM_CHARS = 240
+_CHANGELOG_HEAD_RE = re.compile(r"^##\s+\[?v?(\d+\.\d+\.\d+)\]?")
+
+
+def _changelog_path():
+    return os.path.join(INSTALL_REAL, "CHANGELOG.md")
+
+
+def _lastseen_path():
+    return os.path.join(CFG_DIR, ".lastseen")
+
+
+def parse_changelog(text):
+    """CHANGELOG.md -> [(version, [item, ...]), ...] in file order (newest first by convention).
+
+    An item is one top-level "- " bullet with its indented continuation lines folded in, whitespace
+    collapsed and capped. Anything else -- prose, sub-bullets' own markers, blank lines -- is layout.
+    """
+    out, items, cur = [], None, None
+    for line in (text or "").splitlines():
+        m = _CHANGELOG_HEAD_RE.match(line)
+        if m:
+            items = []
+            out.append((m.group(1), items))
+            cur = None
+            continue
+        if items is None:
+            continue
+        if line.startswith("## "):          # a heading that is not a version ends the section
+            items, cur = None, None
+            continue
+        if line.startswith("- "):
+            cur = [line[2:].strip()]
+            items.append(cur)
+        elif cur is not None and line.startswith((" ", "\t")) and line.strip():
+            cur.append(line.strip())
+        elif not line.strip():
+            cur = None
+    return [(v, [_cap(" ".join(parts)) for parts in its]) for v, its in out]
+
+
+def _cap(s, n=WHATS_NEW_ITEM_CHARS):
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if len(s) <= n else s[:n - 1].rstrip() + "\u2026"
+
+
+def whats_new(prev, current, path=None):
+    """Changelog entries newer than `prev`, up to and including `current`, newest first.
+
+    `prev` None means "some earlier version, unknown": only `current`'s own entry is returned rather
+    than guessing how far back to go. A version with no entry is simply absent -- never an empty
+    "nothing changed", which would be a claim the file does not make.
+    """
+    cv, pv = parse_version(current), parse_version(prev) if prev else None
+    if not cv:
+        return []
+    try:
+        with open(path or _changelog_path(), encoding="utf-8-sig") as f:
+            entries = parse_changelog(f.read())
+    except Exception:  # noqa - no changelog is no announcement, not a failure
+        return []
+    picked = []
+    for v, items in entries:
+        vv = parse_version(v)
+        if not vv or vv > cv or (pv and vv <= pv) or (not pv and vv != cv):
+            continue
+        rec = {"version": v, "items": items[:WHATS_NEW_MAX_ITEMS]}
+        if len(items) > WHATS_NEW_MAX_ITEMS:
+            rec["moreItems"] = len(items) - WHATS_NEW_MAX_ITEMS
+        picked.append(rec)
+    picked.sort(key=lambda r: parse_version(r["version"]), reverse=True)
+    return picked[:WHATS_NEW_MAX_VERSIONS]
+
+
+def _read_lastseen():
+    try:
+        with open(_lastseen_path(), encoding="utf-8-sig") as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else None
+    except Exception:  # noqa
+        return None
+
+
+def _write_lastseen(version):
+    try:
+        _private_write(_lastseen_path(), {"schema": 1, "version": version})
+    except Exception:  # noqa - failing to record means announcing again next session, not breaking
+        pass
+
+
+def announce_whats_new(res, prior_cache):
+    """Attach `whatsNew` to a check result on the first session after this install changed version.
+
+    `prior_cache` is `.updatecheck` as it was BEFORE this session's check rewrote it. Three cases:
+    `.lastseen` exists -> announce everything newer than it. No `.lastseen` but a prior cache -> the
+    skill ran here before this feature existed, so it was updated: announce the range from the
+    cache's version if that is older, else just this version's entry (an older updater rewrote the
+    cache with the new version, so how far back is unknown). Neither -> a fresh install, which has
+    nothing to be told is new. A copy with no comparable version (a working tree) never announces.
+    """
+    local = res.get("installedVersion")
+    lv = parse_version(local)
+    if not lv or res.get("state") == "dev":
+        return res
+    seen = _read_lastseen()
+    announce, prev = False, None
+    if seen is not None:
+        sv = parse_version(seen.get("version"))
+        announce, prev = (not sv or sv < lv), (seen.get("version") if sv and sv < lv else None)
+    elif prior_cache:
+        pv = parse_version(prior_cache.get("installedVersion"))
+        announce, prev = True, (prior_cache.get("installedVersion") if pv and pv < lv else None)
+    if seen is None or parse_version(seen.get("version")) != lv:
+        _write_lastseen(local)
+    if announce:
+        notes = whats_new(prev, local)
+        if notes:
+            res = dict(res, whatsNew=notes, updatedFrom=prev,
+                       changelog=_changelog_path())
+    return res
+
+
 def check_update(force=False, now=None):
     """Is a newer release available? Returns a state dict and never raises.
 
@@ -7611,7 +7740,10 @@ def apply_update(rel):
                             "repo": rel.get("repo"), "installedVersion": want, "latestVersion": want,
                             "state": "current", "installDir": INSTALL_REAL,
                             "message": "Up to date on %s." % want})
+        _write_lastseen(want)
+        notes = whats_new(rel.get("installedVersion"), want)   # the NEW CHANGELOG.md is on disk now
         return {"applied": True, "fromVersion": rel.get("installedVersion"), "toVersion": want,
+                **({"whatsNew": notes, "changelog": _changelog_path()} if notes else {}),
                 "commit": (stamp or {}).get("commit"), "installDir": INSTALL_REAL,
                 "assetBytes": size, "swap": swap,
                 # The skill's instructions were loaded into this session BEFORE the swap, so the
@@ -7633,9 +7765,10 @@ def cmd_selfupdate(a):
     """
     apply_it = bool(getattr(a, "apply", False))
     force = bool(getattr(a, "force", False))
+    prior = _read_updatecheck()          # before check_update rewrites it -- see announce_whats_new
     res = check_update(force=force or apply_it)
     if not apply_it:
-        jout(res); return
+        jout(announce_whats_new(res, prior)); return
     if res.get("state") in ("dev", "disabled", "unknown"):
         # --force overrides the "you already have it" check, NOT these. A dev tree must not be
         # overwritten however hard the caller insists, and there is nothing to install when the

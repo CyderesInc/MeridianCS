@@ -50,6 +50,7 @@ import filecmp
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -138,6 +139,14 @@ def verify_package(zip_path, version):
         for need in ("meridiancs/SKILL.md", "meridiancs/scripts/meridian.py"):
             if need not in names:
                 problems.append("missing required member: %s" % need)
+        # Every install that updates from this package reads its CHANGELOG entry to say what
+        # changed; without one the release reaches users with nothing to tell them.
+        try:
+            notes = z.read("meridiancs/CHANGELOG.md").decode("utf-8-sig")
+        except KeyError:
+            notes = ""
+        if not re.search(r"^##\s+\[?v?%s\]?(\s|$)" % re.escape(version), notes, re.M):
+            problems.append("CHANGELOG.md in the package has no `## %s` entry" % version)
     return problems
 
 

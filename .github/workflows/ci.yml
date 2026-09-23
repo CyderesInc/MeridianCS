@@ -5,12 +5,21 @@
 # Both OSes on purpose: the suite has platform-conditional paths that a single runner never
 # exercises — POSIX 0600 permission assertions and fcntl locking run only on Linux; the msvcrt
 # byte-range lock, cp1252 console handling, and Windows path behavior run only on Windows.
+# Actions are pinned to commit SHAs, not tags: a tag can be re-pointed by whoever controls the
+# action's repo, which is how the tj-actions compromise reached every workflow trusting `@v<N>`.
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+
+# Read-only, declared here rather than inherited. Installs update themselves from the public repo's
+# latest release, so anything that can create a release can ship code to every install -- and a
+# workflow on `main` inherits whatever the repo default token allows. The repo default is now read
+# too, but a file that states it survives a settings change, and a fork of this repo inherits it.
+permissions:
+  contents: read
 
 jobs:
   offline-suite:
@@ -20,8 +29,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Offline test suite
@@ -41,8 +50,8 @@ jobs:
     # package) and SBOM currency are asserted by the offline suite above, on both OSes.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Documentation generators carry no real identifiers
@@ -51,28 +60,29 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - uses: pre-commit/action@v3.0.1
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
 
   package:
     # The zip is how anyone outside a working tree gets the skill, so a PR that breaks the build
     # or its determinism should fail here, not at release time. The version is a placeholder;
     # real releases still build locally per CLAUDE.md and verify against the published asset.
+    # Explicitly-named output on purpose: that is make-package.py's one-off path. The release path
+    # (no output name) refuses a version with no CHANGELOG.md entry, and 0.0.0 is not a release.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Package builds and is deterministic
         run: |
-          python scripts/make-package.py --version 0.0.0
-          sha1=$(sha256sum meridiancs.v0.0.0.skill.zip | cut -d' ' -f1)
-          mv meridiancs.v0.0.0.skill.zip /tmp/first.zip
-          python scripts/make-package.py --version 0.0.0
-          sha2=$(sha256sum meridiancs.v0.0.0.skill.zip | cut -d' ' -f1)
+          python scripts/make-package.py /tmp/first.skill.zip --version 0.0.0
+          python scripts/make-package.py /tmp/second.skill.zip --version 0.0.0
+          sha1=$(sha256sum /tmp/first.skill.zip | cut -d' ' -f1)
+          sha2=$(sha256sum /tmp/second.skill.zip | cut -d' ' -f1)
           echo "build1=$sha1  build2=$sha2"
           test "$sha1" = "$sha2"

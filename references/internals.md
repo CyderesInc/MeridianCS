@@ -115,6 +115,11 @@ Things not to change without reading why:
   that restore can't finish, the error names the backup directory and it is **never deleted**. The
   result's `swap` says which path ran (`directory` or `contents`). A process parked in a
   *subdirectory* (`scripts/`) still blocks that entry and rolls the update back.
+- **What's new comes from `CHANGELOG.md`, once.** The first launch check on a new version carries
+  `whatsNew` (that release's entries, capped), and `~/.meridian/.lastseen` records the version
+  announced so the next session stays quiet. It runs in the new version's check rather than in the
+  updater, so an install moved by an older updater still hears about it. A fresh install announces
+  nothing. A release cannot be built without its changelog entry.
 - **After an apply, the scripts on disk are newer than the SKILL.md already in context.** The result
   carries a `note` saying the new instructions take effect next session; SKILL.md §0.5 requires that
   be surfaced. Without it, an update reads as behaviour changing for no reason.

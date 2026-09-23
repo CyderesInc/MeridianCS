@@ -207,6 +207,9 @@ reason it can be left on:
 - **The update takes full effect in your *next* session.** The scripts are live immediately, but the
   skill's instructions were loaded into the running session before the swap, so the message says so
   rather than leaving you to wonder why something changed.
+- **You're told what changed.** The first session on a new version lists that release's
+  highlights from [CHANGELOG.md](CHANGELOG.md), and asking "what's new in the Meridian skill?"
+  reads the whole of it. A fresh install says nothing, because nothing is new to it.
 - **A failed check is silent, and never claims success.** If GitHub is unreachable, a corporate proxy
   is in the way, or the anonymous rate limit is hit, the skill carries on with the version you have
   and says nothing. It will not report "up to date" when it could not actually tell.
@@ -224,8 +227,8 @@ Tagged [releases](https://github.com/CyderesInc/MeridianCS/releases) carry the p
 asset is built from that tag's tree and is never re-uploaded afterwards, so a given version always
 means the same bytes. Copies from v2.23.0 or earlier do not upgrade themselves (see
 [Staying up to date](#staying-up-to-date)): replace the folder contents — there are
-no configuration changes, and your saved credentials in `~/.meridian/` are untouched. Patch versions
-cover refreshed documentation; the skill's behaviour changes only on a minor bump.
+no configuration changes, and your saved credentials in `~/.meridian/` are untouched. Patch versions carry fixes and refreshed documentation; new capability comes with a
+minor bump. [CHANGELOG.md](CHANGELOG.md) says which is which.
 
 Rebuild the package with `python scripts/make-package.py --version <X.Y.Z>` after any behaviour
 change — it's a build artifact, gitignored, and nothing in the repo will flag it as stale.
@@ -295,6 +298,7 @@ reading the file directly; `sandbox.credentials.files` covers that path if you r
 
 ```text
 SKILL.md                     workflow + connection + query translation + presentation + safety
+CHANGELOG.md                 what changed in each release; the skill reads it after an update
 references/                  authentication, query-syntax, api-reference, field-map, recipes
 scripts/
   meridian.py                the CLI — every verb, plus the PDF report generator

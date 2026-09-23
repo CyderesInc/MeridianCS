@@ -6126,6 +6126,166 @@ def test_selfupdate_held_dir(m):
         os.environ.pop("MERIDIAN_UPDATE_REPO", None)
 
 
+WN_CHANGELOG = """Intro prose that is not an entry.
+
+## 2.25.0 - 2026-09-23
+
+- **Newest.** first item
+  with a continuation line
+- second
+- third
+- fourth
+- fifth
+
+## 2.24.3
+
+- **Middle.** item
+
+## 2.24.2
+
+- **Oldest.** item
+"""
+
+
+def test_whats_new(m):
+    """The release an install moved to announces itself once, from its own CHANGELOG.md.
+
+    Users never open the skill folder, so the changelog only reaches anyone if the skill says it.
+    The detection has to survive being updated BY an older updater, which rewrites `.updatecheck`
+    with the new version straight after an apply -- which is why `.lastseen` is its own file.
+    """
+    print("[35] what's new: changelog parsing, first-session announcement, release guard (offline)")
+    root = os.path.dirname(HERE)
+
+    # --- the shipped CHANGELOG.md is well-formed ---------------------------------------------------
+    with open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8-sig") as f:
+        real = m.parse_changelog(f.read())
+    versions = [m.parse_version(v) for v, _ in real]
+    check("CHANGELOG.md parses into version entries", len(real) >= 4 and all(versions), True)
+    check("... newest first, no duplicates", versions == sorted(set(versions), reverse=True), True)
+    check("... every entry says something", all(items for _, items in real), True)
+
+    # --- parsing and range selection ---------------------------------------------------------------
+    parsed = m.parse_changelog(WN_CHANGELOG)
+    check("entries and items parse, prose ignored", [(v, len(i)) for v, i in parsed],
+          [("2.25.0", 5), ("2.24.3", 1), ("2.24.2", 1)])
+    check("continuation lines fold into their item", parsed[0][1][0],
+          "**Newest.** first item with a continuation line")
+    tmp = tempfile.mkdtemp()
+    try:
+        cl = os.path.join(tmp, "CHANGELOG.md")
+        with open(cl, "w", encoding="utf-8") as f:
+            f.write(WN_CHANGELOG)
+        wn = m.whats_new("2.24.2", "2.25.0", path=cl)
+        check("everything newer than the last-seen version, newest first",
+              [r["version"] for r in wn], ["2.25.0", "2.24.3"])
+        check("... items capped, with the remainder counted", (len(wn[0]["items"]), wn[0].get("moreItems")),
+              (m.WHATS_NEW_MAX_ITEMS, 5 - m.WHATS_NEW_MAX_ITEMS))
+        check("an unknown earlier version announces only the current entry",
+              [r["version"] for r in m.whats_new(None, "2.25.0", path=cl)], ["2.25.0"])
+        check("a version with no entry announces nothing, not 'nothing changed'",
+              m.whats_new("2.25.0", "2.26.0", path=cl), [])
+        check("no changelog is no announcement, not an error", m.whats_new("2.24.2", "2.25.0",
+                                                                           path=cl + ".missing"), [])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- the first-session announcement ------------------------------------------------------------
+    tmp = tempfile.mkdtemp()
+    install = _su_install(tmp, "2.25.0")
+    with open(os.path.join(install, "CHANGELOG.md"), "w", encoding="utf-8") as f:
+        f.write(WN_CHANGELOG)
+    env = _SUEnv(m, install, tmp)
+    os.makedirs(m.CFG_DIR, exist_ok=True)
+    lastseen = os.path.join(m.CFG_DIR, ".lastseen")
+
+    def seen(v):
+        with open(lastseen, "w", encoding="utf-8") as f:
+            json.dump({"schema": 1, "version": v}, f)
+
+    def announce(prior=None, local="2.25.0", state="current"):
+        return m.announce_whats_new({"installedVersion": local, "state": state}, prior)
+
+    try:
+        r = announce()
+        check("a fresh install announces nothing", "whatsNew" in r, False)
+        check("... but records the version it started on",
+              json.load(open(lastseen, encoding="utf-8")).get("version"), "2.25.0")
+        check("the next session on the same version announces nothing", "whatsNew" in announce(), False)
+
+        seen("2.24.3")
+        r = announce()
+        check("the first session after an update announces the new entries",
+              ([x["version"] for x in r.get("whatsNew", [])], r.get("updatedFrom")), (["2.25.0"], "2.24.3"))
+        check("... once: the session after says nothing", "whatsNew" in announce(), False)
+
+        os.remove(lastseen)
+        r = announce(prior={"installedVersion": "2.25.0", "state": "current"})
+        check("updated by a pre-2.25 updater (cache already says the new version): current entry only",
+              ([x["version"] for x in r.get("whatsNew", [])], r.get("updatedFrom")), (["2.25.0"], None))
+
+        os.remove(lastseen)
+        r = announce(prior={"installedVersion": "2.24.2", "state": "current"})
+        check("replaced by hand (cache still says the old version): the whole range",
+              [x["version"] for x in r.get("whatsNew", [])], ["2.25.0", "2.24.3"])
+
+        os.remove(lastseen)
+        r = announce(local=None, state="dev", prior={"installedVersion": "2.24.2"})
+        check("a working tree never announces", "whatsNew" in r, False)
+        check("... and never records a version", os.path.exists(lastseen), False)
+
+        # --- the apply path announces straight away, and records it -------------------------------
+        seen("2.25.0")
+        pkg = _su_package(tmp, "2.26.0", extra={"meridiancs/CHANGELOG.md":
+                                                "## 2.26.0\n\n- **Brand new.** thing\n\n" + WN_CHANGELOG})
+        saved = (m.latest_release, m._download_asset)
+        m.latest_release = lambda repo: {"version": "2.26.0", "tag": "v2.26.0",
+                                         "assetName": "x.skill.zip", "assetSize": 1,
+                                         "assetUrl": "https://github.com/o/r/releases/download/v2.26.0/x.skill.zip"}
+        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
+        os.environ["MERIDIAN_UPDATE_REPO"] = "jwood25/meridiancs-public"
+        try:
+            with open(os.path.join(install, "VERSION.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema": 1, "version": "2.25.0", "commit": "c"}, f)
+            res = m.apply_update(m.check_update(force=True))
+            check("an apply reports the new version's notes from the NEW changelog",
+                  [x["version"] for x in res.get("whatsNew", [])], ["2.26.0"])
+            check("... and records them as seen, so the next session doesn't repeat them",
+                  "whatsNew" in announce(local="2.26.0", prior=m._read_updatecheck()), False)
+        finally:
+            m.latest_release, m._download_asset = saved
+            os.environ.pop("MERIDIAN_UPDATE_REPO", None)
+    finally:
+        env.restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- a release cannot be built without its entry ----------------------------------------------
+    script = os.path.join(root, "scripts", "make-package.py")
+    r = subprocess.run([sys.executable, script, "--version", "9.9.7"], capture_output=True, text=True,
+                       cwd=root)
+    check("make-package refuses a release with no changelog entry",
+          (r.returncode, "no `## 9.9.7` entry" in r.stdout), (1, True))
+    check("... and writes no package", os.path.exists(os.path.join(root, "meridiancs.v9.9.7.skill.zip")),
+          False)
+    out = os.path.join(tempfile.mkdtemp(), "probe.skill.zip")
+    subprocess.run([sys.executable, script, out, "--version", "9.9.7", "--allow-dirty"],
+                   capture_output=True, text=True, cwd=root)
+    import zipfile
+    with zipfile.ZipFile(out) as z:
+        check("CHANGELOG.md ships in the package", "meridiancs/CHANGELOG.md" in z.namelist(), True)
+    shutil.rmtree(os.path.dirname(out), ignore_errors=True)
+
+    # --- SKILL.md carries the rules, not just the code ---------------------------------------------
+    with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as f:
+        skill = re.sub(r"\s+", " ", f.read())
+    for rule in ('`whatsNew` on a check result is the one exception to "say nothing".',
+                 "Show it **once**",
+                 'never "nothing new"',
+                 "read `CHANGELOG.md` in the skill folder",
+                 "never reconstruct release history from memory"):
+        check("SKILL.md still says: %s" % rule[:48], rule in skill, True)
+
+
 def main():
     live = "--live" in sys.argv
     print("Meridian connect preflight — smoke tests\n" + "-" * 42)
@@ -6181,6 +6341,7 @@ def main():
     test_alerts_notify(m)
     test_selfupdate(m)
     test_selfupdate_held_dir(m)
+    test_whats_new(m)
     test_package_stamp()
     test_licensing()
     test_brand_fallback(m)

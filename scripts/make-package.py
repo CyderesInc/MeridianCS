@@ -151,6 +151,15 @@ def resolve_version(explicit, required=True):
     sys.exit(1)
 
 
+def changelog_has(version, text):
+    """Does CHANGELOG.md carry a `## <version>` entry? The skill reads that entry to tell users what
+    changed after it updates, so a release built without one ships silently -- the same class as a
+    package built without its feed address. A heading, not a mention: "fixed in 2.25.0" in prose
+    elsewhere is not an entry."""
+    pat = re.compile(r"^##\s+\[?v?%s\]?(\s|$)" % re.escape(version), re.M)
+    return bool(pat.search(text or ""))
+
+
 def main():
     argv = sys.argv[1:]
     allow_dirty = "--allow-dirty" in argv
@@ -172,6 +181,16 @@ def main():
     else:
         version = resolve_version(version)
         out = os.path.join(SKILL, "meridiancs.v%s.skill.zip" % version)
+        # The release path only: an explicitly-named one-off build is not a release.
+        try:
+            with open(os.path.join(SKILL, "CHANGELOG.md"), encoding="utf-8-sig") as f:
+                notes = f.read()
+        except OSError:
+            notes = ""
+        if not changelog_has(version, notes):
+            print("CHANGELOG.md has no `## %s` entry. Add one before building the release: the skill\n"
+                  "reads it to tell users what changed, and a release without one ships silently." % version)
+            sys.exit(1)
     # .gitignore matches `*.skill.zip`. A name outside that pattern stops being ignored and could be
     # committed -- which is how a package carrying whatever was on disk ends up in the repo. Enforced
     # rather than merely documented, because the failure is silent.

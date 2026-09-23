@@ -75,8 +75,8 @@ python scripts/meridian.py selfupdate
 ```
 
 Cheap: the verdict is cached for a day, so most sessions answer from disk. Match the returned
-`state` exactly — and for five of the six, **say nothing at all**. A version check is housekeeping,
-not an answer:
+`state` exactly — and for five of the six, **say nothing at all**, unless the result carries
+`whatsNew` (below). A version check is housekeeping, not an answer:
 
 | `state` | Meaning | Your response |
 |---|---|---|
@@ -103,6 +103,13 @@ from the JSON:
 **Keep that last clause.** These instructions loaded *before* the swap, so the scripts on disk are
 now newer than the SKILL.md you are following — an update that changes behaviour without saying so is
 indistinguishable from a bug.
+
+**`whatsNew` on a check result is the one exception to "say nothing".** It appears only in the
+first session on a new version. Show it **once**, after the §0 disclaimer and before the
+greeting: a `🆕 **What's new in meridiancs {version}**` line, then up to three bullets from its
+newest entry, each cut to its bold lead-in. An applied update's `whatsNew` goes the same way, under
+its 🔄 line. Without `whatsNew`, say nothing, and never "nothing new": its absence means there was
+nothing to announce, not that nothing changed.
 
 If the result has `"applied": false` — a rejected package, a failed download, anything — **say
 nothing about it** and carry on. The updater leaves a working skill on every failure path, and a
@@ -649,7 +656,8 @@ Pick the script from the question shape; exact flags live in
 | The user's question | Verb |
 |---|---|
 | *(always, first thing in a session)* | `meridian.py connect --with-connectors` |
-| *(always, once per session, alongside the connect above)* | `meridian.py selfupdate` — see §0.5; stay silent on every state except `outdated` |
+| *(always, once per session, alongside the connect above)* | `meridian.py selfupdate` — see §0.5; stay silent on every state except `outdated`, and a result carrying `whatsNew` |
+| "what's new in the skill" / "what changed in this version" | read `CHANGELOG.md` in the skill folder and summarise the releases asked about. It is the only source: never reconstruct release history from memory |
 | "connector status" / "what data do we have" / "which connectors are failing" | `meridian.py connectors` |
 | "top/highest/riskiest/most-vulnerable X" | `meridian.py top` |
 | "tell me about / investigate / risk of `<name>`" | `meridian.py profile` — **returns `findings` + `recommendations`; use them** |
