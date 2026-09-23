@@ -5977,6 +5977,155 @@ def test_security_hardening(m):
         check("Slack renderer handles the fixture", type(e).__name__, None)
 
 
+def test_selfupdate_held_dir(m):
+    """An install directory some process is sitting in must still update.
+
+    Windows refuses to rename a directory that is any process's working directory, and the likeliest
+    such process is the assistant's own shell after `cd <skill dir>`. Found verifying v2.24.2 against
+    the live feed: a stamped-back install with a process parked in it failed every apply with
+    WinError 32, silently, while every earlier end-to-end check had run from outside the directory.
+    The simulated lock runs everywhere; the real one runs wherever the OS enforces it (Windows CI).
+    """
+    print("[34] selfupdate: an install directory in use still updates (offline)")
+
+    def fake(version):
+        def _f(repo):
+            return {"version": version, "tag": "v" + version,
+                    "assetName": "meridiancs.v%s.skill.zip" % version,
+                    "assetUrl": "https://github.com/o/r/releases/download/v%s/x.skill.zip" % version,
+                    "assetSize": 1234}
+        return _f
+
+    def leftovers(install):
+        return sorted(d for d in os.listdir(os.path.dirname(install))
+                      if d.startswith((".meridiancs-", "meridiancs.previous")))
+
+    def read(install, rel):
+        with open(os.path.join(install, rel), encoding="utf-8") as f:
+            return f.read()
+
+    # getattr with a default so this can run against a build without the hooks -- which is how it
+    # was shown to fail against the pre-fix apply path rather than only to pass against the fix.
+    saved = {n: getattr(m, n, None) for n in ("latest_release", "_download_asset", "_rename_dir",
+                                              "_move_entry")}
+    real_replace = os.replace
+
+    def locked_rename(src, dst):
+        if os.path.realpath(src) == m.INSTALL_REAL:
+            raise PermissionError(13, "simulated WinError 32: directory in use", src)
+        return real_replace(src, dst)
+
+    def scenario(version, pkg_version=None):
+        tmp = tempfile.mkdtemp()
+        install = _su_install(tmp, version)
+        with open(os.path.join(install, "old-only.txt"), "w", encoding="utf-8") as f:
+            f.write("from the old install")
+        env = _SUEnv(m, install, tmp)
+        pkg = _su_package(tmp, pkg_version or "2.24.3")
+        m.latest_release = fake(pkg_version or "2.24.3")
+        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
+        return tmp, install, env
+
+    os.environ["MERIDIAN_UPDATE_REPO"] = "jwood25/meridiancs-public"
+    try:
+        # --- 1. the directory cannot be renamed: the contents are swapped instead ----------------
+        tmp, install, env = scenario("2.24.2")
+        try:
+            m._rename_dir = locked_rename
+            ident = os.stat(install)
+            res = m.apply_update(m.check_update(force=True))
+            check("a locked install directory still updates", (res.get("applied"), res.get("toVersion")),
+                  (True, "2.24.3"))
+            check("... by swapping its contents", res.get("swap"), "contents")
+            check("... in place (same directory, not a replacement)",
+                  os.path.samestat(ident, os.stat(install)), True)
+            check("the new stamp and SKILL.md landed",
+                  (m.installed_version().get("version"), "stub skill 2.24.3" in read(install, "SKILL.md")),
+                  ("2.24.3", True))
+            check("the old install's files are gone, as with a directory swap",
+                  os.path.exists(os.path.join(install, "old-only.txt")), False)
+            check("nothing is left beside the install", leftovers(install), [])
+        finally:
+            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
+
+        # --- 2. a failure mid-swap puts every old entry back -------------------------------------
+        tmp, install, env = scenario("2.24.2")
+        try:
+            m._rename_dir = locked_rename
+
+            def failing_move(src, dst):
+                # Only the move IN from staging fails; moving the old entry back must still work.
+                if (os.path.basename(dst) == "scripts" and os.path.dirname(dst) == m.INSTALL_REAL
+                        and "unpacked" in src):
+                    raise PermissionError(13, "simulated: cannot move scripts in", dst)
+                return real_replace(src, dst)
+            m._move_entry = failing_move
+            try:
+                m.apply_update(m.check_update(force=True))
+                check("a failed contents swap is reported", "applied", "raised")
+            except OSError:
+                check("a failed contents swap is reported", "raised", "raised")
+            check("... and the old install is back, whole",
+                  (m.installed_version().get("version"), read(install, "SKILL.md"),
+                   read(install, "scripts/meridian.py"), read(install, "old-only.txt")),
+                  ("2.24.2", "# installed 2.24.2\n", "print('old')\n", "from the old install"))
+            check("... with nothing left beside it", leftovers(install), [])
+        finally:
+            m._move_entry = saved["_move_entry"] or os.replace
+            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
+
+        # --- 3. a restore that cannot finish never deletes the only copy -------------------------
+        tmp, install, env = scenario("2.24.2")
+        try:
+            m._rename_dir = locked_rename
+
+            def stuck_move(src, dst):
+                parent = os.path.dirname(dst)
+                if os.path.basename(dst) == "scripts" and parent == m.INSTALL_REAL and "unpacked" in src:
+                    raise PermissionError(13, "simulated: cannot move scripts in", dst)
+                if os.path.basename(src) == "SKILL.md" and ".meridiancs-previous-" in src:
+                    raise PermissionError(13, "simulated: cannot restore SKILL.md", src)
+                return real_replace(src, dst)
+            m._move_entry = stuck_move
+            try:
+                m.apply_update(m.check_update(force=True))
+                check("an incomplete restore is reported", "applied", "raised")
+            except RuntimeError as e:
+                check("an incomplete restore is reported, naming where the old files are",
+                      ".meridiancs-previous-" in str(e) and "SKILL.md" in str(e), True)
+            kept = [d for d in leftovers(install) if d.startswith(".meridiancs-previous-")]
+            check("... and that directory is kept, holding the stuck file",
+                  len(kept) == 1 and os.path.exists(os.path.join(os.path.dirname(install), kept[0],
+                                                                 "SKILL.md")) if kept else False, True)
+        finally:
+            m._move_entry = saved["_move_entry"] or os.replace
+            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
+
+        # --- 4. for real: another process's working directory is the install ---------------------
+        m._rename_dir = saved["_rename_dir"] or os.replace
+        tmp, install, env = scenario("2.24.2")
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=install)
+        try:
+            res = m.apply_update(m.check_update(force=True))
+            check("an install another process is parked in updates", res.get("applied"), True)
+            # Where the OS enforces the lock this has to take the fallback; elsewhere the plain
+            # rename works and must still be what runs.
+            check("... via the swap this OS needs", res.get("swap"),
+                  "contents" if os.name == "nt" else "directory")
+            check("... and lands the new version", m.installed_version().get("version"), "2.24.3")
+        finally:
+            holder.kill(); holder.wait()
+            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        for n, v in saved.items():
+            if v is None:
+                if hasattr(m, n):
+                    delattr(m, n)
+            else:
+                setattr(m, n, v)
+        os.environ.pop("MERIDIAN_UPDATE_REPO", None)
+
+
 def main():
     live = "--live" in sys.argv
     print("Meridian connect preflight — smoke tests\n" + "-" * 42)
@@ -6031,6 +6180,7 @@ def main():
     test_alerts(m)
     test_alerts_notify(m)
     test_selfupdate(m)
+    test_selfupdate_held_dir(m)
     test_package_stamp()
     test_licensing()
     test_brand_fallback(m)

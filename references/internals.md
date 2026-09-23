@@ -106,6 +106,15 @@ Things not to change without reading why:
   smoke test, move the live tree aside, move the new one in, and only then delete the old — restoring
   it if the move-in fails. A half-updated skill is the worst outcome available here, and the smoke
   test is what turns "we replaced your skill with a broken zip" into a rejected package.
+- **When the directory can't be renamed, its contents are swapped instead.** Windows refuses to
+  rename a directory that is *any* process's working directory (WinError 32), and the likeliest such
+  process is the assistant's own shell after `cd` into the skill. Every update on such an install used
+  to fail with `applied: false`, and since §0.5 is silent on that, it failed every session and no
+  release ever arrived. The fallback moves each entry to a fresh `.meridiancs-previous-*` directory
+  beside the install, moves the new entries in, and moves everything back on any failure. If even
+  that restore can't finish, the error names the backup directory and it is **never deleted**. The
+  result's `swap` says which path ran (`directory` or `contents`). A process parked in a
+  *subdirectory* (`scripts/`) still blocks that entry and rolls the update back.
 - **After an apply, the scripts on disk are newer than the SKILL.md already in context.** The result
   carries a `note` saying the new instructions take effect next session; SKILL.md §0.5 requires that
   be surfaced. Without it, an update reads as behaviour changing for no reason.

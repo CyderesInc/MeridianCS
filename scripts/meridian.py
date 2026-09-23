@@ -7496,6 +7496,53 @@ def _extract_package(zf, staged_root):
             shutil.copyfileobj(src, dst)
 
 
+# Both are os.replace; named so the tests can make the directory rename fail the way Windows does
+# when a process is parked in the install dir, which no POSIX runner can reproduce for real.
+_rename_dir = os.replace
+_move_entry = os.replace
+
+
+def _swap_contents(live, staged, backup):
+    """Replace `live`'s entries with `staged`'s, keeping `live` itself -- the fallback for when the
+    directory cannot be renamed. All or nothing: any failure moves every entry back and re-raises.
+
+    Windows refuses to rename a directory that is ANY process's working directory (WinError 32), and
+    the one process most likely to be sitting in the install dir is the assistant's own shell, after
+    a `cd` there to run `python scripts/meridian.py`. It does not refuse renaming the entries INSIDE
+    such a directory, so moving the contents is the swap that still works. Measured before this
+    existed: an install with a process parked in it failed every update with `applied: false`, and
+    SKILL.md is silent on that result -- so it retried and failed every session, and no release,
+    security patches included, ever reached that machine. Every earlier end-to-end check of the
+    apply path had run from outside the directory, which is why nobody saw it.
+    """
+    moved_out, moved_in = [], []
+    try:
+        for name in sorted(os.listdir(live)):
+            _move_entry(os.path.join(live, name), os.path.join(backup, name))
+            moved_out.append(name)
+        for name in sorted(os.listdir(staged)):
+            _move_entry(os.path.join(staged, name), os.path.join(live, name))
+            moved_in.append(name)
+    except Exception as e:
+        stuck = []
+        for name in reversed(moved_in):
+            try:
+                _move_entry(os.path.join(live, name), os.path.join(staged, name))
+            except Exception:  # noqa
+                stuck.append(name)
+        for name in reversed(moved_out):
+            try:
+                _move_entry(os.path.join(backup, name), os.path.join(live, name))
+            except Exception:  # noqa
+                stuck.append(name)
+        if stuck:
+            # The one failure that cannot be undone here: say exactly where the old files are, and
+            # never delete that directory -- it may hold the only copy of the working skill.
+            raise RuntimeError("%s; restoring the previous install was incomplete (%s) -- its files "
+                               "are in %s" % (e, ", ".join(stuck), backup))
+        raise
+
+
 def apply_update(rel):
     """Install `rel` (a check_update result) over this install. Returns a result dict; may raise.
 
@@ -7533,22 +7580,40 @@ def apply_update(rel):
         backup = INSTALL_REAL + ".previous"
         if os.path.exists(backup):
             shutil.rmtree(backup, ignore_errors=True)
-        os.replace(INSTALL_REAL, backup)
         try:
-            os.replace(staged, INSTALL_REAL)
-        except Exception:
-            os.replace(backup, INSTALL_REAL)   # put the working skill back before re-raising
+            _rename_dir(INSTALL_REAL, backup)
+            swap = "directory"
+        except OSError:
+            # Nothing has moved yet (a failed rename is atomic), so falling back is safe. The
+            # contents backup is a fresh directory rather than `.previous`, which may be a
+            # half-deleted leftover, and it is NOT under `tmp`: the finally below deletes `tmp`, and
+            # after an incomplete restore this directory is the only copy of the old skill.
             backup = None
-            raise
-        shutil.rmtree(backup, ignore_errors=True)
-        backup = None
+            held = tempfile.mkdtemp(prefix=".meridiancs-previous-", dir=parent)
+            try:
+                _swap_contents(INSTALL_REAL, staged, held)
+            except Exception:
+                if not os.listdir(held):   # restored in full: nothing of the old skill is in it
+                    os.rmdir(held)
+                raise
+            shutil.rmtree(held, ignore_errors=True)
+            swap = "contents"
+        if swap == "directory":
+            try:
+                os.replace(staged, INSTALL_REAL)
+            except Exception:
+                os.replace(backup, INSTALL_REAL)   # put the working skill back before re-raising
+                backup = None
+                raise
+            shutil.rmtree(backup, ignore_errors=True)
+            backup = None
         _write_updatecheck({"schema": UPDATE_CHECK_CACHE_SCHEMA, "checkedAt": time.time(),
                             "repo": rel.get("repo"), "installedVersion": want, "latestVersion": want,
                             "state": "current", "installDir": INSTALL_REAL,
                             "message": "Up to date on %s." % want})
         return {"applied": True, "fromVersion": rel.get("installedVersion"), "toVersion": want,
                 "commit": (stamp or {}).get("commit"), "installDir": INSTALL_REAL,
-                "assetBytes": size,
+                "assetBytes": size, "swap": swap,
                 # The skill's instructions were loaded into this session BEFORE the swap, so the
                 # scripts on disk are now newer than the SKILL.md the model is following. Saying so is
                 # the difference between an update and an unexplained change in behaviour.
