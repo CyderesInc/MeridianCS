@@ -236,7 +236,8 @@ On first use the skill prompts for your **Meridian FQDN** and a **User Generated
 [Getting an API token](#getting-an-api-token). Credentials are stored **outside this repo** at
 `~/.meridian/config.json` on macOS or `%USERPROFILE%\.meridian\config.json` on Windows (or the
 `MERIDIAN_FQDN` / `MERIDIAN_API_TOKEN` / `MERIDIAN_ACTION_TOKEN` environment variables) — never commit
-them.
+them. Save them with `stacks add` (below) rather than writing the file by hand: the script creates
+it owner-only and keeps the per-stack `entity_salt` that entity snapshots depend on.
 
 ```json
 { "fqdn": "company.lucidum.cloud", "api_token": "…", "action_token": "…(optional, LDG only)" }
@@ -249,13 +250,14 @@ stacks' credentials are never overwritten. All named stacks live in `~/.meridian
 existing single-stack `config.json` is migrated in automatically on first use.
 
 ```bash
-python scripts/meridian.py stacks add --name prod --fqdn acme.lucidum.cloud --token '<token>'
+printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.lucidum.cloud --token -
 python scripts/meridian.py stacks switch prod        # activate + validate
 python scripts/meridian.py stacks list               # tokens redacted to last 4
 ```
 
-To keep the token out of shell history and process listings, pass `--token -` and paste it on
-stdin, or omit `--token` and set `MERIDIAN_API_TOKEN` for the one command. A stack with a
+`--token -` reads the token from stdin, which keeps it out of shell history and process listings;
+omitting `--token` uses `MERIDIAN_API_TOKEN` instead. `--action-token -` does the same for the
+action token, read as the next line. A stack with a
 self-signed certificate takes `--insecure-tls`, stored per stack and carried across switches.
 
 `python scripts/meridian.py stacks rm <name>` removes one. Each stack needs a token generated **on

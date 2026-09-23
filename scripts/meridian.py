@@ -180,6 +180,33 @@ def load_stacks():
     return reg
 
 
+_CFG_DIR_CHECKED = False
+
+
+def _ensure_cfg_dir():
+    """Create ~/.meridian owner-only, and tighten it if it already exists looser than that.
+
+    makedirs(mode=0o700) only applies at creation, so a directory made by anything else -- an
+    editor, a file tool writing config.json by hand, an old umask -- stays 0755 forever, and every
+    cache written into it with a plain open() (fields, labels, metrics, topcache, .ratelimit) is
+    then readable by every local user. Hardening the directory once covers all of them at the one
+    choke point, rather than relying on each writer to remember. POSIX only: on Windows chmod just
+    toggles read-only and the profile directory's ACLs are the protection.
+    """
+    global _CFG_DIR_CHECKED
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    if _CFG_DIR_CHECKED or os.name == "nt":
+        return
+    _CFG_DIR_CHECKED = True
+    try:
+        if os.path.islink(CFG_DIR):
+            return   # someone else's layout; don't chmod through a link we didn't create
+        if os.stat(CFG_DIR).st_mode & 0o077:
+            os.chmod(CFG_DIR, 0o700)
+    except OSError:
+        pass
+
+
 def _private_write(path, payload):
     """Write a token-bearing JSON file the only acceptable way: owner-only, and atomically.
 
@@ -191,7 +218,7 @@ def _private_write(path, payload):
     os.replace makes the swap atomic. On Windows os.open's mode only toggles read-only -- the
     profile directory's ACLs are the protection there -- so this is effectively POSIX hardening.
     """
-    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    _ensure_cfg_dir()
     # PID in the temp name, not a fixed ".tmp": a scheduled `snapshot --entities` calling
     # entity_salt() concurrently with an interactive `stacks switch` had both processes truncating
     # and replacing the SAME temp path, and interleaved writes of different lengths land as invalid
@@ -364,7 +391,7 @@ def _top_rung_save(table, field, rung):
         if data.get("%s.%s" % (table, field)) == rung:
             return
         data["%s.%s" % (table, field)] = rung
-        os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+        _ensure_cfg_dir()
         with open(p, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception:
@@ -583,7 +610,7 @@ def pace():
     released and re-checks after, so one process waiting out the window doesn't wedge every other
     caller for the duration; the in-process thread lock still holds across the sleep, which is the
     budget being enforced, not overhead."""
-    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    _ensure_cfg_dir()
     with _PACE_LOCK:
         waited = 0.0
         while True:
@@ -1063,6 +1090,26 @@ def _csv_cell(v):
     return "" if v is None else v
 
 
+def out_path_problem(path, suffixes):
+    """Why `path` must not be written as an output file, or None if it may.
+
+    `report --out` and `--format csv --out` overwrite without asking, and nothing checked the target:
+    `report --html --out scripts/meridian.py` replaced the script with a report, and a PDF render over
+    SKILL.md replaces the skill's own instructions. The suffix is the load-bearing check (the doc
+    generators' docout.py guard, same reasoning, reimplemented because that file does not ship).
+    An existing file with the right suffix is still overwritten -- that is the regenerate case.
+    """
+    if not path.lower().endswith(tuple(suffixes)):
+        return "--out %r must end in %s; refusing to overwrite a file of another kind." % (
+            path, " or ".join(suffixes))
+    if os.path.isdir(path):
+        return "--out %r is a directory; give a file path." % path
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        return "--out %r: the directory %r does not exist." % (path, parent)
+    return None
+
+
 def emit(payload, rowkey, fmt=None, out_path=None):
     """Print a verb's result as JSON, or write its rows as CSV.
 
@@ -1213,7 +1260,7 @@ def load_field_map(table, allow_fetch=True):
                 merged = dict(disk or {})
                 merged[key] = fields
                 merged.setdefault("fqdn", load_config()[0])
-                os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+                _ensure_cfg_dir()
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(merged, f, indent=2)
             except Exception:      # a scoped token may not reach metadata; degrade, don't fail the query
@@ -1318,7 +1365,7 @@ def load_labels(allow_fetch=True):
         out.sort(key=lambda x: (x["table"] or "zz", x["name"].lower()))
         if not _LABELS_PROVISIONAL:
             try:
-                os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+                _ensure_cfg_dir()
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump({"fqdn": load_config()[0], "labels": out}, f, indent=2)
             except Exception:
@@ -1397,7 +1444,7 @@ def cmd_refresh_fields(a):
         if isinstance(r, Exception):
             raise r
     path = _fields_path()
-    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    _ensure_cfg_dir()
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"fqdn": fqdn, "asset": _slim_meta(asset), "user": _slim_meta(user)}, f, indent=2)
     _FIELD_MAP.clear()
@@ -1997,7 +2044,10 @@ def append_snapshot(rec, path=None):
     saved config.json and topcache from BOM breakage.
     """
     path = path or _snapshots_path()
-    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    if os.path.dirname(os.path.abspath(path)) == os.path.abspath(CFG_DIR):
+        _ensure_cfg_dir()
+    else:
+        os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
     # os.open so a NEW history file is born owner-only on POSIX: under --with-names it accumulates
     # raw customer identifiers, and the default umask would leave it world-readable. The mode only
     # applies at creation, so an existing file's permissions are respected either way.
@@ -2070,8 +2120,14 @@ def prune_snapshots(keep=None, path=None):
     kept = recs[len(dropped):]
     tmp = path + ".tmp"
     # Same owner-only creation as append_snapshot: the rewrite replaces the history file, so a
-    # default-umask temp here would silently strip the 0600 the file was born with.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # default-umask temp here would silently strip the 0600 the file was born with. Remove any
+    # leftover first and create exclusively: O_TRUNC on an existing temp keeps THAT file's mode
+    # (and follows a symlink planted at the fixed name), so the 0600 would never apply.
+    try:
+        os.remove(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         for r in kept:
             f.write(json.dumps(r, separators=(",", ":"), sort_keys=True) + "\n")
@@ -2474,7 +2530,7 @@ def load_metrics():
 
 
 def save_metrics(metrics):
-    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    _ensure_cfg_dir()
     with open(_metrics_path(), "w", encoding="utf-8") as f:
         json.dump({"schema": METRICS_SCHEMA, "fqdn": load_config()[0], "metrics": metrics}, f, indent=2)
     return _metrics_path()
@@ -3590,7 +3646,7 @@ def load_alerts():
 
 
 def save_alerts(rules):
-    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    _ensure_cfg_dir()
     payload = {"schema": ALERTS_SCHEMA, "fqdn": load_config()[0], "rules": rules}
     # Same atomic write as the other config-dir files -- it takes the OBJECT and dumps it itself. A
     # truncated rules file would silently become "no alerts configured", which is the quietest possible
@@ -4067,20 +4123,27 @@ def _alert_rows(v):
     return rows
 
 
+def _slack_esc(s):
+    """Slack's three control characters. Rule names and messages can carry connector names from the
+    customer's environment, and unescaped, `<!channel>` pings a whole channel and `<https://x|y>`
+    renders a disguised link -- the Slack-shaped version of the unescaped-HTML bug."""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def render_alerts_slack(v):
     """Slack incoming-webhook payload. Slack's markup is mrkdwn, not markdown -- single asterisks for
     bold, no table syntax -- so this builds its own text rather than reusing `render_alerts`'s table.
     """
     head, span = _alert_head_span(v)
-    lines = ["*%s*%s" % (" · ".join(head), span), ""]
+    lines = ["*%s*%s" % (_slack_esc(" · ".join(head)), _slack_esc(span)), ""]
     for kind, dot, rule, text in _alert_rows(v):
-        lines.append("%s *%s* — %s" % (dot, rule, text))
+        lines.append("%s *%s* — %s" % (dot, _slack_esc(rule), _slack_esc(text)))
     if v.get("coverageChanged"):
         lines += ["", "⚠️ Connector health changed across this window. Which connector feeds which "
                       "number is not something the API exposes, so judge relevance before reading any "
                       "movement as real."]
     if v.get("note"):
-        lines += ["", v["note"]]
+        lines += ["", _slack_esc(v["note"])]
     return {"text": "\n".join(lines)}
 
 
@@ -4180,6 +4243,11 @@ def _post_webhook(url, payload, timeout=10):
     avoids it (see the import-time comment there) so every other verb keeps paying zero cost for it.
     """
     import urllib.request
+    # https only: the payload names the customer's failing connectors and alert state, and a plain
+    # http URL (a typo, or a copied test endpoint) would send it over the network in clear. Raised,
+    # not returned, so deliver_alerts reports it as that target's error like any other failure.
+    if urllib.parse.urlsplit(url).scheme.lower() != "https":
+        raise ValueError("webhook URL must be https://; refusing to send alert data unencrypted")
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
@@ -4204,6 +4272,11 @@ def _send_email(cfg, subject, text_body, html_body, timeout=15):
     msg["To"] = ", ".join(cfg["to"])
     msg.set_content(text_body)
     msg.add_alternative(html_body, subtype="html")
+    # STARTTLS=0 is for an unauthenticated internal relay. Logging in without it would send the SMTP
+    # password in clear, so that combination is refused before connecting, not after.
+    if cfg.get("user") and not cfg.get("starttls", True):
+        raise ValueError("refusing SMTP login without TLS: MERIDIAN_ALERT_EMAIL_STARTTLS=0 is only "
+                         "for an unauthenticated relay; unset _SMTP_USER/_SMTP_PASS or enable STARTTLS")
     with client(cfg["host"], cfg["port"], timeout=timeout) as s:
         if cfg.get("starttls", True):
             s.starttls(context=ssl.create_default_context())
@@ -6153,6 +6226,80 @@ def _short(v, n=200):
     return None if not s else (s[:n] + "..." if len(s) > n else s)
 
 
+# Connector messages are the one free-text field the profile allow-list keeps, and connector/SDK
+# errors routinely echo exactly what the allow-list drops: "Login failed for user 'svc_x'",
+# "HTTPSConnectionPool(host='10.1.2.3')", a URL with user:pass@ in it. Those messages are quoted in
+# the mandatory preflight on every session, cached, and rendered into digest PDFs, so the allow-list
+# alone is not the boundary it looks like. Two layers: the profile's OWN credential-shaped values
+# are cut out of its messages wherever they appear (_profile_secrets), and generic shapes are cut
+# regardless of source. Scrub BEFORE _short(): truncating first can leave half a value behind.
+REDACTED = "[redacted]"
+_SCRUB_PATTERNS = (
+    # scheme://user:pass@host -> scheme://[redacted]@host
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@"), r"\1" + REDACTED + "@"),
+    # Authorization-header shapes
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 " + REDACTED),
+    # key=value / key: value for credential-named keys, quoted or not
+    (re.compile(r"(?i)\b((?:client[_-]?)?secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
+                r"secret[_-]?key|(?:access|refresh|auth|api|session)?[_-]?token)"
+                r"(\s*[=:]\s*)([\"']?)[^\s\"'&,;)}]+"), r"\1\2\3" + REDACTED),
+)
+# Key names (split on _ - and camelCase) whose string values are credential-shaped. Anything under
+# such a key is collected, so "proxy": {"host": ...} is covered without naming "proxy.host".
+_SECRET_KEY_PARTS = {"host", "hostname", "user", "username", "login", "account", "password",
+                     "passwd", "pwd", "secret", "token", "key", "apikey", "proxy", "url", "uri",
+                     "endpoint", "tenant", "client", "arn", "vault", "domain", "server", "dsn",
+                     "email", "ip", "address", "ref", "credential", "credentials", "auth"}
+# Keys the allow-list already emits: their values are shown anyway, so never cut them from text.
+_SECRET_KEY_SAFE = {"display_name", "bridge_name", "profile_name", "group", "service", "status",
+                    "activity", "message"}
+_SECRET_VALUE_SKIP = {"true", "false", "none", "null", "http", "https", "default", "encrypt",
+                      "required"}
+
+
+def _key_parts(k):
+    k = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(k))
+    return {p for p in re.split(r"[_\-\s.]+", k.lower()) if p}
+
+
+def _profile_secrets(obj, _inherit=False):
+    """Credential-shaped string values anywhere in one raw connector profile, for _scrub().
+
+    Collected by key name, not by the values' own shape -- a service account or an internal host
+    looks like any other word. Deliberately over-inclusive: a region or tenant name cut from an
+    error message costs a little diagnostic detail, a leaked username does not come back.
+    """
+    found = set()
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _SECRET_KEY_SAFE:
+                continue
+            found |= _profile_secrets(v, _inherit or bool(_key_parts(k) & _SECRET_KEY_PARTS))
+    elif isinstance(obj, list):
+        for v in obj:
+            found |= _profile_secrets(v, _inherit)
+    elif _inherit and isinstance(obj, str):
+        v = obj.strip()
+        if len(v) >= 4 and v.lower() not in _SECRET_VALUE_SKIP:
+            found.add(v)
+            if "://" in v:   # also the host and user a URL carries, which errors quote bare
+                u = urllib.parse.urlsplit(v)
+                found |= {x for x in (u.hostname, u.username) if x and len(x) >= 4}
+    return found
+
+
+def _scrub(text, secrets=()):
+    """Cut credential-shaped content out of a connector message. None/empty pass through."""
+    if not text:
+        return text
+    s = text if isinstance(text, str) else json.dumps(text)
+    for v in sorted(secrets, key=len, reverse=True):
+        s = re.sub(re.escape(v), REDACTED, s, flags=re.IGNORECASE)
+    for pat, rep in _SCRUB_PATTERNS:
+        s = pat.sub(rep, s)
+    return s
+
+
 # `event_messages` on a connector run is the connector's own log lines verbatim, e.g. one entry of
 # {"WARNING": "2026-08-26 04:26:19 | WARNING  | loguru._logger:warning:1979 - no local data
 # template..."} per record processed - so a single failing lookup can repeat dozens of times with
@@ -6195,10 +6342,11 @@ def _traceback_cause(text):
     return re.sub(r"\s+", " ", _TB_FRAME_RE.sub("", text)).strip() or text
 
 
-def _friendly_event_message(raw, limit=2):
+def _friendly_event_message(raw, limit=2, secrets=(), cap=True):
     """Reduce `event_messages` to the distinct human-readable text a reader would want, capped to
     `limit` distinct messages (join with '; '). Handles the {LEVEL: line} list shape and a plain
-    string alike; returns None for nothing usable."""
+    string alike; returns None for nothing usable. Each line is _scrub()-ed; `cap=False` skips the
+    final _short() for a caller that scrubs again with more secrets and must truncate only after."""
     if not raw:
         return None
     entries = raw if isinstance(raw, list) else [raw]
@@ -6208,13 +6356,15 @@ def _friendly_event_message(raw, limit=2):
         if not text:
             continue
         text = re.sub(r"\s+", " ", _LOG_LINE_PREFIX_RE.sub("", str(text))).strip()
-        text = _traceback_cause(text)
+        text = _scrub(_traceback_cause(text), secrets)
         if text and text not in seen:
             seen.add(text)
             out.append(text)
         if len(out) >= limit:
             break
-    return _short("; ".join(out)) if out else None
+    if not out:
+        return None
+    return _short("; ".join(out)) if cap else "; ".join(out)
 
 
 _NOT_ACRONYM = {"log", "and", "the", "for", "new", "raw"}   # short words that aren't initialisms
@@ -6252,20 +6402,27 @@ def _run_health(status):
 
 
 def _fetch_connector_profiles():
-    """Configured connectors, reduced to the non-sensitive fields."""
+    """(configured connectors reduced to the non-sensitive fields, every profile's credential-shaped
+    values). The second half never leaves summarize_connectors: it exists so run messages, fetched
+    concurrently from another endpoint, can be scrubbed of the same values. Every profile's values
+    scrub every message -- an error in one connector can quote another's host."""
     raw = call("GET", "/CMDB/v2/connector/profile", retries=0)
+    profiles = raw.get("connectorProfiles") or []
+    secrets = set()
+    for p in profiles:
+        secrets |= _profile_secrets(p)
     out = []
-    for p in (raw.get("connectorProfiles") or []):
+    for p in profiles:
         svcs = [{"service": s.get("service"),
                  "displayName": s.get("display_name") or _pretty_name(s.get("service")),
                  "enabled": s.get("activity") is True,
                  "testStatus": (s.get("status") or "UNKNOWN").upper(),
-                 "message": _short(s.get("message"))}
+                 "message": _short(_scrub(s.get("message"), secrets))}
                 for s in (p.get("services_list") or [])]
         out.append({"connector": p.get("display_name") or p.get("bridge_name"),
                     "bridge": p.get("bridge_name"), "profile": p.get("profile_name"),
                     "group": p.get("group"), "services": svcs})
-    return out
+    return out, secrets
 
 
 def _fetch_connector_runs():
@@ -6296,7 +6453,13 @@ def _fetch_connector_runs():
             bucket[key] = {"service": r.get("bridge_name"), "profile": _profile_name(r.get("profile")),
                            "platform": platform, "status": r.get("status"),
                            "records": r.get("output_records"), "utc": r.get("_utc"),
-                           "_time": r.get("_time") or 0, "message": _friendly_event_message(r.get("event_messages"))}
+                           "_time": r.get("_time") or 0,
+                           # Uncapped: summarize_connectors scrubs again with every profile's
+                           # values, then truncates. The run's own embedded profile scrubs now.
+                           "message": _friendly_event_message(
+                               r.get("event_messages"), cap=False,
+                               secrets=_profile_secrets(r.get("profile"))
+                               if isinstance(r.get("profile"), dict) else ())}
     return ingest, list(actions.values()), list(pipeline.values()), truncated
 
 
@@ -6376,15 +6539,19 @@ def summarize_connectors(max_failures=12, max_other=15, brief=True, max_warnings
     profiles, runs, actions, pipeline, runs_truncated = [], {}, [], [], False
     # Two independent endpoints, ~0.6s each against a remote stack - fetch them at the same time.
     pr, rn = parallel([_fetch_connector_profiles, _fetch_connector_runs])
+    secrets = set()
     if isinstance(pr, Exception):
         result["fetched"]["profiles"] = _short(str(pr), 160)
     else:
-        profiles, result["fetched"]["profiles"] = pr, "ok"
+        (profiles, secrets), result["fetched"]["profiles"] = pr, "ok"
     if isinstance(rn, Exception):
         result["fetched"]["ingestion"] = _short(str(rn), 160)
     else:
         runs, actions, pipeline, runs_truncated = rn
         result["fetched"]["ingestion"] = "ok"
+        for r in list(runs.values()) + list(actions) + list(pipeline):
+            r["message"] = _short(_scrub(r.get("message"), secrets))
+    del secrets   # credential values: nothing below may carry them into the result or the cache
 
     runs_ok = result["fetched"].get("ingestion") == "ok"
     owner = {}  # service name -> the configured connector that owns it (labels ingestion runs)
@@ -6843,8 +7010,16 @@ def cmd_stacks_add(a):
     entry = dict(reg["stacks"].get(a.name) or {})
     entry["fqdn"] = fqdn
     entry["api_token"] = token
-    if a.action_token:
-        entry["action_token"] = a.action_token
+    action = a.action_token
+    if action == "-":
+        # Same stdin channel as `--token -`, for the more powerful of the two tokens, which had no
+        # way to stay out of argv. Read AFTER the API token, so both can be piped as two lines.
+        action = sys.stdin.readline().strip()
+        if not action:
+            die("--action-token - was given but stdin had no line for it (with --token - too, send "
+                "the API token on the first line and the action token on the second).")
+    if action:
+        entry["action_token"] = action
     if getattr(a, "insecure_tls", False):
         # Set-only, like the action token: an update that omits the flag preserves the stored
         # posture rather than silently re-enabling verification on a stack that can't pass it.
@@ -7436,7 +7611,7 @@ def _add_output_flags(s):
     s.add_argument("--format", choices=["json", "csv"], default="json",
                    help="csv writes the rows to --out and prints the JSON envelope alone; past a few "
                         "hundred rows this is the difference between ~87 tokens and tens of thousands")
-    s.add_argument("--out", help="write CSV here instead of stdout")
+    s.add_argument("--out", help="write CSV here instead of stdout; must end .csv")
     return s
 
 
@@ -7668,7 +7843,8 @@ def main():
     sa.add_argument("--name", required=True); sa.add_argument("--fqdn", required=True)
     sa.add_argument("--token", help="API token; '-' reads it from stdin (keeps it out of shell "
                     "history and process listings); omit to use MERIDIAN_API_TOKEN")
-    sa.add_argument("--action-token", help="separate token for /data/ldg writes, if this stack uses one")
+    sa.add_argument("--action-token", help="separate token for /data/ldg writes, if this stack uses "
+                    "one; '-' reads it from stdin (after the API token's line if --token - too)")
     sa.add_argument("--insecure-tls", dest="insecure_tls", action="store_true",
                     help="this stack presents a self-signed/internal certificate; stored per stack "
                          "and carried by `stacks switch`. Reverting to verified TLS is rm + re-add.")
@@ -7682,7 +7858,7 @@ def main():
     s.add_argument("--input", nargs="+",
         help="JSON from any verb; omit to read stdin. Several files render one document with "
              "several subjects -- profiles only (e.g. a user and each of its linked assets).")
-    s.add_argument("--out", required=True, help="output path; must end .pdf (or .html with --html)")
+    s.add_argument("--out", required=True, help="output path; must end .pdf or .html (.html with --html)")
     s.add_argument("--title", help="document title (defaults to one derived from the input)")
     s.add_argument("--date", help="date shown on the cover (defaults to today)")
     s.add_argument("--html", action="store_true",
@@ -7690,6 +7866,16 @@ def main():
     s.set_defaults(func=cmd_report)
 
     args = p.parse_args()
+    # Checked before dispatch, so a bad path fails before any API call or render is spent on it.
+    out = getattr(args, "out", None)
+    if out:
+        if args.func is cmd_report:
+            suffixes = (".html", ".htm") if args.html else (".pdf", ".html", ".htm")
+        else:
+            suffixes = (".csv",)
+        problem = out_path_problem(out, suffixes)
+        if problem:
+            die(problem, 2)
     try:
         args.func(args)
     except Exception as e:  # noqa

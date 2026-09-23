@@ -61,6 +61,7 @@ EXCLUDE = {
     "scripts/make-package.py",      # this script
     "scripts/make-sbom.py",         # regenerates sbom.cdx.json; the SBOM itself DOES ship
     "scripts/make-public.py",       # derives the open-source tree
+    "scripts/publish-public.py",    # stages the public release from that tree
     "scripts/check-docs-pii.py",    # the repo-wide PII gate
     "scripts/docout.py",            # output-path guard the generators share; nothing
                                     # installed imports it, so it is maintenance too

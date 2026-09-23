@@ -199,13 +199,19 @@ If they ask for the walkthrough, give this inline quick-path (full detail in
 
 1. Re-run the connection preflight to confirm you now get `connected`.
 2. **Then** offer to save (its own step, so it isn't skipped):
-   > Save this so you don't re-enter it next time? I'll write `~/.meridian/config.json` — note it's **plain text** in your user profile (outside any repo, never committed).
+   > Save this so you don't re-enter it next time? I'll save it under `~/.meridian/` — note it's **plain text** in your user profile (outside any repo, never committed).
 
-   On yes, write the file:
+   On yes, save it **through the script — never write `config.json` yourself.** A hand-written file
+   skips the owner-only permissions the script applies, and it drops the stack's `entity_salt`, which
+   makes every earlier entity snapshot permanently incomparable. Pipe the token on stdin so it stays
+   out of the command line (shell history, process listings):
 
-   ```json
-   { "fqdn": "company.lucidum.cloud", "api_token": "…", "action_token": "…(optional, LDG only)" }
+   ```bash
+   printf '%s\n' '<api token>' | python scripts/meridian.py stacks add --name <short name, e.g. prod> --fqdn company.lucidum.cloud --token -
    ```
+
+   The first stack saved becomes active and is mirrored into `config.json`, so every helper picks it
+   up. For an action token too (LDG only), send it as a second line and add `--action-token -`.
 
 3. The **Action token** is optional — mention it only if the user asks about the LDG endpoint;
    `/CMDB/v2/data/cmdb` answers the same questions. Don't block onboarding on it.
@@ -221,7 +227,7 @@ Trigger on "switch to my prod stack", "use `<name>`", "add another stack", "what
 
 ```bash
 python scripts/meridian.py stacks list                                                  # saved stacks + which is active
-python scripts/meridian.py stacks add --name prod --fqdn acme.lucidum.cloud --token '<token>'  # others untouched
+printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.lucidum.cloud --token -  # others untouched
 python scripts/meridian.py stacks switch prod                                           # activate + validate
 python scripts/meridian.py stacks rm prod
 ```
@@ -463,7 +469,7 @@ For data queries, follow this loop:
    - **Pass `--select` with only the columns the question needs.** Otherwise every row carries the
      default six fields. Measured: 1,198 rows were 288,137 chars bare against 94,294 with
      `--select Asset_Name,Count_KEV`. Applies to `top` and `summary` too.
-   - **Past a few hundred rows, write the set to a file instead:** `--format csv --out <file>`. The
+   - **Past a few hundred rows, write the set to a file instead:** `--format csv --out <file>.csv`. The
      JSON envelope still prints — `totalRecords`, `truncated`, the completeness flags — so report the
      count, name the file, and read back only the slice the question needs. Those same 1,198 rows cost
      **347 characters** this way. **`--all` at the 5,000-row ceiling is ~229,000 tokens of raw rows** —
@@ -662,8 +668,8 @@ Pick the script from the question shape; exact flags live in
 | "how much history do we have" / "clear out old snapshots" | `meridian.py snapshots list` / `snapshots prune` |
 | "alert me if X" / "let me know when a connector breaks" / "is anything firing" | `meridian.py alerts add` / `alerts eval` — reads stored history, makes no API calls; `unevaluable` is **not** a pass |
 | "send those alerts to Slack/Teams/email" | `meridian.py alerts notify` — webhook/SMTP settings are env-var only, and it sends only when a verdict **changed** (or `--force`) |
-| "give me that as a spreadsheet / CSV / for Excel" | add `--format csv --out <file>` to `top`/`list`/`summary` |
-| a result set of more than a few hundred rows | `--format csv --out <file>` — the envelope prints, the rows go to disk. Reading 5,000 rows inline is ~229,000 tokens of data you were asked to summarize |
+| "give me that as a spreadsheet / CSV / for Excel" | add `--format csv --out <file>.csv` to `top`/`list`/`summary` |
+| a result set of more than a few hundred rows | `--format csv --out <file>.csv` — the envelope prints, the rows go to disk. Reading 5,000 rows inline is ~229,000 tokens of data you were asked to summarize |
 | a field name isn't in `field-map.md` | `meridian.py refresh-fields` |
 | anything shareable (report, export, "send this on") | `meridian.py report` |
 | raw endpoint not covered above | `meridian.py api` |

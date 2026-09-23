@@ -183,10 +183,21 @@ def test_not_configured():
 # profile whose services fail with one identical message, a Datadog profile whose run only warned, a
 # cert profile that has never run, and a disabled AD profile whose data is still in the stack. The
 # credential fields (host / password / field_metadata) are here on purpose - extraction must drop them.
+# So are the fields NOBODY HAS SEEN YET. Platform security is migrating connector secrets to Vault,
+# and from 2026-10-05 this endpoint returns a vault path in place of the encrypted string. The
+# protection is an allow-list -- summarize_connectors builds a new dict from named keys -- so an
+# unanticipated field is dropped by construction rather than by matching a pattern. Pinning that
+# PROPERTY matters more than pinning the field names that happen to exist today: without it the
+# suite would keep describing the pre-Vault world and still pass, and a later loosening of the
+# extraction to a deny-list would go unnoticed exactly when the response shape was changing.
 FIXTURE_PROFILES = {"connectorProfiles": [
     {"display_name": "Amazon Web Services (AWS)", "bridge_name": "aws", "profile_name": "Prod",
      "group": "Cloud Infrastructure", "host": "10.0.0.9", "password": "gAAAAABsecret",
      "field_metadata": {"password": "encrypt;required"},
+     "vault_path": "secret/data/meridian/aws/prod",
+     "secret_ref": "kv/meridian/aws#password",
+     "proxy": {"host": "proxy.internal.invalid", "port": 8080},
+     "config": {"role_arn": "role-placeholder-value", "region": "us-east-1"},
      "services_list": [
          {"service": "aws_ec2", "display_name": "AWS EC2", "status": "OK", "activity": True},
          {"service": "aws_s3", "display_name": "AWS S3", "status": "OK", "activity": True}]},
@@ -252,10 +263,18 @@ def test_connector_rollup(m):
     m.call = fake_call
     try:
         out = m.summarize_connectors()
+        brief_calls = len(calls)
+        # The --full shape as well, because the leak assertions below are worthless without it.
+        # `brief` (the default) reshapes rows through _brief_connectors, which rebuilds them from
+        # named keys -- so a field leaking out of summarize_connectors itself is invisible in the
+        # brief output while sitting in plain view of anyone running `connectors --full`. Proven,
+        # not assumed: adding a passthrough key to the profile extraction left every one of these
+        # checks passing until this second call existed.
+        full = m.summarize_connectors(brief=False)
     finally:
         m.call = real_call
 
-    check("both endpoints read, once each", len(calls), 2)
+    check("both endpoints read, once each", brief_calls, 2)
     check("whole run history in one call", any("size=2000" in c for c in calls), True)
     check("profiles fetched", out["fetched"]["profiles"], "ok")
     check("ingestion fetched", out["fetched"]["ingestion"], "ok")
@@ -308,9 +327,15 @@ def test_connector_rollup(m):
           [k for k in other if k.startswith("Amazon") or k.startswith("Datadog")], [])
 
     # Extraction must keep every credential-ish field out of the summary.
-    blob = json.dumps(out)
+    blob = json.dumps(out) + json.dumps(full)
     for leak in ("password", "gAAAAAB", "field_metadata", "10.0.0.9", "LDAP", "username"):
         check("no %r in output" % leak, leak in blob, False)
+    # The post-Vault shape, and the non-secret configuration that a secret migration does not
+    # remove. None of these are named by the allow-list, so none may appear whatever they are
+    # called upstream.
+    for future in ("vault_path", "secret/data", "secret_ref", "kv/meridian",
+                   "proxy.internal.invalid", "role_arn", "role-placeholder-value"):
+        check("no %r in output" % future, future in blob, False)
 
     check("pretty name: acronym + word", m._pretty_name("sepm_computers"), "SEPM Computers")
     check("pretty name: short non-acronym word", m._pretty_name("pan_vpn_log"), "PAN VPN Log")
@@ -5375,6 +5400,16 @@ def test_package_stamp():
             # asserted the shape of what lands in a customer package.
             check("repo tooling configs are not packaged",
                   sorted(n for n in names if "pre-commit" in n or "markdownlint" in n), [])
+            # Maintenance scripts run ON the skill and need a repo an install does not have.
+            # Asserted as a FAMILY rather than one name at a time, because EXCLUDE is a filename
+            # list -- the next generator or release helper added beside these would otherwise
+            # ship in silence, which is how the lint configs and the .public.md variants both
+            # reached a customer package.
+            check("maintenance scripts are not packaged",
+                  sorted(n.split("/")[-1] for n in names
+                         if n.startswith("meridiancs/scripts/")
+                         and (n.split("/")[-1].startswith(("make-", "publish-", "check-"))
+                              or n.endswith("docout.py"))), [])
             # make-public.py's substitution sources, and the stamp recording when each was last
             # reviewed. A .public.md is a sanitised derivative of the reference doc beside it,
             # carrying illustrative round numbers where the internal one carries measured ones,
@@ -5729,6 +5764,219 @@ def test_dangling_links():
         _shutil.rmtree(tmp, ignore_errors=True)
 
 
+# Connector messages that echo exactly what the profile allow-list drops. The allow-list keeps
+# `message` verbatim, so before scrubbing every one of these values reached the preflight output.
+SCRUB_PROFILES = {"connectorProfiles": [
+    {"display_name": "Microsoft Active Directory (AD)", "bridge_name": "ad_ldap", "profile_name": "Corp",
+     "group": "Identity Access Management", "host": "10.20.30.40", "username": "CORP\\svc_ldap",
+     "password": "gAAAAABscrubsecret",
+     "proxy": {"host": "proxy.scrub.invalid", "port": 8080},
+     "config": {"api_url": "https://apiuser:hunter22@api.scrub.example.com/v1", "region": "us-east-1"},
+     "services_list": [
+         {"service": "ad_user", "display_name": "AD User", "status": "FAIL", "activity": True,
+          "message": "Login failed for user 'CORP\\svc_ldap' at 10.20.30.40 via proxy.scrub.invalid; "
+                     "password=hunter22"},
+         # A secret straddling the 200-char cap: truncating before scrubbing would keep half of it.
+         {"service": "ad_computer", "display_name": "AD Computer", "status": "FAIL", "activity": True,
+          "message": "A" * 195 + " 10.20.30.40 unreachable"}]},
+    {"display_name": "Okta", "bridge_name": "okta", "profile_name": "Prod", "group": "Identity",
+     "services_list": [
+         # One connector's error quoting ANOTHER profile's host: every profile's values scrub every
+         # message, not just its own.
+         {"service": "okta_user", "display_name": "Okta User", "status": "FAIL", "activity": True,
+          "message": "HTTPSConnectionPool(host='10.20.30.40', port=443): Max retries exceeded"}]},
+]}
+SCRUB_RUNS = {"content": [
+    {"bridge_name": "okta_user", "platform": "api", "profile": "Prod", "status": "Error",
+     "output_records": 10, "_utc": "2026-09-20T10:00:00.000+00:00", "_time": 1789900000,
+     "event_messages": [{"ERROR": "request to https://api.scrub.example.com failed: "
+                                  "Authorization: Bearer abcdefghijklmnopqrstuvwxyz"}]},
+    # A run whose `profile` is the whole embedded profile object, credentials included.
+    {"bridge_name": "ad_user", "platform": "api",
+     "profile": {"profile_name": "Corp", "config": {"username": "run_embedded_user"}},
+     "status": "Error", "output_records": 0, "_utc": "2026-09-20T10:01:00.000+00:00",
+     "_time": 1789900060,
+     "event_messages": [{"ERROR": "bind as run_embedded_user rejected; token: tok_live_9f8e7d6c"}]},
+]}
+
+
+def test_security_hardening(m):
+    """Fixes from the 2026-09-22 security review. Every check here was run against the pre-fix
+    meridian.py and failed there -- a guard written alongside its fix proves nothing otherwise."""
+    print("[33] security review fixes: message scrubbing, token channels, output paths (offline)")
+    import contextlib, io
+
+    # --- M3: connector messages are scrubbed of credential values ----------------------------------
+    def fake_call(method, endpoint, body=None, retries=1):
+        if "connector/profile" in endpoint:
+            return SCRUB_PROFILES
+        if "metrics/connector" in endpoint:
+            return SCRUB_RUNS
+        raise AssertionError("unexpected endpoint %r" % endpoint)
+
+    real_call = m.call
+    m.call = fake_call
+    try:
+        brief = m.summarize_connectors()
+        full = m.summarize_connectors(brief=False)
+    finally:
+        m.call = real_call
+    blob = json.dumps(brief) + json.dumps(full)
+    for leak in ("svc_ldap", "10.20.30.40", "10.20.3", "proxy.scrub.invalid", "hunter22", "apiuser",
+                 "api.scrub.example.com", "abcdefghijklmnop", "run_embedded_user", "tok_live_9f8e7d6c",
+                 "gAAAAAB"):
+        check("scrubbed from connector messages: %r" % leak, leak in blob, False)
+    check("...replaced by a visible marker, not silently dropped", "[redacted]" in blob, True)
+    check("...keeping the diagnostic text around it",
+          "Login failed for user" in blob and "Max retries exceeded" in blob, True)
+
+    # --- M2: the action token has a stdin channel too ----------------------------------------------
+    tmp = tempfile.mkdtemp()
+    real = (m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE)
+    m.CFG_DIR = tmp
+    m.CFG_PATH = os.path.join(tmp, "config.json")
+    m.STACKS_PATH = os.path.join(tmp, "stacks.json")
+
+    class A:
+        name, fqdn, token, action_token = "sec", "sec.example.com", "-", "-"
+    real_stdin = sys.stdin
+    sys.stdin = io.StringIO("tok-api\ntok-action\n")
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.cmd_stacks_add(A())
+        entry = m.load_stacks()["stacks"]["sec"]
+        check("--token - and --action-token - read two stdin lines, in order",
+              [entry.get("api_token"), entry.get("action_token")], ["tok-api", "tok-action"])
+    except SystemExit:
+        check("--action-token - is accepted", False, True)
+    finally:
+        sys.stdin = real_stdin
+        m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # SKILL.md must route saving through the script. A model writing config.json itself skips the
+    # 0600 write and drops entity_salt, and `--token '<token>'` puts the token in argv.
+    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
+        skill = re.sub(r"\s+", " ", f.read())
+    check("SKILL.md no longer tells the model to write config.json by hand",
+          "On yes, write the file" in skill, False)
+    check("...and saves through stacks add with the token on stdin",
+          "never write `config.json` yourself" in skill and "--token -" in skill, True)
+    check("...and shows no token-in-argv example", "--token '<token>'" in skill, False)
+
+    # --- L3: output paths are checked before anything is written -----------------------------------
+    work = tempfile.mkdtemp()
+    # A HOME with no ~/.meridian and blank credential env vars: if the guard ever regresses, the
+    # subprocess dies "not configured" instead of querying whatever stack this machine has saved --
+    # which is exactly what the first draft of this check did against the pre-fix code.
+    iso = dict(os.environ, HOME=work, USERPROFILE=work, MERIDIAN_FQDN="", MERIDIAN_API_TOKEN="",
+               MERIDIAN_ACTION_TOKEN="")
+    try:
+        victim = os.path.join(work, "victim.py")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("print('original')\n")
+        inp = os.path.join(work, "in.json")
+        with open(inp, "w", encoding="utf-8") as f:
+            json.dump({"table": "asset", "totalRecords": 0, "rows": []}, f)
+        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
+                            "--out", victim], capture_output=True, text=True, encoding="utf-8", env=iso)
+        with open(victim, encoding="utf-8") as f:
+            check("report --out refuses a non-report suffix (the script survives)",
+                  f.read() == "print('original')\n", True)
+        check("...exiting 2 with the reason", (r.returncode, "must end in" in r.stderr), (2, True))
+        with open(victim, "w", encoding="utf-8") as f:   # independent of the check above
+            f.write("print('original')\n")
+        r = subprocess.run([sys.executable, MERIDIAN_PY, "list", "--format", "csv",
+                            "--out", victim], capture_output=True, text=True, encoding="utf-8",
+                           env=iso)
+        with open(victim, encoding="utf-8") as f:
+            check("--format csv --out refuses a non-.csv target", f.read() == "print('original')\n", True)
+        check("...before any credential or API work", "must end in" in r.stderr, True)
+        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
+                            "--out", os.path.join(work, "missing", "r.html")],
+                           capture_output=True, text=True, encoding="utf-8", env=iso)
+        check("report --out into a missing directory is refused", r.returncode, 2)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    # --- L1: ~/.meridian is tightened to 0700 even when something else created it --------------------
+    if os.name != "nt":
+        tmp = tempfile.mkdtemp()
+        os.chmod(tmp, 0o755)
+        real = (m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE)
+        m.CFG_DIR = tmp
+        m.CFG_PATH = os.path.join(tmp, "config.json")
+        m.STACKS_PATH = os.path.join(tmp, "stacks.json")
+        m._CFG_DIR_CHECKED = False
+        try:
+            m.save_stacks({"active": None, "stacks": {}})
+            check("a 0755 ~/.meridian is tightened to 0700", oct(os.stat(tmp).st_mode & 0o777), "0o700")
+        finally:
+            m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE = real
+            m._CFG_DIR_CHECKED = False
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        # prune_snapshots' fixed-name temp file must not follow a planted symlink.
+        tmp = tempfile.mkdtemp()
+        try:
+            hist = os.path.join(tmp, "snapshots.jsonl")
+            with open(hist, "w", encoding="utf-8") as f:
+                for i in range(3):
+                    f.write(json.dumps({"schema": m.SNAPSHOT_SCHEMA, "n": i}) + "\n")
+            victim = os.path.join(tmp, "victim.txt")
+            with open(victim, "w", encoding="utf-8") as f:
+                f.write("untouched")
+            os.symlink(victim, hist + ".tmp")
+            m.prune_snapshots(keep=1, path=hist)
+            with open(victim, encoding="utf-8") as f:
+                check("prune's temp file does not write through a planted symlink", f.read(), "untouched")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        print("  SKIP  POSIX permission checks (Windows)")
+
+    # --- L7: alert delivery ------------------------------------------------------------------------
+    try:
+        m._post_webhook("http://hooks.example/slack", {"text": "x"})
+        check("a plain-http webhook URL is refused", "sent", "refused")
+    except ValueError:
+        check("a plain-http webhook URL is refused", "refused", "refused")
+    except Exception as e:   # the pre-fix code tries to connect instead
+        check("a plain-http webhook URL is refused", type(e).__name__, "ValueError")
+
+    class FakeSMTP:
+        log = []
+        def __init__(self, host, port, timeout=None): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def starttls(self, context=None): FakeSMTP.log.append("starttls")
+        def login(self, user, password): FakeSMTP.log.append("login")
+        def send_message(self, msg): FakeSMTP.log.append("sent")
+
+    m._SMTP_CLIENT = FakeSMTP
+    try:
+        try:
+            m._send_email({"host": "smtp.example", "port": 25, "from": "a@example.com",
+                           "to": ["b@example.com"], "user": "u", "password": "p", "starttls": False},
+                          "s", "t", "<p>h</p>")
+        except ValueError:
+            pass
+        check("SMTP login without TLS is refused, before connecting", FakeSMTP.log, [])
+    finally:
+        m._SMTP_CLIENT = None
+
+    v = {"firing": [{"rule": "<!channel> ping", "message": "see <https://evil.example|your bank>"}],
+         "clear": [], "unevaluable": [], "stack": "demo",
+         "summary": {"firing": 1, "unevaluable": 0, "clear": 0}}
+    try:
+        text = m.render_alerts_slack(v)["text"]
+        check("Slack control sequences from rule text are escaped",
+              ("<!channel>" in text, "<https://evil" in text, "&lt;!channel&gt;" in text),
+              (False, False, True))
+    except Exception as e:
+        check("Slack renderer handles the fixture", type(e).__name__, None)
+
+
 def main():
     live = "--live" in sys.argv
     print("Meridian connect preflight — smoke tests\n" + "-" * 42)
@@ -5789,6 +6037,7 @@ def main():
     test_public_variants()
     test_trademark_notice()
     test_dangling_links()
+    test_security_hardening(m)
     if live:
         test_live()
         test_live_connectors()
