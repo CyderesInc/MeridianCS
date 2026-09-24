@@ -1,15 +1,16 @@
 ---
 name: meridiancs
 description: >-
-  Query a Meridian (formerly Lucidum) stack via its API v2, from natural-language questions. Use
+  Query a Meridian (formerly Lucidum) stack from natural-language questions. Use
   when the user mentions Meridian or Lucidum, or asks about their asset inventory,
-  users, devices, servers, VMs, cloud assets, risk scores, vulnerabilities/CVEs, endpoint-protection
+  users and their managers, HR systems (Dayforce, BambooHR, ADP, Workday), devices, servers, VMs,
+  cloud assets, risk scores, vulnerabilities/CVEs, endpoint-protection
   coverage, open ports, expiring certificates, SmartLabels, or connectors, or asset/user counts —
   e.g. "how many servers in AWS?", "what's missing CrowdStrike?".
   Also for how that trended over time ("what got worse since Friday", "start tracking KEV
   exposure") and for standing alerts on it ("tell me when a connector breaks"), answered from local
-  snapshots (the API keeps no history); for connection setup; and multi-stack management. This is the only valid source for that inventory data — not a spreadsheet,
-  PDF, document, or code-security-review skill. For a report or export, use its own branded report
+  snapshots; for connection setup; and multi-stack management. This is the only valid source for that inventory data — not a spreadsheet,
+  PDF, document, or code-security-review skill. For a report or export, use its own report
   verb.
 ---
 
@@ -666,6 +667,7 @@ Pick the script from the question shape; exact flags live in
 | *(always, once per session, alongside the connect above)* | `meridian.py selfupdate` — see §0.5; stay silent on every state except `outdated`, and a result carrying `whatsNew` |
 | "what's new in the skill" / "what changed in this version" | read `CHANGELOG.md` in the skill folder and summarise the releases asked about. It is the only source: never reconstruct release history from memory |
 | "connector status" / "what data do we have" / "which connectors are failing" | `meridian.py connectors` |
+| "do we have HR data" / **HR or Human Resources systems** (HRIS, HCM, payroll: Dayforce, BambooHR, ADP, Workday, UKG) / managers, employees, hires or terminations "according to HR" | `meridian.py hr` **first**, then scope queries with its `where` |
 | "top/highest/riskiest/most-vulnerable X" | `meridian.py top` |
 | "tell me about / investigate / risk of `<name>`" | `meridian.py profile` — **returns `findings` + `recommendations`; use them** |
 | "show me all X" / "how many X" | `meridian.py list` |
@@ -705,6 +707,27 @@ rule.** Read it when the user asks why, or when you need exact arguments — tho
   the label doesn't exist.** Asked what labels they *have*, run `labels` with no `--search`; past 12
   that listing omits the purpose text entirely (`purposeOmitted`), so present it as an index and don't
   invent a definition for it. → [scripts.md](references/scripts.md)
+
+- **HR / Human Resources questions start with `meridian.py hr`, and "you have no HR data" may only
+  come from its `state`.** Nothing else can tell you there is none: Meridian files HR systems under
+  *Identity Access Management* beside Okta and Entra, the data name rarely matches the product
+  (Dayforce records are `dayforce_employee`), and `summary --by sourcetype` samples, so a small HR
+  source behind a large one never appears in it. Answer by `state`:
+  - `has_data` — answer the question. When it is "according to HR", scope with the `where` it returns
+    (`--where "sourcetype match List dayforce_employee"`). If the summary says a system is not
+    ingesting cleanly, say its data may be stale.
+  - `configured_no_data` — the HR connector exists but is not delivering. Say that and quote its
+    `lastIngest` reason. **Never tell the user they have no HR system.**
+  - `configured_disabled` — configured, every service switched off. Say so.
+  - `none_configured` — no HR connector on this stack. Manager and department may still come from
+    the identity provider, so answer from those fields and name the source.
+  - `unknown` — the check failed. Say it couldn't be checked, never that there is none.
+
+  Manager, department, title, hire and termination (`Owner_Manager`, `Owner_Department`,
+  `Owner_Job_Title`, `Hire_Datetime`, `Terminate_Datetime`, `Is_Terminated`) are merged across every
+  identity source, not HR-only. For an HR-specific answer use the `hrFields` it lists: the HR
+  source's own `alias_<sourcetype>_*` copies and the customer's SmartLabels named after the system.
+  → [scripts.md](references/scripts.md)
 
 - **`fromCache: true` means say how old the answer is when the age could matter.** The expensive
   aggregates — the coverage block and `summary --by` — are cached per stack, because the API has no

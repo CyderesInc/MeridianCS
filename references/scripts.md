@@ -239,6 +239,25 @@ rung cache (`topcache.<fqdn>.json`), cached field names (`fields.<fqdn>.json`) a
     whose values happen to cluster early — `--by Lucidum_Asset_Type` moved from 54 unplaced to 191.
     Both are *reported exactly*, so neither is a silent answer; the 37% case was.
 - `compare` — **two entities side by side.**
+- `hr` — **which HR systems feed this stack, and how many user records carry their data.** The
+  answer to "do we have HR data?", and the first call for any HR, manager or employee question.
+  - It recognises ADP, BambooHR, Dayforce, HiBob, Sage People, UKG and Workday by catalog
+    `bridge_name`, falling back to display name. A fixed list, because nothing in the API marks a
+    connector as HR: the catalog files all of them under *Identity Access Management* with Okta and
+    Entra, and a description regex matched non-HR tools. iCIMS is left out on purpose: applicant
+    tracking holds candidates, not employees.
+  - A connector's enabled services are the `sourcetype` values its records carry, so each is counted
+    exactly with its own query. `userRecords` is one OR query across them, so a person in two HR
+    systems counts once. Not `summary --by sourcetype`, which samples and misses a small source.
+  - `state` is `has_data`, `configured_no_data`, `configured_disabled`, `none_configured` or
+    `unknown`. Only `none_configured` means there is no HR system, and only because the profiles were
+    read. An unreadable endpoint or a failed count is `unknown`, never a zero.
+  - `where` is the `--where` clause that scopes `list`/`top`/`summary` to HR records. `hrFields` lists
+    the user fields that come from HR: the source's `alias_<sourcetype>_*` copies and SmartLabels
+    named after the system. The core `Owner_Manager`/`Owner_Department` fields are merged across every
+    identity source.
+  - Each system row carries the connector's `health` and `lastIngest` from the same scrubbed summary
+    `connectors` uses. Credential values from the profile read are discarded before anything else runs.
 - `check` — **token capability preflight**: which API areas the token can reach + rate-limit
   headroom. Run this if you hit a 403 or before a big investigation.
 - `refresh-fields` — re-read this stack's real fields into
@@ -309,6 +328,12 @@ absent. Two things depend on it, and both used to fail silently:
 
 If metadata is unreachable (a scoped token 403s), both degrade quietly: types fall back to `String` and
 validation is skipped rather than inventing a failure. Tested in both directions.
+
+**A miss against the cached map re-reads the metadata once before refusing.** The cache never expired,
+and enabling a connector is exactly what adds fields (its `alias_<sourcetype>_*` copies, the
+customer's SmartLabels for it), so a newly connected source's fields were refused as "doesn't exist".
+The re-read happens once per table per process, so a run of typos costs one call; a changed field set
+also clears the SmartLabel and result caches, as `refresh-fields` does.
 
 - `labels` — **the stack's own SmartLabels**, resolved to
   queryable fields. Each carries the customer's `llmBusinessValue` description, so this is the bridge from

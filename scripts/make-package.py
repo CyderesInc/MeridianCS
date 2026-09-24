@@ -55,6 +55,8 @@ VERSION_SCHEMA = 1
 EXCLUDE = {
     ".gitignore",
     "CLAUDE.md",                    # how to work ON the skill
+    "CONTRIBUTING.md",              # repository community docs: GitHub reads them from the
+    "SECURITY.md",                  # repo, and an install has no issues or pull requests
     "scripts/make-guide.py",        # doc generators
     "scripts/make-impact.py",
     "scripts/make-brief.py",

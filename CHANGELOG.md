@@ -3,6 +3,17 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.26.1 - 2026-09-24
+
+- **Questions about HR systems now find your HR data.** Ask about Dayforce, BambooHR, ADP, Workday,
+  UKG, HiBob or Sage People, or about managers and employees, and the skill checks those
+  connectors directly instead of sometimes saying you have no HR data. If an HR connector is set up
+  but not delivering, it says so and why.
+- A field that appears on your stack after the skill first looked, for example when you enable a
+  new connector, is no longer reported as missing.
+- An update from a deeply nested folder on Windows now says why it can't install, instead of
+  failing with a file-not-found error.
+
 ## 2.26.0 - 2026-09-23
 
 - **Teams alerts now arrive.** They were sent in a format the standard Teams Workflows webhook

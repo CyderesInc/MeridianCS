@@ -83,7 +83,8 @@ def _load_pii_gate():
 
 PII = _load_pii_gate()
 
-# Set True only as a deliberate decision to publish the internal engineering record.
+# Decided 2026-09-23: never. CLAUDE.md and design/ hold counsel's advice, the PII gate's denylist and
+# dismissed scan findings -- see design/oss-release.md. test_public_variants pins this False.
 PUBLISH_INTERNAL_DOCS = False
 
 # Markdown inline links, for the dangling-link audit below.
@@ -155,6 +156,11 @@ SYNC_SCHEMA = 1
 # unlike the drops above, this one is unconditional: flipping PUBLISH_INTERNAL_DOCS is a decision
 # to publish the engineering record, not to publish a review ledger with nothing left to review.
 DERIVATION_ARTIFACTS = {SYNC_STAMP}
+
+# Source-repo automation that cannot work in a derived tree. Dependabot there would open pull
+# requests against a tree the next release commit replaces wholesale, so none could ever merge;
+# updates are taken in this repo and reach the public one through the derivation.
+SOURCE_ONLY = {".github/dependabot.yml"}
 
 
 def doc_digest(path):
@@ -229,7 +235,7 @@ def plan(files):
     `substitutions` maps an output path to the source path it is taken from, which is how a
     `.public.md` variant lands under the internal doc's name.
     """
-    drop = set(BRAND_ASSETS) | set(BRANDED_DOCS) | set(DERIVATION_ARTIFACTS)
+    drop = set(BRAND_ASSETS) | set(BRANDED_DOCS) | set(DERIVATION_ARTIFACTS) | set(SOURCE_ONLY)
     if not PUBLISH_INTERNAL_DOCS:
         drop |= INTERNAL_DOCS
 

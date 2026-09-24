@@ -1283,6 +1283,8 @@ def _slim_meta(arr):
 
 
 _FIELD_MAP: dict = {}   # per-process memo, keyed by "asset"/"user"
+_FIELD_MAP_LIVE: set = set()   # tables whose map was fetched from the API in this process, not read from disk
+_FIELD_MAP_DISK: set = set()   # tables whose map was read from the disk cache -- the only kind that can be stale
 _FIELD_MAP_LOCK = threading.Lock()  # cold-cache fills race under parallel(); see load_field_map
 
 
@@ -1314,21 +1316,72 @@ def load_field_map(table, allow_fetch=True):
         except Exception:
             disk = None
         fields = (disk or {}).get(key)
-        if not fields and allow_fetch:
-            try:
-                fields = _slim_meta(call("GET", "/CMDB/v2/data/metadata/%s" % key)["metadata"])
-                merged = dict(disk or {})
-                merged[key] = fields
-                merged.setdefault("fqdn", load_config()[0])
-                _ensure_cfg_dir()
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(merged, f, indent=2)
-            except Exception:      # a scoped token may not reach metadata; degrade, don't fail the query
-                fields = None
+        if fields:
+            _FIELD_MAP_DISK.add(key)
+        elif allow_fetch:
+            fields = _fetch_field_meta(key, disk)
         m = {f.get("fieldName"): (f.get("dataType") or "String")
              for f in (fields or []) if f.get("fieldName")}
         _FIELD_MAP[key] = m
         return m
+
+
+def _fetch_field_meta(key, disk):
+    """One table's slimmed metadata from the API, written into the per-stack cache. None if unreachable."""
+    try:
+        fields = _slim_meta(call("GET", "/CMDB/v2/data/metadata/%s" % key)["metadata"])
+        merged = dict(disk or {})
+        merged[key] = fields
+        merged.setdefault("fqdn", load_config()[0])
+        _ensure_cfg_dir()
+        with open(_fields_path(), "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2)
+    except Exception:      # a scoped token may not reach metadata; degrade, don't fail the query
+        return None
+    _FIELD_MAP_LIVE.add(key)
+    return fields
+
+
+def _refetch_field_map(table):
+    """Re-read one table's metadata after a cached map missed a name. True if the field set changed.
+
+    The disk cache never expired, so a field that appeared after it was written -- which is exactly what
+    enabling a connector does: an HR connector brings `alias_dayforce_employee_*` and the customer's
+    Dayforce SmartLabels -- was refused as "doesn't exist" by every verb until someone ran
+    `refresh-fields` by hand. Measured on a live stack: the cache knew 280 user fields, the API had 282,
+    and the missing two were the HR source's. Once per table per process, so a typo costs one metadata
+    call rather than one per query. A changed field set drops the label and result caches for the same
+    reason `refresh-fields` does: both are derived from this metadata.
+    """
+    key = "user" if table.startswith("user") else "asset"
+    # Compare against the map this process is actually using -- loading it first also means a cold,
+    # cache-less start (which fetches live) returns below instead of fetching the same metadata twice.
+    # Only a map READ FROM DISK can be stale. One fetched live this run is current, and one placed in
+    # the memo any other way (the offline suite does this) must never reach the network from here --
+    # the first version refetched for those too, and the "offline" suite quietly called a live stack.
+    old = set(load_field_map(key))
+    if key not in _FIELD_MAP_DISK or key in _FIELD_MAP_LIVE:
+        return False
+    with _FIELD_MAP_LOCK:
+        if key in _FIELD_MAP_LIVE:
+            return False
+        try:
+            with open(_fields_path(), encoding="utf-8-sig") as f:
+                disk = json.load(f)
+        except (Exception, SystemExit):   # no config resolves: nothing to refetch against
+            _FIELD_MAP_LIVE.add(key)
+            return False
+        fields = _fetch_field_meta(key, disk)
+        _FIELD_MAP_LIVE.add(key)        # even on failure: never retry a blocked endpoint per query
+        if fields is None:
+            return False
+        m = {f.get("fieldName"): (f.get("dataType") or "String") for f in fields if f.get("fieldName")}
+        _FIELD_MAP[key] = m
+    if set(m) != old:
+        drop_labels_cache()
+        drop_rescache()
+        return True
+    return False
 
 
 # SmartLabel metadata declares its own type names, which are not the query DSL's. Only these two
@@ -1538,6 +1591,8 @@ def field_problem(table, *fields):
     m = load_field_map(table)
     if not m:
         return None     # metadata unavailable (e.g. a scoped token) - don't invent a failure
+    if any(f not in m for f in fields if f) and _refetch_field_map(table):
+        m = load_field_map(table)   # the cache was stale; judge against what the stack has now
     for field in [f for f in fields if f]:
         if field in m:
             continue
@@ -7055,6 +7110,159 @@ def cmd_connectors(a):
                               refresh=a.refresh))
 
 
+# The HR / HCM systems in Meridian's connector catalog (/CMDB/v2/connector), by bridge_name, taken from
+# the live 505-entry catalog on 2026-09-23. A fixed list, because nothing in the API says "HR":
+#   * the catalog files every one of these under "Identity Access Management", beside Okta, Entra and
+#     the PAM tools, so the `group` a connector row carries cannot tell an HR system from an IdP;
+#   * product, bridge and data names diverge -- Dayforce is bridge `ceridian` and its records are
+#     `dayforce_employee` -- so a search for the name the user said finds nothing;
+#   * the descriptions don't separate them either: a regex for HR/HCM/payroll/workforce also matched
+#     HYPR Passwordless and five connectors outside the group.
+# Together those made "do we have HR data?" come back "no" on stacks with an HR connector enabled.
+# iCIMS is deliberately absent: applicant tracking holds candidates, not employees, and counting it
+# would answer a manager question with people who do not work there yet.
+HR_BRIDGES = {"adp": "ADP", "bamboohr": "BambooHR", "ceridian": "Dayforce", "hibob": "HiBob",
+              "sage_people": "Sage People", "ukg_pro": "UKG", "workday": "Workday"}
+# Name tokens that mark a user-table field as HR-derived: SmartLabels the customer named after the
+# system (say `Workday_Department_SmartLabel`), matched per underscore-separated token, lowercased.
+# Per-source `alias_<sourcetype>_*` copies are matched by prefix from the configured services.
+HR_FIELD_TOKENS = {"adp", "bamboohr", "ceridian", "dayforce", "hibob", "sage", "ukg", "workday"}
+
+
+def _hr_field_names(fields, sourcetypes):
+    prefixes = tuple("alias_%s_" % s for s in sourcetypes)
+    out = []
+    for name in fields or ():
+        tokens = {t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t}
+        if (prefixes and name.startswith(prefixes)) or tokens & HR_FIELD_TOKENS:
+            out.append(name)
+    return sorted(out)
+
+
+def _hr_where(sourcetypes):
+    if not sourcetypes:
+        return None
+    if len(sourcetypes) == 1:
+        return "sourcetype match List %s" % sourcetypes[0]
+    return "sourcetype in List %s" % ",".join(sourcetypes)
+
+
+def hr_sources(refresh=False):
+    """Which HR systems feed this stack, and how many user records each actually carries.
+
+    The deterministic answer to "do we have HR data?". Configured HR connectors come from the profile
+    endpoint (by bridge_name, see HR_BRIDGES). Their enabled services ARE the `sourcetype` values their
+    records carry -- `jira_user`, `intune_user`, `knowbe4_user` all match one-for-one -- so each is
+    counted EXACTLY with its own query, plus one OR query for the people any HR source knows (a person
+    in two HR systems is one record). Not from `summary --by sourcetype`: that samples to discover
+    values, and on a real stack where one source held over 90% of the user records, the sample never
+    reached a small HR source. It says so (`unaccountedRecords`), but it reads as "not present".
+
+    `state`: has_data / configured_no_data / configured_disabled / none_configured / unknown. Only
+    none_configured means "no HR system here", and only when the profile endpoint was actually read;
+    an unreadable endpoint or a failed count is `unknown`, never a zero.
+    """
+    result = {"recognized": sorted(HR_BRIDGES.values()), "fetched": {}}
+    try:
+        profiles, secrets = _fetch_connector_profiles()
+        del secrets     # credential values: nothing here needs them, and nothing may carry them out
+        result["fetched"]["profiles"] = "ok"
+    except Exception as e:
+        result["fetched"]["profiles"] = _short(str(e), 160)
+        result.update(state="unknown", systems=[], hrSourcetypes=[], userRecords=None, where=None,
+                      summary="Could not read the connector profiles, so whether an HR system is "
+                              "configured is unknown -- which is not the same as none.")
+        return result
+    by_name = {v.lower(): k for k, v in HR_BRIDGES.items()}
+    hr = [p for p in profiles
+          if p.get("bridge") in HR_BRIDGES or (p.get("connector") or "").lower() in by_name]
+    health = {}
+    if hr:
+        try:
+            health = {(r.get("connector"), r.get("profile")): r
+                      for r in summarize_connectors(brief=False, refresh=refresh).get("connectors", [])}
+            result["fetched"]["health"] = "ok"
+        except Exception as e:
+            result["fetched"]["health"] = _short(str(e), 160)
+
+    systems, sts = [], []
+    for p in hr:
+        bridge = p.get("bridge") if p.get("bridge") in HR_BRIDGES else by_name.get((p.get("connector") or "").lower())
+        enabled = [s["service"] for s in p.get("services") or [] if s.get("enabled") and s.get("service")]
+        row = {"system": HR_BRIDGES.get(bridge) or p.get("connector"), "connector": p.get("connector"),
+               "profile": p.get("profile"), "bridge": p.get("bridge"),
+               "servicesEnabled": len(enabled), "servicesDisabled": len(p.get("services") or []) - len(enabled),
+               "sourcetypes": [{"sourcetype": s} for s in enabled]}
+        h = health.get((p.get("connector"), p.get("profile")))
+        if h:
+            row["health"] = h.get("health")
+            if h.get("lastIngest"):
+                row["lastIngest"] = h["lastIngest"]
+        systems.append(row)
+        sts += [s for s in enabled if s not in sts]
+
+    def count(q):
+        return call("POST", "/CMDB/v2/data/cmdb", {"table": "user", "query": q,
+                                                  "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]
+
+    def match(s):
+        return {"searchFieldName": "sourcetype", "operator": "match", "type": "List", "value": s}
+
+    tasks = [(lambda s=s: count([[match(s)]])) for s in sts]
+    if len(sts) > 1:
+        tasks.append(lambda: count([[match(s) for s in sts]]))
+    got = parallel(tasks) if tasks else []
+    per = dict(zip(sts, got[:len(sts)]))
+    for row in systems:
+        for st in row["sourcetypes"]:
+            n = per.get(st["sourcetype"])
+            if isinstance(n, Exception):
+                st["userRecords"], st["error"] = None, _short(str(n), 160)
+            else:
+                st["userRecords"] = n
+    union = got[-1] if len(sts) > 1 else (got[0] if got else None)
+    result["userRecords"] = None if isinstance(union, Exception) or not sts else union
+
+    counts = [st["userRecords"] for r in systems for st in r["sourcetypes"]]
+    names = ", ".join(sorted({r["system"] for r in systems}))
+    if not hr:
+        state = "none_configured"
+        summary = ("No HR system is configured on this stack (recognized: %s). Manager, department and "
+                   "title fields may still be filled by an identity provider." % ", ".join(result["recognized"]))
+    elif not sts:
+        state = "configured_disabled"
+        summary = "%s is configured, but every service on it is switched off." % names
+    elif any(isinstance(c, int) and c > 0 for c in counts):
+        state = "has_data"
+        summary = "%s: %s user records carry HR data." % (
+            names, "{:,}".format(result["userRecords"]) if isinstance(result["userRecords"], int) else "some")
+        bad = sorted({r["system"] for r in systems if r.get("health") in ("failing", "degraded")})
+        if bad:
+            summary += " %s is not ingesting cleanly, so its data may be stale -- see lastIngest." % ", ".join(bad)
+    elif any(c is None for c in counts):
+        state = "unknown"
+        summary = "%s is configured, but its records could not be counted -- unknown, not zero." % names
+    else:
+        state = "configured_no_data"
+        summary = ("%s is configured but no user records carry its data -- the connector is not "
+                   "delivering. See each system's health and lastIngest for why." % names)
+    result.update(state=state, summary=summary, systems=systems, hrSourcetypes=sts, where=_hr_where(sts))
+
+    # An HR connector's own fields appear when it is enabled, i.e. after a field cache was likely
+    # written -- and a stale list here would hide exactly the fields this verb exists to point at.
+    if hr:
+        _refetch_field_map("user")
+    m = load_field_map("user")
+    result["hrFields"] = _hr_field_names(m, sts) if m else None
+    if not m:
+        result["hrFieldsNote"] = "user field metadata unreachable; HR-named fields unknown"
+    return result
+
+
+def cmd_hr(a):
+    jout(hr_sources(refresh=a.refresh))
+
+
 def classify_connect_error(err_str):
     """Map a call() error string to (state, http_status). Shared by cmd_connect, cmd_check and the
     smoke tests so the classification has one source of truth.
@@ -7354,6 +7562,13 @@ UPDATE_TIMEOUT = 10
 UPDATE_MAX_JSON_BYTES = 4 * 1024 * 1024
 UPDATE_MAX_ASSET_BYTES = 64 * 1024 * 1024      # the package is <1MB; this is a runaway-download stop
 UPDATE_MAX_REDIRECTS = 5    # a release download is one hop (github.com -> *.githubusercontent.com)
+# Staging and held-copy folder prefixes, beside the install. Short on purpose: every staged file sits
+# at <parent>/<prefix+8 random>/unpacked/meridiancs/<path>, and on Windows without long paths any path
+# over 259 chars cannot be opened. ".meridiancs-update-" made staging 37 chars deeper than the install;
+# this is 23. ".mcsp" + 8 is 13 chars against "meridiancs"' 10, so a held copy is barely deeper.
+UPDATE_STAGING_PREFIX = ".mcsu"
+UPDATE_HELD_PREFIX = ".mcsp"
+WINDOWS_MAX_PATH = 259      # MAX_PATH (260) less the terminating NUL
 UPDATE_MAX_UNPACKED_BYTES = 256 * 1024 * 1024  # ... and this is the zip-bomb stop
 UPDATE_MAX_MEMBERS = 2000
 UPDATE_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
@@ -7719,7 +7934,12 @@ def check_update(force=False, now=None):
         age = now - (cached.get("checkedAt") or 0)
         ttl = UPDATE_RETRY_INTERVAL if cached.get("state") == "unknown" else UPDATE_CHECK_INTERVAL
         if 0 <= age < ttl:
-            out = dict(cached, checkedVia="cache", cacheAgeSeconds=int(age))
+            # `base` goes over the cached record, not under it. The cache is one file per user,
+            # keyed on repo + version, so a second install of the same version on this machine (a
+            # branded and a public copy, or a test extraction) would otherwise report the FIRST
+            # install's commit and folder as its own until --force. What the cache knows is the feed:
+            # the latest release. Which commit and folder this copy is are read from disk every time.
+            out = dict(cached, **base, checkedVia="cache", cacheAgeSeconds=int(age))
             out.pop("schema", None)
             out.pop("checkedAt", None)
             return out
@@ -7834,6 +8054,47 @@ def _smoke_test(staged):
     return None
 
 
+def _long_paths_enabled():
+    """True unless this is Windows with the 260-char path limit still in force.
+
+    Python itself is long-path aware on Windows; the OS setting is what decides. Unreadable is
+    treated as off, because the cost of guessing wrong the other way is a failed extraction.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Control\FileSystem") as k:
+            return winreg.QueryValueEx(k, "LongPathsEnabled")[0] == 1
+    except OSError:
+        return False
+
+
+def _too_long_for_windows(zf, staged_root):
+    """The deepest path this update would write that Windows cannot open, or None.
+
+    Checked before a byte is extracted. Found verifying v2.26.0: from an install whose folder was
+    already deep, the staged `assets/fonts/SpaceGrotesk-Bold.ttf` came to 263 chars and extraction
+    died with a bare "No such file or directory". It failed safe -- the install was untouched -- but
+    the reason named a file that plainly exists in the package, and the next session would retry and
+    fail identically. Both where the file is staged and where it finally lands are checked: a
+    package whose installed paths do not fit would leave a skill Windows cannot read.
+    """
+    if _long_paths_enabled():
+        return None
+    worst = None
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        if name.endswith("/") or not name.startswith("meridiancs/"):
+            continue
+        rel = name[len("meridiancs/"):].split("/")
+        for p in (os.path.join(staged_root, "meridiancs", *rel), os.path.join(INSTALL_REAL, *rel)):
+            if len(p) > WINDOWS_MAX_PATH and (worst is None or len(p) > len(worst)):
+                worst = p
+    return worst
+
+
 def _extract_package(zf, staged_root):
     """Extract validated members under `staged_root`. Containment is re-checked per member."""
     import shutil
@@ -7921,7 +8182,7 @@ def apply_update(rel):
     parent = os.path.dirname(INSTALL_REAL)
     # Temp dir BESIDE the install, not in the system temp dir: os.replace cannot rename across
     # filesystems, and ~/.claude/skills is routinely on a different volume from /tmp.
-    tmp = tempfile.mkdtemp(prefix=".meridiancs-update-", dir=parent)
+    tmp = tempfile.mkdtemp(prefix=UPDATE_STAGING_PREFIX, dir=parent)
     backup = None
     try:
         pkg = os.path.join(tmp, "package.zip")
@@ -7930,6 +8191,13 @@ def apply_update(rel):
         os.makedirs(staged_root)
         with zipfile.ZipFile(pkg) as zf:
             stamp = _validate_package(zf, want)
+            deep = _too_long_for_windows(zf, staged_root)
+            if deep:
+                raise ValueError(
+                    "this install's folder is too deep for Windows to update it: %r is %d characters, "
+                    "over the %d-character limit. Turn on Windows long paths (LongPathsEnabled), or "
+                    "move the skill to a shorter folder such as ~/.claude/skills/meridiancs."
+                    % (deep, len(deep), WINDOWS_MAX_PATH + 1))
             _extract_package(zf, staged_root)
         staged = os.path.join(staged_root, "meridiancs")
         why = _smoke_test(staged)
@@ -7948,7 +8216,7 @@ def apply_update(rel):
             # half-deleted leftover, and it is NOT under `tmp`: the finally below deletes `tmp`, and
             # after an incomplete restore this directory is the only copy of the old skill.
             backup = None
-            held = tempfile.mkdtemp(prefix=".meridiancs-previous-", dir=parent)
+            held = tempfile.mkdtemp(prefix=UPDATE_HELD_PREFIX, dir=parent)
             try:
                 _swap_contents(INSTALL_REAL, staged, held)
             except Exception:
@@ -8250,6 +8518,11 @@ def main():
                         "are always detailed and do not count against this")
     s.add_argument("--refresh", action="store_true", help="ignore the cached coverage block and refetch")
     s.set_defaults(func=cmd_connectors)
+
+    s = sub.add_parser("hr", help="which HR systems (Dayforce, BambooHR, ADP, Workday, UKG...) feed "
+                                  "this stack, exact user-record counts, and the --where to scope by them")
+    s.add_argument("--refresh", action="store_true", help="ignore the cached connector health and refetch")
+    s.set_defaults(func=cmd_hr)
 
     s = sub.add_parser("check", help="what this token can reach, and rate-limit headroom "
                                      "(run after a 403, or before a big investigation)")

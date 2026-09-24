@@ -1,0 +1,43 @@
+name: Bug report
+description: Something the skill got wrong, or a script that failed.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Don't paste an API token, a stack hostname, or inventory output here.** Meridian responses
+        carry names, devices and vulnerability data from your environment, and this issue is public.
+        Redact them, or describe their shape instead. Security problems go to
+        [private reporting](https://github.com/CyderesInc/MeridianCS/security/advisories/new), not here.
+  - type: input
+    id: version
+    attributes:
+      label: Skill version
+      description: "`python scripts/meridian.py selfupdate` prints it as `installedVersion`."
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Python version
+      placeholder: "Windows 11, Python 3.12"
+    validations:
+      required: true
+  - type: textarea
+    id: asked
+    attributes:
+      label: What you asked or ran
+      description: The question you gave Claude, or the command line.
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Error output (redacted)
+      render: text

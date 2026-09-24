@@ -4689,10 +4689,45 @@ def test_skill_frontmatter():
     check("name is the folder identifier", fm["name"], "meridiancs")
     # The routing surface the description exists to provide must survive any future trimming.
     for term in ("Meridian", "Lucidum", "asset inventory", "SmartLabels", "risk", "connectors",
-                 "alert"):
+                 "alert", "HR systems", "managers", "Dayforce", "BambooHR"):
         check("description still triggers on %r" % term, term.lower() in fm["description"].lower(), True)
     check("...and on change-over-time phrasing",
           any(t in fm["description"].lower() for t in ("trend", "changed over time")), True)
+
+
+def test_hr_routing():
+    """SKILL.md routes HR / Human Resources questions to `hr`, with the "no HR data" rule attached.
+
+    The failure this exists for is one sentence said to users who had an HR connector enabled: "you
+    don't have HR data". It came from the model, not the code -- nothing in SKILL.md tied "HR" or
+    "manager" to Dayforce, BambooHR or ADP, and the paths it did take (the connector group, a search
+    for the product name, a sampled breakdown) all return nothing for an HR source. SKILL.md is prose
+    the model follows, so no behaviour test can notice that routing being dropped. This asserts it in
+    both directions: the question reaches the verb, AND the rules that keep it from being answered
+    wrongly travel with it.
+    """
+    print("[50] SKILL.md routes HR questions to `hr`, and only its state may say 'no HR data'")
+    body = open(SKILL_MD, encoding="utf-8").read()
+    flat = " ".join(body.split())
+    check("the verb table routes HR questions to `hr`",
+          "Human Resources systems" in flat and "`meridian.py hr` **first**" in flat, True)
+    check("...naming the systems a user actually says", all(s in flat for s in (
+        "Dayforce", "BambooHR", "ADP", "Workday", "UKG")), True)
+    check("...and manager/employee questions", "managers, employees, hires or terminations" in flat, True)
+    check("the rule: 'no HR data' only from its state",
+          '"you have no HR data" may only come from its `state`' in flat, True)
+    check("...explaining why nothing else can say it (group, name, sample)", all(s in flat for s in (
+        "Identity Access Management", "`dayforce_employee`", "samples")), True)
+    for st in ("has_data", "configured_no_data", "configured_disabled", "none_configured", "unknown"):
+        check("...covering state %s" % st, "`%s` —" % st in flat, True)
+    check("...forbidding 'no HR system' when the connector exists but isn't delivering",
+          "Never tell the user they have no HR system." in flat, True)
+    check("...and 'none' when the check failed", "never that there is none" in flat, True)
+    check("...and saying the core manager fields are not HR-only", "not HR-only" in flat, True)
+    with open(os.path.join(os.path.dirname(SKILL_MD), "references", "scripts.md"), encoding="utf-8") as f:
+        ref = " ".join(f.read().split())
+    check("scripts.md documents the verb and its states",
+          "`hr` — **which HR systems feed this stack" in ref and "`configured_no_data`" in ref, True)
 
 
 def test_alert_routing():
@@ -5408,7 +5443,7 @@ def test_selfupdate(m):
                       os.path.exists(m.INSTALL_REAL + ".previous"), False)
                 check("no staging directory is left behind",
                       [d for d in os.listdir(os.path.dirname(m.INSTALL_REAL))
-                       if d.startswith(".meridiancs-update-")], [])
+                       if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
                 check("the next check reads current from cache",
                       m.check_update()["state"], "current")
 
@@ -5431,7 +5466,7 @@ def test_selfupdate(m):
                 check("... with no leftover backup", os.path.exists(m.INSTALL_REAL + ".previous"), False)
                 check("... and no leftover staging dir",
                       [d for d in os.listdir(os.path.dirname(m.INSTALL_REAL))
-                       if d.startswith(".meridiancs-update-")], [])
+                       if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
 
                 # A dev tree is refused by apply_update itself, not merely by cmd_selfupdate.
                 with open(os.path.join(install, "CLAUDE.md"), "w") as f:
@@ -5523,6 +5558,9 @@ def test_package_stamp():
                   sorted(n for n in names if n.endswith(".public.md")), [])
             check("... nor the review stamp that tracks them",
                   [n for n in names if n.endswith(".public-sync.json")], [])
+            # GitHub reads these from the repository; in a skill folder they are dead weight.
+            check("repository community docs are not packaged",
+                  sorted(n for n in names if n.split("/")[-1] in ("SECURITY.md", "CONTRIBUTING.md")), [])
 
         # An unversioned one-off is stamped null rather than guessed -- and a null stamp is exactly
         # what install_markers() refuses to update from, so it cannot silently self-replace.
@@ -5729,6 +5767,12 @@ def test_public_variants():
     check("identifier data is dropped from the public tree",
           "design/known-identifiers.json" in dropped, True)
     check("... and is not in the kept set", "design/known-identifiers.json" in keep, False)
+    # Decided 2026-09-23, not defaulted: the internal record holds counsel's advice, and publishing
+    # privileged advice risks waiving the privilege. See design/oss-release.md.
+    check("PUBLISH_INTERNAL_DOCS stays False", mp.PUBLISH_INTERNAL_DOCS, False)
+    check("... so the legal record is dropped from the public tree",
+          sorted(f for f in ("design/oss-release.md", "design/legal-review-packet.md", "CLAUDE.md")
+                 if f in dropped), ["CLAUDE.md", "design/legal-review-packet.md", "design/oss-release.md"])
 
 
 def test_trademark_notice():
@@ -6100,7 +6144,7 @@ def test_selfupdate_held_dir(m):
 
     def leftovers(install):
         return sorted(d for d in os.listdir(os.path.dirname(install))
-                      if d.startswith((".meridiancs-", "meridiancs.previous")))
+                      if d.startswith((m.UPDATE_STAGING_PREFIX, m.UPDATE_HELD_PREFIX, "meridiancs.previous")))
 
     def read(install, rel):
         with open(os.path.join(install, rel), encoding="utf-8") as f:
@@ -6185,7 +6229,7 @@ def test_selfupdate_held_dir(m):
                 parent = os.path.dirname(dst)
                 if os.path.basename(dst) == "scripts" and parent == m.INSTALL_REAL and "unpacked" in src:
                     raise PermissionError(13, "simulated: cannot move scripts in", dst)
-                if os.path.basename(src) == "SKILL.md" and ".meridiancs-previous-" in src:
+                if os.path.basename(src) == "SKILL.md" and m.UPDATE_HELD_PREFIX in os.path.basename(os.path.dirname(src)):
                     raise PermissionError(13, "simulated: cannot restore SKILL.md", src)
                 return real_replace(src, dst)
             m._move_entry = stuck_move
@@ -6194,8 +6238,8 @@ def test_selfupdate_held_dir(m):
                 check("an incomplete restore is reported", "applied", "raised")
             except RuntimeError as e:
                 check("an incomplete restore is reported, naming where the old files are",
-                      ".meridiancs-previous-" in str(e) and "SKILL.md" in str(e), True)
-            kept = [d for d in leftovers(install) if d.startswith(".meridiancs-previous-")]
+                      m.UPDATE_HELD_PREFIX in str(e) and "SKILL.md" in str(e), True)
+            kept = [d for d in leftovers(install) if d.startswith(m.UPDATE_HELD_PREFIX)]
             check("... and that directory is kept, holding the stuck file",
                   len(kept) == 1 and os.path.exists(os.path.join(os.path.dirname(install), kept[0],
                                                                  "SKILL.md")) if kept else False, True)
@@ -6716,6 +6760,448 @@ def test_update_redirects(m):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_community_files(m):
+    """The public repository's security and contribution front door: present, pointed at the feed,
+    and warning people off pasting their environment into a public issue.
+
+    The skill's inputs and outputs are customer inventory -- names, devices, vulnerability data --
+    and the natural way to report a bug is to paste what you saw. So the redaction warning is the
+    load-bearing line in every one of these files, and is asserted rather than trusted. The private
+    reporting link must name the UPDATE_REPO feed: that repository is the one whose releases run on
+    every install, so it is where a vulnerability report has to land.
+    """
+    print("[46] community files: private security reporting, redaction warnings, dependabot stays internal")
+    root = os.path.dirname(HERE)
+
+    def read(rel):
+        path = os.path.join(root, *rel.split("/"))
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    advisories = "https://github.com/%s/security/advisories/new" % m.UPDATE_REPO
+    sec, contrib = read("SECURITY.md"), read("CONTRIBUTING.md")
+    cfg, bug = read(".github/ISSUE_TEMPLATE/config.yml"), read(".github/ISSUE_TEMPLATE/bug_report.yml")
+    feat = read(".github/ISSUE_TEMPLATE/feature_request.yml")
+    check("SECURITY.md and CONTRIBUTING.md exist", (sec is not None, contrib is not None), (True, True))
+    check("issue forms exist (config, bug, feature)",
+          (cfg is not None, bug is not None, feat is not None), (True, True, True))
+    if None in (sec, contrib, cfg, bug, feat):
+        return
+    check("SECURITY.md reports privately, to the update feed's repository", advisories in sec, True)
+    check("... and steers away from a public issue", "public issue" in sec, True)
+    check("... and asks for no tokens, hostnames or inventory", "API tokens" in sec and "hostnames" in sec, True)
+    check("... and says only the latest release is supported", "latest release is supported" in sec, True)
+    check("the issue chooser offers private reporting and no blank issue",
+          ("blank_issues_enabled: false" in cfg, advisories in cfg), (True, True))
+    check("the bug form warns against pasting a token, hostname or inventory",
+          all(w in bug for w in ("API token", "hostname", "inventory")), True)
+    check("... and links private reporting", advisories in bug, True)
+    check("the feature form warns too", "no tokens" in feat, True)
+    check("CONTRIBUTING.md carries the redaction warning",
+          all(w in contrib for w in ("API token", "hostname", "inventory")), True)
+    check("... and says a pull request is reapplied internally, not merged",
+          ("reapplied internally" in contrib, "not merged here" in contrib), (True, True))
+    check("... and states the inbound licence", "Apache License 2.0" in contrib, True)
+
+    # Dependabot belongs to the SOURCE repo: in the derived tree its pull requests could never merge.
+    if derived_tree():
+        check("the derived tree carries no dependabot config",
+              os.path.exists(os.path.join(root, ".github", "dependabot.yml")), False)
+        return
+    dep = read(".github/dependabot.yml")
+    check("dependabot keeps the pinned actions current", dep is not None and "github-actions" in dep, True)
+    spec = importlib.util.spec_from_file_location("mk_public_cf", os.path.join(root, "scripts", "make-public.py"))
+    mp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mp)
+    keep, _subs, dropped, _missing = mp.plan(mp.tracked_files())
+    check("make-public drops dependabot.yml", ".github/dependabot.yml" in dropped, True)
+    check("... and publishes the community files",
+          sorted(f for f in ("SECURITY.md", "CONTRIBUTING.md", ".github/ISSUE_TEMPLATE/config.yml",
+                             ".github/ISSUE_TEMPLATE/bug_report.yml",
+                             ".github/ISSUE_TEMPLATE/feature_request.yml") if f in keep),
+          [".github/ISSUE_TEMPLATE/bug_report.yml", ".github/ISSUE_TEMPLATE/config.yml",
+           ".github/ISSUE_TEMPLATE/feature_request.yml", "CONTRIBUTING.md", "SECURITY.md"])
+
+
+def test_ci_workflow():
+    """ci.yml's two supply-chain rules hold on every step, not just the ones someone remembered.
+
+    Actions are pinned to full commit SHAs, because a tag can be re-pointed by whoever controls the
+    action's repo. And every checkout sets persist-credentials: false, because nothing in CI pushes,
+    so a token left in the runner's git config is only something for a later step to read. Both are
+    one-line omissions in a new job, and Dependabot rewrites these lines weekly.
+    """
+    print("[47] CI workflow: actions pinned to commit SHAs, checkout persists no credentials")
+    path = os.path.join(os.path.dirname(HERE), ".github", "workflows", "ci.yml")
+    if not os.path.exists(path):
+        print("  SKIP  no .github/workflows/ci.yml in this tree")
+        return
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    uses = [(i, l.split("uses:", 1)[1].split("#", 1)[0].strip()) for i, l in enumerate(lines)
+            if l.strip().startswith(("uses:", "- uses:"))]
+    check("the workflow has steps to check", len(uses) > 0, True)
+    check("every action is pinned to a full commit SHA",
+          [u for _i, u in uses if not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", u)], [])
+    checkouts = [i for i, u in uses if u.startswith("actions/checkout@")]
+    check("... including every checkout", len(checkouts) > 0, True)
+
+    def step(i):
+        out = []
+        for l in lines[i + 1:]:
+            if l.strip().startswith("- ") or (l.strip() and len(l) - len(l.lstrip()) <= 6):
+                break
+            out.append(l.strip())
+        return out
+    check("every checkout sets persist-credentials: false",
+          [i + 1 for i in checkouts if "persist-credentials: false" not in step(i)], [])
+
+
+def test_hr_sources(m):
+    """`hr` answers "do we have HR data?" from configured connectors and exact counts, never a sample.
+
+    Three things together made the skill tell users with an HR connector enabled that they had no HR
+    data: Meridian files HR systems under Identity Access Management beside Okta, the product and data
+    names diverge (Dayforce is bridge `ceridian`, records `dayforce_employee`), and `summary --by
+    sourcetype` samples values, so a small HR source behind a large one never shows. The verb takes all
+    three out of the model's hands. The negative space matters most: only `none_configured` may mean
+    "no HR system", and only when the profiles were actually read.
+    """
+    print("[48] hr: HR systems resolved from connectors, counted exactly, never an unread 'none'")
+    real = {n: getattr(m, n) for n in ("_fetch_connector_profiles", "summarize_connectors", "call",
+                                       "load_field_map", "_refetch_field_map")}
+    secret = "hunter2-dayforce-secret"
+
+    def prof(connector, bridge, services, profile="Prod"):
+        return {"connector": connector, "bridge": bridge, "profile": profile,
+                "group": "Identity Access Management",
+                "services": [{"service": s, "enabled": on, "testStatus": "SUCCESS", "message": ""}
+                             for s, on in services]}
+
+    state = {"profiles": [], "counts": {}, "calls": [], "health": "ok"}
+
+    def fake_profiles():
+        if isinstance(state["profiles"], Exception):
+            raise state["profiles"]
+        return list(state["profiles"]), {secret}
+
+    def fake_summary(brief=True, refresh=False, **k):
+        return {"connectors": [{"connector": p["connector"], "profile": p["profile"],
+                                "health": state["health"],
+                                "lastIngest": {"status": "Error", "records": 0}}
+                               for p in state["profiles"]]}
+
+    def fake_call(method, endpoint, body=None, retries=1):
+        vals = tuple(sorted(c["value"] for c in body["query"][0]))
+        state["calls"].append(vals)
+        v = state["counts"].get(vals, 0)
+        if isinstance(v, Exception):
+            raise v
+        return {"totalRecords": v}
+
+    fields = {"Owner_Manager": "String", "Dayforce_Department_SmartLabel": "String",
+              "alias_dayforce_employee_displayName": "String", "alias_okta_user_Owner_Manager": "String",
+              "Message_Usage_Adapter": "String", "Workday_Status_SmartLabel": "String"}
+    m._fetch_connector_profiles, m.summarize_connectors, m.call = fake_profiles, fake_summary, fake_call
+    m.load_field_map = lambda t, allow_fetch=True: dict(fields)
+    m._refetch_field_map = lambda t: False
+    try:
+        # 1. an unreadable profile endpoint is unknown -- the one case that must never read as "none"
+        state["profiles"] = RuntimeError("HTTP 403: Forbidden")
+        r = m.hr_sources()
+        check("unreadable profiles are unknown, not none", (r["state"], r["userRecords"]), ("unknown", None))
+        check("... and the summary says unknown is not none", "not the same as none" in r["summary"], True)
+
+        # 2. only an IdP configured: none, and only because the profiles WERE read
+        state["profiles"] = [prof("Okta SSO", "okta", [("okta_user", True)])]
+        r = m.hr_sources()
+        check("an IdP alone is none_configured", (r["state"], r["systems"], r["where"]),
+              ("none_configured", [], None))
+        check("... noting the IdP may still fill manager and department", "identity provider" in r["summary"], True)
+        check("... and making no count query", state["calls"], [])
+
+        # 3. Dayforce: catalog bridge `ceridian`, data `dayforce_employee`, nothing delivered
+        state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)])]
+        state["counts"], state["health"] = {("dayforce_employee",): 0}, "degraded"
+        r = m.hr_sources()
+        s = r["systems"][0]
+        check("Dayforce is recognised by its bridge name", (s["system"], s["bridge"]), ("Dayforce", "ceridian"))
+        check("configured but empty is configured_no_data, never none", r["state"], "configured_no_data")
+        check("... carrying the connector's health and last run",
+              (s["health"], s["lastIngest"]["status"]), ("degraded", "Error"))
+        check("... and the exact --where for its records", r["where"], "sourcetype match List dayforce_employee")
+        check("its sourcetype is counted exactly", s["sourcetypes"],
+              [{"sourcetype": "dayforce_employee", "userRecords": 0}])
+
+        # 4. two HR systems and an IdP: a person in both HR systems is ONE record
+        state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)]),
+                             prof("BambooHR", "bamboohr", [("bamboohr_employee", True), ("bamboohr_extra", False)]),
+                             prof("Okta SSO", "okta", [("okta_user", True)])]
+        state["counts"] = {("dayforce_employee",): 700, ("bamboohr_employee",): 400,
+                           ("bamboohr_employee", "dayforce_employee"): 900}
+        state["health"], state["calls"] = "ok", []
+        r = m.hr_sources()
+        check("data from either system is has_data", r["state"], "has_data")
+        check("the total is the de-duplicated OR count, not 700 + 400", r["userRecords"], 900)
+        check("... and the summary states that total", "900 user records" in r["summary"], True)
+        check("the IdP is not counted as an HR system", sorted(x["system"] for x in r["systems"]),
+              ["BambooHR", "Dayforce"])
+        check("a disabled service is reported but never counted",
+              ([x["servicesDisabled"] for x in r["systems"] if x["system"] == "BambooHR"],
+               any("bamboohr_extra" in c for c in state["calls"])), ([1], False))
+        check("the --where covers every HR sourcetype", r["where"],
+              "sourcetype in List dayforce_employee,bamboohr_employee")
+        check("HR fields: the source's alias copies and HR-named SmartLabels, nothing else", r["hrFields"],
+              ["Dayforce_Department_SmartLabel", "Workday_Status_SmartLabel",
+               "alias_dayforce_employee_displayName"])
+        check("no credential value reaches the output", secret in json.dumps(r), False)
+        state["health"] = "failing"
+        r = m.hr_sources()
+        check("data from a failing connector is flagged as possibly stale", "may be stale" in r["summary"], True)
+
+        # 5. a failed count with nothing positive is unknown, never a zero
+        state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)])]
+        state["counts"] = {("dayforce_employee",): RuntimeError("HTTP 500: boom")}
+        r = m.hr_sources()
+        check("a failed count is unknown, not configured_no_data", (r["state"], r["userRecords"]), ("unknown", None))
+        check("... keeping the error on the row", "HTTP 500" in r["systems"][0]["sourcetypes"][0]["error"], True)
+
+        # 6. configured with every service switched off
+        state["profiles"] = [prof("Workday", "workday", [("workday_worker", False)])]
+        state["counts"], state["calls"] = {}, []
+        r = m.hr_sources()
+        check("every service off is configured_disabled, with no count query",
+              (r["state"], state["calls"]), ("configured_disabled", []))
+
+        # 7. a recognised product under a bridge name the list has not seen yet
+        state["profiles"] = [prof("UKG", "ukg_ready_v2", [("ukg_employee", True)])]
+        state["counts"] = {("ukg_employee",): 3}
+        r = m.hr_sources()
+        check("recognised by display name when the bridge is new",
+              (r["state"], r["systems"][0]["system"]), ("has_data", "UKG"))
+    finally:
+        for n, v in real.items():
+            setattr(m, n, v)
+
+
+def test_field_cache_refetch(m):
+    """A cached field map that misses a name re-reads the metadata once before calling it missing.
+
+    The disk cache never expired, so a field that appeared after it was written was refused as
+    "doesn't exist" by every verb. Enabling a connector is exactly what adds fields -- an HR connector
+    brings its `alias_<sourcetype>_*` copies and the customer's SmartLabels for it -- so the skill told
+    users their newly connected HR system's fields did not exist. Measured live: 280 cached against 282
+    real, the missing two the HR source's. Bounded to one metadata call per table per process, so a
+    run of typos costs one call, not one each.
+    """
+    print("[49] field cache: a miss re-fetches once, so a newly added field is not 'doesn't exist'")
+    import tempfile
+    real = {n: getattr(m, n) for n in ("CFG_DIR", "call", "load_config", "drop_labels_cache", "drop_rescache")}
+    saved_map, saved_live, saved_disk = dict(m._FIELD_MAP), set(m._FIELD_MAP_LIVE), set(m._FIELD_MAP_DISK)
+    tmp = tempfile.mkdtemp(prefix="fieldcache-")
+    calls, dropped = [], []
+    api = {"user": [{"fieldName": "Owner_Manager", "dataType": "String"},
+                    {"fieldName": "alias_dayforce_employee_displayName", "dataType": "String"}]}
+
+    def fake_call(method, endpoint, body=None, retries=1):
+        calls.append(endpoint)
+        if api.get("fail"):
+            raise RuntimeError("HTTP 403: Forbidden")
+        return {"metadata": api["user"]}
+
+    m.CFG_DIR, m.call = tmp, fake_call
+    m.load_config = lambda: ("s.example", "tok", None)
+    m.drop_labels_cache = lambda: dropped.append("labels") or True
+    m.drop_rescache = lambda: dropped.append("rescache") or True
+    cached = [{"fieldName": "Owner_Manager", "dataType": "String"}]
+
+    def reset():
+        m._FIELD_MAP.clear()
+        m._FIELD_MAP_LIVE.clear()
+        m._FIELD_MAP_DISK.clear()
+        del calls[:], dropped[:]
+        with open(m._fields_path(), "w", encoding="utf-8") as f:
+            json.dump({"fqdn": "s.example", "user": cached}, f)
+
+    try:
+        # the cache predates the HR connector: it knows Owner_Manager only
+        reset()
+        check("a field added after the cache was written is accepted",
+              m.field_problem("user", "alias_dayforce_employee_displayName"), None)
+        check("... at the cost of one metadata call", calls, ["/CMDB/v2/data/metadata/user"])
+        check("... dropping the caches derived from metadata", sorted(dropped), ["labels", "rescache"])
+        with open(m._fields_path(), encoding="utf-8") as f:
+            check("... and the disk cache now holds it",
+                  "alias_dayforce_employee_displayName" in {x["fieldName"] for x in json.load(f)["user"]}, True)
+
+        # a typo: still refused, after exactly one refetch however many typos follow
+        reset()
+        api["user"] = list(cached)
+        p1, p2 = m.field_problem("user", "Owner_Mnager"), m.field_problem("user", "Owner_Mangr")
+        check("a real typo is still refused, with the suggestion",
+              (p1 is not None and "Owner_Manager" in p1, p2 is not None), (True, True))
+        check("... after one refetch, not one per query", len(calls), 1)
+        check("... and an unchanged field set drops no cache", dropped, [])
+
+        # metadata unreachable on refetch: the cached answer stands, and it is not retried per query
+        reset()
+        api["fail"] = True
+        p1, p2 = m.field_problem("user", "Owner_Mnager"), m.field_problem("user", "Nope")
+        check("an unreachable refetch still refuses from the cache", (p1 is not None, p2 is not None), (True, True))
+        check("... trying the endpoint once", len(calls), 1)
+        api.pop("fail")
+
+        # a field the cache already has costs nothing
+        reset()
+        check("a known field makes no call", (m.field_problem("user", "Owner_Manager"), calls), (None, []))
+
+        # a cold start with no disk cache fetches exactly once, even when a name then misses
+        reset()
+        os.remove(m._fields_path())
+        m.field_problem("user", "Not_There")
+        check("a cold start fetches once, not a second time for the miss", len(calls), 1)
+
+        # a map placed in the memo (not read from disk) is never refetched: this is what keeps the
+        # offline suite offline, since other tests inject a map and then probe a misspelt field
+        reset()
+        m._FIELD_MAP["user"] = {"Owner_Manager": "String"}
+        m.call = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network reached from a memo map"))
+        check("an injected map is judged as given, with no call",
+              "Did you mean" in (m.field_problem("user", "Owner_Mnager") or ""), True)
+        m.call = fake_call
+    finally:
+        for n, v in real.items():
+            setattr(m, n, v)
+        m._FIELD_MAP.clear()
+        m._FIELD_MAP.update(saved_map)
+        m._FIELD_MAP_LIVE.clear()
+        m._FIELD_MAP_LIVE.update(saved_live)
+        m._FIELD_MAP_DISK.clear()
+        m._FIELD_MAP_DISK.update(saved_disk)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_selfupdate_followups(m):
+    """Two defects found verifying v2.26.0 end to end, both on the self-update path.
+
+    1. A cached check reported ANOTHER install's commit and folder. The cache is one file per user,
+       keyed on repo + version, and the cached record was returned whole -- so a second install of
+       the same version reported the first one's `installedCommit`/`installDir` until --force.
+    2. A deep install folder failed its update on Windows with a bare "No such file or directory":
+       staging sat 37 chars deeper than the install, and a staged font path reached 263 chars against
+       a 260 limit. Now staging is shallower, and a path that cannot fit is refused before a byte is
+       extracted, with a reason that says what to do.
+    """
+    print("[45] selfupdate: the cache never speaks for another install; deep paths refused up front (offline)")
+
+    def fake(version):
+        def _f(repo):
+            return {"version": version, "tag": "v" + version,
+                    "assetName": "meridiancs.v%s.skill.zip" % version,
+                    "assetUrl": "https://github.com/o/r/releases/download/v%s/x.skill.zip" % version,
+                    "assetSize": 1234}
+        return _f
+
+    def stamp(install, commit):
+        path = os.path.join(install, "VERSION.json")
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        rec["commit"] = commit
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+
+    saved = {n: getattr(m, n, None) for n in ("latest_release", "_download_asset", "_long_paths_enabled")}
+    os.environ["MERIDIAN_UPDATE_REPO"] = "jwood25/meridiancs-public"
+    try:
+        # --- 1. two installs of one version share the cache, never each other's identity ----------
+        tmp = tempfile.mkdtemp()
+        a = _su_install(os.path.join(tmp, "a"), "2.26.0")
+        b = _su_install(os.path.join(tmp, "b"), "2.26.0")
+        stamp(a, "aaaa1111")
+        stamp(b, "bbbb2222")
+        m.latest_release = fake("2.26.0")
+        env = _SUEnv(m, a, tmp)
+        try:
+            first = m.check_update(force=True)
+        finally:
+            env.restore()
+        env = _SUEnv(m, b, tmp)             # same tmp -> the same CFG_DIR and .updatecheck
+        try:
+            m.latest_release = lambda repo: (_ for _ in ()).throw(AssertionError("cache should answer"))
+            second = m.check_update()
+        finally:
+            env.restore()
+        check("the first install checks over the network", (first.get("checkedVia"), first.get("installedCommit")),
+              ("network", "aaaa1111"))
+        check("a second install of the same version is answered from the shared cache",
+              second.get("checkedVia"), "cache")
+        check("...but reports its OWN commit", second.get("installedCommit"), "bbbb2222")
+        check("...and its own folder", second.get("installDir"), os.path.realpath(b))
+        check("...while the feed facts still come from the cache",
+              (second.get("state"), second.get("latestVersion")), ("current", "2.26.0"))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+        # --- 2. a deep install is refused before extraction, a normal one still updates -----------
+        font = {"meridiancs/assets/fonts/SpaceGrotesk-Bold.ttf": "x"}
+        m._long_paths_enabled = lambda: False       # the Windows default, forced on every platform
+
+        tmp = tempfile.mkdtemp()
+        # Deep enough that STAGED paths pass 259 chars while every INSTALLED path still fits, which
+        # is exactly the v2.26.0 case: the install works, only its update cannot.
+        target = 259 - len("/assets/fonts/SpaceGrotesk-Bold.ttf") - 4
+        root = os.path.join(tmp, "d")
+        while len(os.path.join(root, "skills", "meridiancs")) < target - 12:
+            root = os.path.join(root, "deepfolder")
+        install = _su_install(root, "2.25.0")
+        installed = len(os.path.join(os.path.realpath(install), "assets", "fonts", "SpaceGrotesk-Bold.ttf"))
+        staged = installed + len(m.UPDATE_STAGING_PREFIX) + 8 + len("/unpacked/")
+        check("fixture: the installed path fits and the staged one does not",
+              (installed <= m.WINDOWS_MAX_PATH, staged > m.WINDOWS_MAX_PATH), (True, True))
+        pkg = _su_package(tmp, "2.26.0", extra=font)
+        m.latest_release = fake("2.26.0")
+        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
+        env = _SUEnv(m, install, tmp)
+        try:
+            err = ""
+            try:
+                m.apply_update(m.check_update(force=True))
+            except Exception as e:  # noqa
+                err = str(e)
+            check("an update whose staged paths cannot fit is refused", "too deep" in err, True)
+            check("...saying how long the path is and what to do",
+                  ("characters" in err, "LongPathsEnabled" in err), (True, True))
+            with open(os.path.join(install, "VERSION.json"), encoding="utf-8") as f:
+                check("...leaving the install untouched", json.load(f)["version"], "2.25.0")
+            check("...and nothing staged beside it",
+                  [d for d in os.listdir(os.path.dirname(install)) if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
+        finally:
+            env.restore()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        tmp = tempfile.mkdtemp()
+        install = _su_install(tmp, "2.25.0")
+        pkg = _su_package(tmp, "2.26.0", extra=font)
+        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
+        env = _SUEnv(m, install, tmp)
+        try:
+            res = m.apply_update(m.check_update(force=True))
+            check("a normal-depth install still updates with the check in force",
+                  (res.get("applied"), res.get("toVersion")), (True, "2.26.0"))
+        finally:
+            env.restore()
+            shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        for n, v in saved.items():
+            if v is None:
+                if hasattr(m, n):
+                    delattr(m, n)
+            else:
+                setattr(m, n, v)
+        os.environ.pop("MERIDIAN_UPDATE_REPO", None)
+
+
 def main():
     live = "--live" in sys.argv
     print("Meridian connect preflight — smoke tests\n" + "-" * 42)
@@ -6776,6 +7262,12 @@ def main():
     test_publish_public()
     test_low_findings(m)
     test_update_redirects(m)
+    test_selfupdate_followups(m)
+    test_community_files(m)
+    test_ci_workflow()
+    test_hr_routing()
+    test_hr_sources(m)
+    test_field_cache_refetch(m)
     test_licensing()
     test_brand_fallback(m)
     test_public_variants()
