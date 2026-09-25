@@ -3,6 +3,22 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.27.0 - 2026-09-24
+
+- **Every answer now says which data it describes**: the time of Meridian's latest rebuild, for
+  example "Data as of 2026-09-24 10:12 UTC". If that time can't be read, the answer says so instead
+  of implying the data is current.
+- **If Meridian rebuilds mid-conversation, the skill tells you** before its next answer, says which
+  earlier figures may have changed, and offers to re-run them. It never combines numbers from two
+  rebuilds.
+- **Figures from the past are labelled "Historical" wherever they appear.** That covers trends,
+  alerts, snapshot history, the 30-day averages and a user's change history, so a past value is
+  never mistaken for today's.
+- **Trends are more accurate on stacks that rebuild several times a day.** Same-day rebuilds are
+  separate points, and a snapshot just after midnight no longer draws a false flat line. Older
+  history is unchanged.
+- **Reports show the same "as of" or "Historical" line under the title.**
+
 ## 2.26.1 - 2026-09-24
 
 - **Questions about HR systems now find your HR data.** Ask about Dayforce, BambooHR, ADP, Workday,

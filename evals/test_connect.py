@@ -839,11 +839,20 @@ def test_result_cache(m):
                 "data": [{"Risk_Level": "1-low"} for _ in range(100)]}
 
     m.call = fake_call
+    # Every breakdown here passes a rebuild stamp. Since design/data-currency.md the stamp is part of
+    # the key and NO stamp means NO cache, so a call without one would make each "is a miss" check
+    # below pass trivially -- and leave the 0600 check stat()-ing a file that was never written.
+    stamp = "2026-09-24T10:12:12Z"
+
+    def sb(*args, **kw):
+        kw.setdefault("rebuilt", stamp)
+        return m.summarize_by(*args, **kw)
+
     try:
         # --- a second identical breakdown costs nothing ---------------------------------------
-        first = m.summarize_by("asset", "Risk_Level")
+        first = sb("asset", "Risk_Level")
         n_first = len(calls)
-        second = m.summarize_by("asset", "Risk_Level")
+        second = sb("asset", "Risk_Level")
         check("a repeated breakdown issues no further calls", len(calls), n_first)
         check("...and the first one actually cost calls", n_first > 1, True)
         check("cached groups match the computed ones", second["groups"], first["groups"])
@@ -853,22 +862,40 @@ def test_result_cache(m):
 
         # --- the cache key discriminates ------------------------------------------------------
         calls.clear()
-        m.summarize_by("asset", "Risk_Level", where=["OS == String Windows"])
+        sb("asset", "Risk_Level", where=["OS == String Windows"])
         check("a different --where is a different entry", len(calls) > 0, True)
         calls.clear()
-        m.summarize_by("user", "Risk_Level")
+        sb("user", "Risk_Level")
         check("a different table is a different entry", len(calls) > 0, True)
+
+        # --- the LDG rebuild is part of the key ------------------------------------------------
+        # A count cached just before a merge must not be served after it: the TTL alone would do
+        # exactly that for up to RESCACHE_TTL.
+        calls.clear()
+        sb("asset", "Risk_Level", rebuilt="2026-09-24T14:05:00Z")
+        check("a later rebuild is a miss, not a pre-merge hit", len(calls) > 0, True)
+        calls.clear()
+        back = sb("asset", "Risk_Level")
+        check("...and the original rebuild's entry still hits", (len(calls), back.get("fromCache")), (0, True))
+
+        # --- no stamp, no cache: read AND write ---------------------------------------------------
+        calls.clear()
+        unstamped = m.summarize_by("asset", "Risk_Level", rebuilt=None)
+        check("an unknown rebuild never reads the cache", (len(calls) > 0, "fromCache" in unstamped), (True, False))
+        before = set((m._rescache_read().get("entries") or {}))
+        m.summarize_by("asset", "Risk_Level", where=["OS == String Solaris"], rebuilt=None)
+        check("...and never writes to it", set((m._rescache_read().get("entries") or {})), before)
 
         # --- refresh bypasses -----------------------------------------------------------------
         calls.clear()
-        again = m.summarize_by("asset", "Risk_Level", refresh=True)
+        again = sb("asset", "Risk_Level", refresh=True)
         check("--refresh recomputes", len(calls) > 0, True)
         check("...and its result is unstamped", "fromCache" in again, False)
 
         # --- the kill switch ------------------------------------------------------------------
         os.environ["MERIDIAN_NO_CACHE"] = "1"
         calls.clear()
-        m.summarize_by("asset", "Risk_Level")
+        sb("asset", "Risk_Level")
         check("MERIDIAN_NO_CACHE=1 disables reads", len(calls) > 0, True)
         os.environ.pop("MERIDIAN_NO_CACHE", None)
 
@@ -879,7 +906,7 @@ def test_result_cache(m):
             rec["at"] = time.time() - (m.RESCACHE_TTL + 60)
         m._private_write(m._rescache_path(), data)
         calls.clear()
-        m.summarize_by("asset", "Risk_Level")
+        sb("asset", "Risk_Level")
         check("an entry past its TTL is a miss", len(calls) > 0, True)
 
         # --- a future timestamp is a miss, not an un-ageable hit ------------------------------
@@ -888,14 +915,14 @@ def test_result_cache(m):
             rec["at"] = time.time() + 86400
         m._private_write(m._rescache_path(), data)
         calls.clear()
-        m.summarize_by("asset", "Risk_Level")
+        sb("asset", "Risk_Level")
         check("a backwards clock is a miss, not a hit with an unstatable age", len(calls) > 0, True)
 
         # --- an unverifiable breakdown is not cached ------------------------------------------
         # `complete` absent means the coverage check could not run; caching that would pin an
         # unanswered question in place for the whole TTL.
         m.drop_rescache()
-        broken = dict(m.summarize_by("asset", "Risk_Level"))
+        broken = dict(sb("asset", "Risk_Level"))
         broken.pop("complete", None)
         check("a breakdown without a completeness verdict is refused by the cache",
               m.rescache_get("summary_by", m.RESCACHE_TTL,
@@ -980,7 +1007,7 @@ def test_result_cache(m):
         # _private_write for the same 0600-and-atomic treatment as config.json, and a read-modify-write
         # racing a scheduled digest must not leave a temp file or half-written JSON behind.
         m.drop_rescache()
-        m.summarize_by("asset", "Risk_Level")
+        sb("asset", "Risk_Level")
         check("no temp file survives a cache write",
               [f for f in os.listdir(tmp) if f.endswith(".tmp")], [])
         if os.name == "posix":
@@ -989,7 +1016,7 @@ def test_result_cache(m):
             check("rescache is owner-only (0600)", oct(mode), oct(0o600))
         check("a corrupt cache file is a miss, not a crash", (lambda: (
             open(m._rescache_path(), "w", encoding="utf-8").write("{not json"),
-            m.summarize_by("asset", "Risk_Level").get("groups") is not None)[1])(), True)
+            sb("asset", "Risk_Level").get("groups") is not None)[1])(), True)
         m.drop_rescache()
         check("a wrong-schema file is ignored", (lambda: (
             open(m._rescache_path(), "w", encoding="utf-8").write('{"schema": 99, "entries": {}}'),
@@ -5158,6 +5185,627 @@ def test_live_entities(m):
         m.CFG_DIR = real_dir
 
 
+def test_data_currency(m):
+    """Every answer is tied to the LDG rebuild it came from (design/data-currency.md, phase 1).
+
+    The LDG changes only when a merger run completes, so the stamp is the last completed, non-failed
+    merger run -- never the query time, never the latest ingest. The load-bearing negatives: an
+    unreadable stamp is `unknown` (never "current", never "now"), a failed merge is skipped rather
+    than trusted, a renamed merger fails loudly and names itself, and a query that straddles a
+    rebuild is not an answer.
+    """
+    print("[51] data currency: rebuild stamps on every data verb (offline)")
+    import contextlib
+    import io
+    import tempfile
+    names = ("_CFG_CACHE", "CFG_DIR", "CFG_PATH", "call", "load_config", "ldg_rebuild", "top_n", "list_records",
+             "summarize_by", "stack_metrics", "build_profile", "hr_sources", "summarize_connectors",
+             "diagnose_connection", "build_digest", "take_snapshot")
+    real = {n: getattr(m, n) for n in names}
+    real_env = os.environ.get("MERIDIAN_NO_CACHE")
+    tmp = tempfile.mkdtemp(prefix="currency-")
+    m.CFG_DIR = tmp
+    m._CFG_CACHE = ("s.example", "tok", None)   # configured, so ldg_rebuild reaches call()
+    m.load_config = lambda: ("s.example", "tok", None)
+
+    T0 = 1790244732                               # 2026-09-24T10:12:12Z, a real merger end_time
+    ISO0 = "2026-09-24T10:12:12Z"
+    DAY = 86400
+    ASSET, USER = "Lucidum Asset Merger", "Lucidum User Merger"
+
+    def run(name, end, status="Warning", dag=None, platform="ML-ENGINE"):
+        return {"platform": platform, "bridge_name": name, "status": status, "end_time": end,
+                "_time": end * 1000, "_utc": time.strftime("%Y-%m-%dT%H:%M:%S.000+00:00", time.gmtime(end)),
+                "dag_run_id": dag or "scheduled__%d" % end}
+
+    def filler(n, end):
+        return [run("some_connector", end - i, "Success", platform="api") for i in range(n)]
+
+    served = {"calls": 0}
+
+    def serve(pages, fail=None):
+        served["calls"] = 0
+
+        def fake(method, endpoint, body=None, retries=1):
+            served["calls"] += 1
+            if fail:
+                raise RuntimeError(fail)
+            check_sort = "sort=_time%2Cdesc" in endpoint
+            p = int(re.search(r"[?&]page=(\d+)", endpoint).group(1))
+            return {"content": pages[p] if p < len(pages) and check_sort else [], "totalPages": len(pages)}
+        m.call = fake
+
+    try:
+        os.environ["MERIDIAN_NO_CACHE"] = "1"
+        check("the merger names are pinned exactly (a rename is a visible test change)",
+              m.LDG_MERGERS, (("asset", ASSET), ("user", USER)))
+
+        # --- found on page 0: one call, end_time as the stamp -----------------------------------
+        serve([filler(3, T0 + 50) + [run(ASSET, T0, dag="d1"), run(USER, T0, dag="d1")] + filler(5, T0)])
+        s = m.ldg_rebuild()
+        check("newest page holds both mergers: one call", (s["apiCalls"], served["calls"]), (1, 1))
+        check("stamp is end_time, as ISO UTC", (s["asset"].get("rebuiltUtc"), s["user"].get("rebuiltUtc")), (ISO0, ISO0))
+        check("...carrying the pipeline run that produced it", s["asset"].get("dagRunId"), "d1")
+        check("a Warning merge is a rebuild, not a failure", "lastRebuildFailed" in s["asset"], False)
+
+        # --- found deeper: pages until both are seen ---------------------------------------------
+        serve([filler(4, T0 + 90), filler(4, T0 + 80), [run(ASSET, T0), run(USER, T0)]])
+        s = m.ldg_rebuild()
+        check("mergers on page 2 are found on page 2", (s["apiCalls"], s["asset"].get("rebuiltUtc")), (3, ISO0))
+
+        # --- missing within the cap: unknown with a reason, never a timestamp -------------------
+        pages = [filler(4, T0 + 900 - 10 * i) for i in range(10)]
+        pages[0] = pages[0] + [run(ASSET, T0)]
+        serve(pages)
+        s = m.ldg_rebuild()
+        check("a merger absent from the newest pages stops at the cap",
+              s["apiCalls"], m.LDG_REBUILD_MAX_PAGES)
+        check("...its table is unknown, with a reason", ("unknown" in s["user"], "rebuiltUtc" in s["user"]), (True, False))
+        check("...naming the merger it looked for", USER in s["user"]["unknown"], True)
+        check("...while the table that WAS found keeps its stamp", s["asset"].get("rebuiltUtc"), ISO0)
+
+        # --- renamed: loud, and names what it found ----------------------------------------------
+        serve([[run("Meridian Asset Merger", T0), run(USER, T0)]])
+        s = m.ldg_rebuild()
+        check("a renamed merger is unknown, not absorbed", "rebuiltUtc" in s["asset"], False)
+        check("...and the reason names the unexpected bridge", "'Meridian Asset Merger'" in s["asset"]["unknown"], True)
+        check("...and says it may have been renamed", "renamed" in s["asset"]["unknown"], True)
+        check("...and the result lists it", s.get("unexpectedMergers"), ["Meridian Asset Merger"])
+        check("the unchanged merger still stamps", s["user"].get("rebuiltUtc"), ISO0)
+
+        # --- failed runs are skipped; the previous good one is the stamp -------------------------
+        for status in ("Error", "FAILED", "Warning&Error", ""):
+            pages = [[run(ASSET, T0 + DAY, status, dag="bad"), run(USER, T0 + DAY, dag="good-u")] + filler(3, T0 + DAY)]
+            pages += [filler(4, T0 + DAY - 100 * i) for i in range(1, 4)]
+            pages += [[run(ASSET, T0, "Success", dag="good-a")]]
+            serve(pages)
+            s = m.ldg_rebuild()
+            check("newest asset merge %r: stamps the earlier good run" % status,
+                  s["asset"].get("rebuiltUtc"), ISO0)
+            check("...flags the failed one with its status %r" % status,
+                  (s["asset"].get("lastRebuildFailed") or {}).get("status"), status)
+            check("...having paged back to find it (%r)" % status, s["apiCalls"], 5)
+        check("a Warning newest run stamps itself",
+              (s["user"].get("rebuiltUtc"), "lastRebuildFailed" in s["user"]),
+              (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + DAY)), False))
+
+        # --- failed with no earlier success: unknown at the rate-limit backstop -----------------
+        pages = [[run(ASSET, T0 + DAY, "Error"), run(USER, T0 + DAY)]]
+        pages += [filler(2, T0 + DAY - 10 * i) for i in range(1, 40)]
+        serve(pages)
+        s = m.ldg_rebuild()
+        check("a failed newest run with no earlier success stops at the backstop",
+              s["apiCalls"], m.LDG_REBUILD_FAILED_MAX_PAGES)
+        check("...and is unknown, saying the newest run failed",
+              ("rebuiltUtc" in s["asset"], "failed" in s["asset"].get("unknown", "")), (False, True))
+
+        # --- the failed-run search is paid once per failed run -----------------------------------
+        os.environ.pop("MERIDIAN_NO_CACHE", None)
+        m.drop_rescache()
+        pages = [[run(ASSET, T0 + DAY, "Error", dag="bad1"), run(USER, T0 + DAY)]]
+        pages += [filler(3, T0 + DAY - 100 * i) for i in range(1, 6)] + [[run(ASSET, T0, "Success", dag="ok0")]]
+        serve(pages)
+        first = m.ldg_rebuild()
+        second = m.ldg_rebuild()
+        check("the backwards search runs once", first["apiCalls"] > 1, True)
+        check("...and the next check costs one call", second["apiCalls"], 1)
+        check("...with the same stamp and the failure still flagged",
+              (second["asset"].get("rebuiltUtc"), (second["asset"].get("lastRebuildFailed") or {}).get("dagRunId")),
+              (ISO0, "bad1"))
+        pages[0] = [run(ASSET, T0 + 2 * DAY, "Error", dag="bad2"), run(USER, T0 + 2 * DAY)]
+        serve(pages)
+        third = m.ldg_rebuild()
+        check("a NEW failed run is a new key: the search runs again", third["apiCalls"] > 1, True)
+        os.environ["MERIDIAN_NO_CACHE"] = "1"
+
+        # --- never raises; unconfigured makes no call ---------------------------------------------
+        serve([], fail="HTTP 403: Forbidden")
+        s = m.ldg_rebuild()
+        check("an unreadable endpoint is unknown for both tables, not an exception",
+              ("could not read" in s["asset"].get("unknown", ""), "rebuiltUtc" in s["user"]), (True, False))
+        serve([[run(ASSET, T0), run(USER, T0)]])
+        # Isolated from THIS machine: with only _CFG_CACHE cleared, an operator's real
+        # ~/.meridian/config.json made the stack "configured" and this passed in CI only.
+        m._CFG_CACHE = None
+        m.CFG_PATH = os.path.join(tmp, "no-such-config.json")
+        saved_env = {k: os.environ.pop(k, None) for k in ("MERIDIAN_FQDN", "MERIDIAN_API_TOKEN")}
+        try:
+            s = m.ldg_rebuild()
+        finally:
+            os.environ.update({k: v for k, v in saved_env.items() if v is not None})
+            m.CFG_PATH = real["CFG_PATH"]
+        check("unconfigured: unknown, and no network call",
+              (s["asset"].get("unknown"), served["calls"]), ("no stack is configured", 0))
+        m._CFG_CACHE = ("s.example", "tok", None)
+
+        # --- _merger_end ----------------------------------------------------------------------------
+        r = run(ASSET, T0)
+        r["_utc"] = "2026-09-24T10:30:00.000+00:00"
+        check("end_time wins over _utc when they disagree", m._merger_end(r)[1], ISO0)
+        r.pop("end_time")
+        check("_utc is the fallback without end_time", m._merger_end(r)[1], "2026-09-24T10:30:00Z")
+        check("milliseconds are tolerated", m._merger_end({"end_time": T0 * 1000})[1], ISO0)
+        check("an undatable run is None, not now", m._merger_end({"_utc": "yesterday"}), (None, None))
+
+        # --- data_currency -------------------------------------------------------------------------
+        a = {"rebuiltUtc": ISO0, "dagRunId": "d1"}
+        u = {"rebuiltUtc": ISO0, "dagRunId": "d1"}
+        cur = m.data_currency({"asset": a, "user": u}, ["asset", "user"])
+        check("both known: current, both stamped",
+              (cur["class"], cur.get("ldgRebuiltUtc")), ("current", {"asset": ISO0, "user": ISO0}))
+        check("...with the query time beside it, not instead of it", bool(cur.get("queriedUtc")), True)
+        check("...and no split", "mergersSplit" in cur, False)
+        split = m.data_currency({"asset": a, "user": dict(u, dagRunId="d0")}, ["asset", "user"])
+        check("two pipeline runs: mergersSplit", split.get("mergersSplit"), True)
+        unk = m.data_currency({"asset": a, "user": {"unknown": "no run"}}, ["asset", "user"])
+        check("one table unknown: the answer is unknown, never current",
+              (unk["class"], "ldgRebuiltUtc" in unk, "no run" in unk.get("reason", "")), ("unknown", False, True))
+        check("a table the answer doesn't use doesn't taint it",
+              m.data_currency({"asset": a, "user": {"unknown": "x"}}, ["asset"])["class"], "current")
+        check("an empty stamp is unknown", m.data_currency({}, ["asset"])["class"], "unknown")
+        same = m.data_currency({"asset": a}, ["asset"], after={"asset": dict(a)})
+        check("re-read unchanged: current", same["class"], "current")
+        moved = m.data_currency({"asset": a}, ["asset"], after={"asset": {"rebuiltUtc": "2026-09-24T14:05:00Z"}})
+        check("rebuilt mid-query: unknown with rebuildDuringQuery",
+              (moved["class"], moved.get("rebuildDuringQuery"), "Re-run" in moved.get("reason", "")),
+              ("unknown", True, True))
+        unread = m.data_currency({"asset": a}, ["asset"], after={"asset": {"unknown": "HTTP 500"}})
+        check("re-read failed: unknown (a mid-query rebuild can't be ruled out)", unread["class"], "unknown")
+        check("unexpected mergers travel into the block",
+              m.data_currency({"asset": a, "unexpectedMergers": ["X"]}, ["asset"]).get("unexpectedMergers"), ["X"])
+        check("label form: absolute, 24-hour, UTC spelled out",
+              m.currency_label_utc(ISO0), "2026-09-24 10:12 UTC")
+
+        # --- with_currency ---------------------------------------------------------------------
+        reads = []
+        stamp = {"asset": dict(a), "user": dict(u)}
+        m.ldg_rebuild = lambda: reads.append(1) or stamp
+        got = m.with_currency(["asset"], lambda: {"rows": []})
+        check("with_currency stamps the result, one read", (got["dataCurrency"]["class"], len(reads)), ("current", 1))
+        reads.clear()
+        m.with_currency(["asset"], lambda: {"rows": []}, straddle=True)
+        check("straddle re-reads after the query", len(reads), 2)
+        try:
+            m.with_currency(["asset"], lambda: (_ for _ in ()).throw(ValueError("boom")))
+            raised = False
+        except ValueError:
+            raised = True
+        check("a failing verb still fails (not swallowed into a stamped non-answer)", raised, True)
+
+        # --- every data verb emits dataCurrency ---------------------------------------------------
+        m.top_n = lambda *a_, **k: {"top": []}
+        m.list_records = lambda a_: {"rows": [], "totalRecords": 0}
+        m.summarize_by = lambda *a_, **k: {"groups": [], "rebuiltSeen": k.get("rebuilt")}
+        m.stack_metrics = lambda: {"metrics": {"assetCount": 1, "avg30DaysAssetCount": 1}}
+        m.build_profile = lambda *a_, **k: {"type": "user", "stability": {}}
+        m.hr_sources = lambda **k: {"state": "has_data"}
+        m.summarize_connectors = lambda *a_, **k: {"summary": {}}
+        m.diagnose_connection = lambda: {"state": "connected"}
+        m.take_snapshot = lambda **k: {"written": True}
+
+        class NS:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        def out_of(fn, ns):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                fn(ns)
+            return json.loads(buf.getvalue())
+
+        verbs = {
+            "top": (m.cmd_top, NS(table="asset", field="Risk_Score", top=5, where=None, select=None)),
+            "list": (m.cmd_list, NS(table="asset", where=None, select=None, all=False, limit=50, count_only=False)),
+            "list --count-only": (m.cmd_list, NS(table="user", where=None, select=None, all=False, limit=50, count_only=True)),
+            "summary --by": (m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None)),
+            "summary --metrics": (m.cmd_summary, NS(metrics=True, by=None, table="asset", where=None)),
+            "profile": (m.cmd_profile, NS(name="x", type="user")),
+            "compare": (m.cmd_compare, NS(name1="x", name2="y", type="user")),
+            "hr": (m.cmd_hr, NS(refresh=False)),
+            "connectors": (m.cmd_connectors, NS(max_failures=12, max_other=15, full=False, max_warnings=12,
+                                                max_detail=10, refresh=False)),
+            "connect": (m.cmd_connect, NS(with_connectors=False)),
+            "connect --with-connectors": (m.cmd_connect, NS(with_connectors=True, refresh=False, coverage_full=True)),
+            "digest": (m.cmd_digest, NS(table="asset", by=None, field="Risk_Score", top=5, snapshot=False)),
+            "asof": (m.cmd_asof, NS()),
+        }
+        outs = {}
+        for label, (fn, ns) in verbs.items():
+            outs[label] = out_of(fn, ns)
+            check("%s carries dataCurrency, current" % label,
+                  (outs[label].get("dataCurrency") or {}).get("class"), "current")
+        check("summary --by keys its cache on the stamp", outs["summary --by"].get("rebuiltSeen"), ISO0)
+        check("summary --metrics labels the 30-day averages historical",
+              (outs["summary --metrics"]["dataCurrency"].get("sections") or {})
+              .get("metrics.avg30DaysAssetCount", {}).get("class"), "historical")
+        check("a user profile labels its change-log verdict historical",
+              outs["profile"]["dataCurrency"].get("sections", {}).get("stability", {}).get("class"), "historical")
+        check("compare labels both sides' change-log verdicts",
+              sorted(outs["compare"]["dataCurrency"].get("sections", {})),
+              ["profileA.stability", "profileB.stability"])
+        check("digest labels its headline averages historical",
+              "headline.assets30DayAvg" in outs["digest"]["dataCurrency"].get("sections", {}), True)
+        check("asof speaks the label form",
+              outs["asof"].get("message"), "Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)")
+        m.diagnose_connection = lambda: {"state": "auth_error"}
+        check("a failed connect carries no currency claim",
+              "dataCurrency" in out_of(m.cmd_connect, NS(with_connectors=False)), False)
+
+        # summary --by: a cache hit made no calls, so there is nothing to straddle
+        reads.clear()
+        m.summarize_by = lambda *a_, **k: {"groups": [], "fromCache": True}
+        out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+        check("a cached breakdown reads the stamp once", len(reads), 1)
+        reads.clear()
+        m.summarize_by = lambda *a_, **k: {"groups": []}
+        out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+        check("a computed breakdown re-reads it after", len(reads), 2)
+
+        # Every top-level verb is classified, so a new one fails here until someone decides.
+        src = open(MERIDIAN_PY, encoding="utf-8").read()
+        declared = set(re.findall(r'\bsub\.add_parser\("([a-z-]+)"', src))
+        stamped = {"top", "list", "summary", "profile", "compare", "hr", "connectors", "connect", "digest", "asof"}
+        # Not LDG reads: config, metadata, diagnostics, updates, rendering of an input file, and the raw
+        # passthrough (SKILL.md treats `api` output as currency-unknown). The local-history verbs are
+        # historical by definition and get their own labels in phase 2 of design/data-currency.md.
+        not_ldg = {"api", "refresh-fields", "labels", "check", "selfupdate", "stacks", "report"}
+        history = {"snapshot", "snapshots", "trend", "metrics", "alerts"}
+        check("every verb is classified for data currency",
+              sorted(declared - stamped - not_ldg - history), [])
+        check("...and nothing classified has been removed", sorted((stamped | not_ldg | history) - declared), [])
+    finally:
+        for n, v in real.items():
+            setattr(m, n, v)
+        if real_env is None:
+            os.environ.pop("MERIDIAN_NO_CACHE", None)
+        else:
+            os.environ["MERIDIAN_NO_CACHE"] = real_env
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_live_currency(m):
+    """The facts design/data-currency.md rests on, re-checked on whichever stack the suite runs against.
+
+    The merger-name check is a FAILING TEST BY DESIGN. The names are stable by platform contract, so
+    an ML-ENGINE run under any other name means the platform changed and LDG_MERGERS needs a release.
+    Don't add a tolerance or a skip: this failing is the whole mechanism, and CLAUDE.md makes `--live`
+    a required release step so a rename is caught before a release ships rather than by a user.
+    """
+    print("[52] live data currency: merger names, rebuild = LDG (needs a configured, reachable stack)")
+    proc = subprocess.run([sys.executable, MERIDIAN_PY, "asof"], capture_output=True, text=True, timeout=120)
+    out = json.loads(proc.stdout)
+    cur = out.get("dataCurrency") or {}
+    check("asof: current, both tables stamped", (cur.get("class"), sorted(cur.get("ldgRebuiltUtc") or {})),
+          ("current", ["asset", "user"]))
+    iso = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"
+    check("...as ISO UTC", all(re.match(iso, v or "") for v in (cur.get("ldgRebuiltUtc") or {}).values()), True)
+
+    rows = []
+    for p in range(m.LDG_REBUILD_MAX_PAGES):
+        r = m.call("GET", "/CMDB/v2/system/metrics/connector?size=%d&page=%d&sort=_time%%2Cdesc"
+                   % (m.LDG_REBUILD_PAGE_SIZE, p), retries=0)
+        rows += [x for x in (r.get("content") or []) if x.get("platform") == "ML-ENGINE"]
+    pinned = {n for _, n in m.LDG_MERGERS}
+    seen = {x.get("bridge_name") for x in rows}
+    check("every ML-ENGINE run carries a pinned merger name (a rename needs a skill release)",
+          sorted(str(s) for s in seen - pinned), [])
+    check("...and both pinned mergers are present", sorted(pinned - seen), [])
+
+    # Rebuild = LDG: the newest non-failed merger's output equals the LDG's own current count.
+    metrics = m.call("GET", "/CMDB/v2/system/metrics/data", retries=0)
+    for table, name, key in (("asset", m.LDG_MERGERS[0][1], "assetCount"), ("user", m.LDG_MERGERS[1][1], "userCount")):
+        good = [x for x in rows if x.get("bridge_name") == name and m._run_health(x.get("status")) not in ("fail", "unknown")]
+        good.sort(key=lambda x: m._merger_end(x)[0] or 0, reverse=True)
+        check("%s merger output_records == the LDG's %s" % (table, key),
+              good[0].get("output_records") if good else None, metrics.get(key))
+
+
+def test_historical_labels(m):
+    """History-reading verbs say they are historical, and a trend's data point is an LDG rebuild.
+
+    Phase 2 of design/data-currency.md. The load-bearing claims: (1) a history with no rebuild stamps
+    -- all of it before v2.27.0 -- behaves exactly as it did, checked against a reference copy of the
+    old per-date rule rather than a restatement of it; (2) a stamped once-a-day history gives the same
+    trend; (3) the two cases the old rule got wrong are now right -- several rebuilds on one date are
+    several points, and one rebuild seen on two dates is ONE point, not a flat segment; (4) nothing read
+    back from local snapshots is ever labelled current.
+    """
+    print("[53] historical labels + rebuild-keyed trend points (offline)")
+    import contextlib
+    import io
+    import tempfile
+
+    def stamped(rec, *utc):
+        rec = dict(rec)
+        rec["ldgRebuiltUtc"] = {"asset": utc[0], "user": utc[-1]}
+        return rec
+
+    def old_rule(recs):
+        """design/trends.md's rule before v2.27.0, verbatim in effect: one point per stackDate, last
+        taken wins. Kept here so 'unchanged for old history' is checked, not asserted."""
+        by = {}
+        for r in recs:
+            dd = r.get("stackDate")
+            if dd and (dd not in by or (r.get("takenAt") or "") >= (by[dd].get("takenAt") or "")):
+                by[dd] = r
+        return by
+
+    def strip(t):
+        t = json.loads(json.dumps(t))
+        t.pop("dataCurrency", None)
+        for end in ("from", "to"):
+            (t.get(end) or {}).pop("ldgRebuiltUtc", None)
+        return t
+
+    # --- (1) unstamped history is untouched ------------------------------------------------------
+    unstamped = [_snap("2026-09-01", taken="2026-09-01T08:00:00Z"),
+                 _snap("2026-09-01", assets=34300, taken="2026-09-01T20:00:00Z"),
+                 _snap("2026-09-02", assets=34400), _snap("2026-09-04", assets=34500)]
+    got, _ = m._usable_snapshots(unstamped)
+    ref = old_rule(unstamped)
+    check("unstamped history: the same points as the old per-date rule", sorted(got), sorted(ref))
+    check("...holding the same records (last taken wins)",
+          all(got[k] is ref[k] for k in ref), True)
+
+    # --- (2) a stamped once-a-day history gives the same trend -------------------------------------
+    daily = [_snap("2026-09-%02d" % dd, assets=34000 + 50 * dd) for dd in range(1, 8)]
+    daily_st = [stamped(r, "%sT10:12:12Z" % r["stackDate"]) for r in daily]
+    daily_st.insert(3, stamped(_snap("2026-09-03", assets=1, taken="2026-09-03T01:00:00Z"),
+                               "2026-09-03T10:12:12Z"))   # an earlier re-run of the same rebuild
+    daily.insert(3, _snap("2026-09-03", assets=1, taken="2026-09-03T01:00:00Z"))
+    for since in (None, "2026-09-03"):
+        check("daily stack, since=%s: stamped trend == unstamped trend" % since,
+              strip(m.compute_trend(daily_st, since=since)), strip(m.compute_trend(daily, since=since)))
+    t = m.compute_trend(daily_st)
+    check("...and the endpoints name their rebuilds",
+          ((t["from"].get("ldgRebuiltUtc") or {}).get("asset"), (t["to"].get("ldgRebuiltUtc") or {}).get("asset")),
+          ("2026-09-01T10:12:12Z", "2026-09-07T10:12:12Z"))
+
+    # --- (3a) a 4-hour stack: several genuine points on one date ------------------------------------
+    four = [stamped(_snap("2026-09-10", assets=30000 + i, taken="2026-09-10T%02d:30:00Z" % (h + 1)),
+                    "2026-09-10T%02d:00:00Z" % h) for i, h in enumerate((2, 6, 10))]
+    pts, _ = m._usable_snapshots(four)
+    check("three rebuilds on one date are three points", len(pts), 3)
+    check("...labelled so they sort in time order", sorted(pts),
+          ["2026-09-10 rebuild 2026-09-10T02:00:00Z", "2026-09-10 rebuild 2026-09-10T06:00:00Z",
+           "2026-09-10 rebuild 2026-09-10T10:00:00Z"])
+    t = m.compute_trend(four)
+    check("...so a same-day trend is answerable, not insufficientHistory",
+          (t.get("insufficientHistory"), t.get("dataPoints"), t.get("distinctStackDates")), (None, 3, 1))
+    check("...comparing the first rebuild with the last",
+          next(r["change"] for r in t["changes"] if r.get("kind") == "total" and r.get("name") == "assets"), 2)
+    t = m.compute_trend(four, since="2026-09-10")
+    check("a --since date still selects every point on that date", t.get("dataPoints"), 3)
+    check("the insufficient-history refusal counts points too",
+          m.compute_trend(four[:1]).get("dataPoints"), 1)
+
+    # --- (3b) one rebuild on two dates is ONE point -----------------------------------------------------
+    late = stamped(_snap("2026-09-11", assets=30002, taken="2026-09-11T00:40:00Z"), "2026-09-10T10:00:00Z")
+    pts, _ = m._usable_snapshots([four[2], late])
+    check("a snapshot after midnight, before that day's merge, is the same point", len(pts), 1)
+    check("...so there is no manufactured flat segment to compare",
+          m.compute_trend([four[2], late]).get("insufficientHistory"), True)
+    check("...where the old rule saw two dates", len(old_rule([four[2], late])), 2)
+    check("two snapshots of one rebuild on one date: one point, last taken wins",
+          [r["totals"]["assets"] for r in m._usable_snapshots(
+              [stamped(_snap("2026-09-12", assets=1, taken="2026-09-12T11:00:00Z"), "2026-09-12T10:00:00Z"),
+               stamped(_snap("2026-09-12", assets=2, taken="2026-09-12T12:00:00Z"), "2026-09-12T10:00:00Z")])[0].values()],
+          [2])
+    mixed = [stamped(_snap("2026-09-13", assets=1, taken="2026-09-13T11:00:00Z"), "2026-09-13T10:00:00Z"),
+             _snap("2026-09-13", assets=2, taken="2026-09-13T15:00:00Z")]
+    check("a date with any unstamped record keeps the old rule (upgrade day)",
+          [r["totals"]["assets"] for r in m._usable_snapshots(mixed)[0].values()], [2])
+    check("a half-empty stamp is no stamp", m._rebuild_key({"ldgRebuiltUtc": {"asset": "x", "user": None}}), None)
+
+    # --- (4) every history-reading output is labelled historical, never current ------------------------
+    for label, t in (("computed", m.compute_trend(daily_st)), ("insufficient", m.compute_trend(daily_st[:1])),
+                     ("unverifiable", m.compute_trend([_snap("2026-09-01", coverage=False), _snap("2026-09-02")]))):
+        c = t.get("dataCurrency") or {}
+        check("trend (%s) is historical, with its range" % label,
+              (c.get("class"), c.get("source"), bool(c.get("from")), bool(c.get("to"))),
+              ("historical", "local snapshots", True, True))
+    check("an empty history is still historical, not current",
+          m.compute_trend([]).get("dataCurrency", {}).get("class"), "historical")
+
+    real = {n: getattr(m, n) for n in ("CFG_DIR", "load_config", "load_snapshots", "load_alerts",
+                                       "ldg_rebuild", "name_entities", "add_metric", "measure_metric",
+                                       "load_metrics")}
+    tmp = tempfile.mkdtemp(prefix="hist-")
+    try:
+        m.CFG_DIR = tmp
+        m.load_config = lambda: ("s.example", "tok", None)
+        path = os.path.join(tmp, "snaps.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for r in daily_st:
+                f.write(json.dumps(r) + "\n")
+        s = m.snapshots_summary(path)
+        check("snapshots list is historical, oldest to newest",
+              (s["dataCurrency"]["class"], s["dataCurrency"]["from"], s["dataCurrency"]["to"]),
+              ("historical", "2026-09-01", "2026-09-07"))
+        check("...and counts the records that carry a rebuild stamp", s["withRebuildStamp"], len(daily_st))
+
+        m.load_snapshots = lambda *a_, **k: (list(four), [])
+        m.load_alerts = lambda: []
+        v = m._current_alert_verdict()
+        check("an alert verdict is historical (the latest SNAPSHOT, not the stack now)",
+              v.get("dataCurrency", {}).get("class"), "historical")
+        check("...and its window counts points: two same-day rebuilds are a 0-day window",
+              (v["window"].get("dataPoints"), v["window"].get("days")), (2, 0))
+
+        # --- snapshot records carry the rebuild they measured -----------------------------------------
+        cur = {"class": "current", "ldgRebuiltUtc": {"asset": "2026-09-24T10:12:12Z", "user": "2026-09-24T10:12:12Z"}}
+        dig = {"generated": "digest", "stack": "s.example", "metrics": {"metrics": {"date": "2026-09-24"}}}
+        rec = m.snapshot_record(dict(dig, dataCurrency=cur))
+        check("a snapshot records its rebuild", rec.get("ldgRebuiltUtc"), cur["ldgRebuiltUtc"])
+        rec = m.snapshot_record(dict(dig, dataCurrency={"class": "unknown", "reason": "rebuilt mid-query"}))
+        check("an unknown stamp is recorded as unknown, never guessed",
+              ("ldgRebuiltUtc" in rec, rec.get("ldgRebuildUnknown")), (False, "rebuilt mid-query"))
+        check("a digest with no currency block writes neither key",
+              sorted(k for k in m.snapshot_record(dig) if k.startswith("ldgRebuil")), [])
+
+        # --- trend --name-entities: live names stamped like any LDG read --------------------------------
+        m.ldg_rebuild = lambda: {"asset": {"rebuiltUtc": "2026-09-24T10:12:12Z", "dagRunId": "d"},
+                                 "user": {"rebuiltUtc": "2026-09-24T10:12:12Z", "dagRunId": "d"}}
+
+        def fake_name(diff, limit=None):
+            diff["names"] = {"abc": "HOST1"}
+        m.name_entities = fake_name
+        ent = {"comparable": True, "scope": "asset:Risk_Score:top:5"}
+        m.load_snapshots = lambda *a_, **k: ([dict(daily_st[0], entities=ent), dict(daily_st[-1], entities=ent)], [])
+
+        class TA:
+            since = metric = table = by = format = out = None
+            name_entities = True
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            m.cmd_trend(TA())
+        tout = json.loads(buf.getvalue())
+        sec = (tout.get("dataCurrency", {}).get("sections") or {}).get("entities.names") or {}
+        check("trend --name-entities stays historical overall", tout["dataCurrency"]["class"], "historical")
+        check("...while the live names are stamped current", (sec.get("class"), bool(sec.get("ldgRebuiltUtc"))),
+              ("current", True))
+
+        # --- metrics add --derived: the baseline is a live measurement ---------------------------------------
+        m.add_metric = lambda *a_, **k: ({"name": "kev", "table": "asset"}, None)
+        m.measure_metric = lambda rec_: {"name": "kev", "ok": True, "count": 455}
+        m.load_metrics = lambda: [{"name": "kev"}]
+
+        class MA:
+            metrics_cmd, name, label, table, where, smart_label, derived = "add", "kev", "KEV", "asset", None, None, True
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            m.cmd_metrics(MA())
+        check("a derived metric's baseline is stamped current",
+              json.loads(buf.getvalue()).get("dataCurrency", {}).get("class"), "current")
+    finally:
+        for n_, v_ in real.items():
+            setattr(m, n_, v_)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- reports say which kind of data they show -----------------------------------------------------------
+    one = "2026-09-24T10:12:12Z"
+    check("report line, current", m._currency_line({"dataCurrency": {"class": "current",
+                                                     "ldgRebuiltUtc": {"asset": one, "user": one}}}),
+          "Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)")
+    check("report line, split tables", m._currency_line({"dataCurrency": {"class": "current",
+                                                          "ldgRebuiltUtc": {"asset": one, "user": "2026-09-23T10:11:24Z"}}}),
+          "Assets as of 2026-09-24 10:12 UTC; Users as of 2026-09-23 10:11 UTC")
+    check("report line, historical", m._currency_line({"dataCurrency": {"class": "historical",
+                                                        "source": "local snapshots", "from": "2026-09-01", "to": "2026-09-24"}}),
+          "Historical · local snapshots, 2026-09-01 to 2026-09-24")
+    check("report line, unknown says so", m._currency_line({"dataCurrency": {"class": "unknown", "reason": "HTTP 403"}}),
+          "Data currency could not be confirmed: HTTP 403")
+    check("an input with no currency block says so, not nothing", m._currency_line({"rows": []}),
+          "Data currency not recorded in this input")
+    sub, _, _ = m._trend_html({"generated": "trend", "insufficientHistory": True, "snapshotsRead": 1})
+    check("a trend report's subtitle leads with Historical", sub.startswith("Historical"), True)
+
+    tmp = tempfile.mkdtemp(prefix="hist-report-")
+    try:
+        inp = os.path.join(tmp, "in.json")
+        with open(inp, "w", encoding="utf-8") as f:
+            json.dump({"table": "asset", "field": "Risk_Score", "matchedAtThreshold": 1, "totalInTail": 1,
+                       "top": [{"Asset_Name": "X"}],
+                       "dataCurrency": {"class": "current", "ldgRebuiltUtc": {"asset": one}}}, f)
+
+        class R:
+            input, out, title, date, html = [inp], os.path.join(tmp, "r.html"), "T", "2026-09-24", True
+        real_lc = m.load_config
+        m.load_config = lambda: ("s.example", "tok", None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                m.cmd_report(R())
+        finally:
+            m.load_config = real_lc
+        html = open(os.path.join(tmp, "r.html"), encoding="utf-8").read()
+        check("the rendered report carries the currency line",
+              "Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)" in html, True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+CURRENCY_RULES = (
+    # (what the assertion protects, text that must survive, whitespace-normalised)
+    ("the connected template carries the rebuild", "data as of **{rebuiltUtc}** (latest Meridian rebuild)"),
+    ("...and says what to write when it's unknown", "(data currency could not be confirmed: {reason})"),
+    ("...and names it the baseline for later answers", "baseline every later answer's rebuild is compared against"),
+    ("rule 1: stamp every data answer", "**Stamp every data answer**"),
+    ("...in the approved label form", "_Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild) · company.lucidum.cloud_"),
+    ("...UTC spelled out", "`UTC` spelled out"),
+    ("...never relative", 'Never write "2 hours ago"'),
+    ("...never local time", "never convert to local time"),
+    ("...split tables give both times", "With `mergersSplit`, give both times"),
+    ("...a failed newest rebuild is said", "With `lastRebuildFailed`"),
+    ("...unknown is said as unknown", '**"Data currency could not be confirmed"**'),
+    ("...and never replaced by the query time", "never put the query time in its place"),
+    ("rule 2: historical labelled at the point of use", "**Label historical data every time it's used, where it's used**"),
+    ("...with one consistent marker", "**🕘 Historical**"),
+    ("...covering the sections map", "every path listed in `dataCurrency.sections`"),
+    ("...and mixed answers label each part", "Label each part of an answer that mixes current and historical data"),
+    ("rule 3: a rebuild between answers is said first", "say so **before** the new answer"),
+    ("...and earlier figures become superseded", "**superseded**"),
+    ("...and are referred to with their rebuild", "Meridian has rebuilt since"),
+    ("rule 4: never mix rebuilds in one figure", "**Never derive one figure from two rebuilds.**"),
+    ("rule 5: asof before reusing earlier rows", "**Before answering from Meridian rows already in the conversation, run `meridian.py asof`**"),
+    ("rule 6: a straddled query is not an answer", "**`rebuildDuringQuery: true` is not an answer.**"),
+    ("rule 7: api output is currency-unknown", "**`api` output carries no stamp.**"),
+    ("the 30-day average arrow is labelled historical", "The 30-day average is **historical**, so label it"),
+    ("the verb table routes to asof", "`meridian.py asof`: one call. If the rebuild moved"),
+)
+
+
+def test_currency_routing(m):
+    """SKILL.md carries the data-currency rules, and its labels match what the code produces.
+
+    Phase 3 of design/data-currency.md. SKILL.md is prose the model follows, so no behaviour test can
+    notice a rule being dropped from it -- the same gap test_alert_routing and test_hr_routing exist
+    for. CLAUDE.md warns that a guard authored alongside the rules it guards proves little on its own,
+    so each entry in CURRENCY_RULES was also shown to FAIL with its text deleted from a copy of
+    SKILL.md (recorded in the PR). Matched whitespace-normalised: these are rules, not a display
+    template, so a reflow must not fail the build.
+
+    The label cross-check is the other half: if SKILL.md told the model to write one form and the
+    report or `asof` printed another, a user would see two "as of" lines disagree about the same data.
+    """
+    print("[54] SKILL.md carries the data-currency rules, in the labels the code prints")
+    flat = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+    check("SKILL.md has the data-currency section", "### 4.1 Current or historical: say which, every time" in flat, True)
+    for what, text in CURRENCY_RULES:
+        check(what, " ".join(text.split()) in flat, True)
+    one = "2026-09-24T10:12:12Z"
+    check("the label form SKILL.md prescribes is the one asof/reports print",
+          m.currency_label_utc(one) in flat and
+          m._currency_line({"dataCurrency": {"class": "current", "ldgRebuiltUtc": {"asset": one, "user": one}}}) in flat,
+          True)
+    hist = m._currency_line({"dataCurrency": {"class": "historical", "source": "local snapshots",
+                                              "from": "2026-09-01", "to": "2026-09-24"}})
+    check("...and the historical form matches too", hist in flat, True)
+    ref = " ".join(open(os.path.join(os.path.dirname(SKILL_MD), "references", "scripts.md"),
+                        encoding="utf-8").read().split())
+    check("scripts.md documents asof and dataCurrency",
+          "`asof` — **when the LDG was last rebuilt" in ref and "carries `dataCurrency`" in ref, True)
+
+
 def test_live_connectors():
     print("[22] live connectors / data coverage (needs a configured, reachable stack)")
     proc = subprocess.run([sys.executable, MERIDIAN_PY, "connectors"],
@@ -7274,10 +7922,14 @@ def main():
     test_trademark_notice()
     test_dangling_links()
     test_security_hardening(m)
+    test_data_currency(m)
+    test_historical_labels(m)
+    test_currency_routing(m)
     if live:
         test_live()
         test_live_connectors()
         test_live_entities(m)
+        test_live_currency(m)
     else:
         print("[21] live connect: SKIPPED (pass --live to run against your stack)")
     print("-" * 42)

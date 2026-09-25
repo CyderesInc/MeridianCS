@@ -21,6 +21,13 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR branch cancels that PR's run still in progress: its result describes a commit
+# nobody will merge. Runs on `main` are never cancelled -- a merge to main is a live deploy, and
+# every one of them should have a finished result, including one superseded by the next merge.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Every checkout sets persist-credentials: false. By default checkout writes the job token into the
 # runner's git config so later steps can push; nothing here pushes, so that only leaves a token on
 # disk for any step (or compromised action) to read. The token is read-only, but it is still a token.
@@ -42,18 +49,14 @@ jobs:
       - name: Offline test suite
         run: python evals/test_connect.py
 
-  docs-pii:
-    # The three PDFs ship inside the package and one of them goes to customers, so a real name,
-    # stack FQDN or IP reaching a generator is a data-handling incident rather than a typo. This was
-    # a manual pre-regeneration step, and a manual step that has to be remembered every time is one
-    # that eventually isn't. The script reads generator SOURCE, never the PDF: Chrome subsets the
-    # embedded brand fonts, so a grep over the finished PDF passes silently whatever the page says.
-    #
-    # Now repo-wide, not just the three generators. The narrow scope was not enough: a sweep over
-    # every tracked text file found a real demo-stack username, a real asset id, and rendered
-    # demo-tenant data in SKILL.md's own example -- which ships in every release. All of it sat in
-    # files this job never opened. Licence compliance (LICENSE/NOTICE/OFL texts present in the
-    # package) and SBOM currency are asserted by the offline suite above, on both OSes.
+  repo-checks:
+    # One job for the three quick Linux checks, not three. On a private repo Actions minutes are
+    # metered, and each job is billed rounded up to a whole minute; each of these runs in 5-25s, so
+    # as separate jobs they cost three billed minutes for well under one minute of work.
+    # Every step after the first runs even if an earlier one failed (`!cancelled()`), so a PR still
+    # gets all three verdicts from one run rather than finding the second failure on the next push.
+    # pre-commit goes last because its fixer hooks rewrite files in the workspace when they fail,
+    # and the two checks before it should see the tree exactly as committed.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,35 +65,30 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Documentation generators carry no real identifiers
+
+      # docs-pii. The three PDFs ship inside the package and one of them goes to customers, so a
+      # real name, stack FQDN or IP reaching a generator is a data-handling incident rather than a
+      # typo. This was a manual pre-regeneration step, and a manual step that has to be remembered
+      # every time is one that eventually isn't. The script reads generator SOURCE, never the PDF:
+      # Chrome subsets the embedded brand fonts, so a grep over the finished PDF passes silently
+      # whatever the page says.
+      #
+      # Now repo-wide, not just the three generators. The narrow scope was not enough: a sweep over
+      # every tracked text file found a real demo-stack username, a real asset id, and rendered
+      # demo-tenant data in SKILL.md's own example -- which ships in every release. All of it sat in
+      # files this check never opened. Licence compliance (LICENSE/NOTICE/OFL texts present in the
+      # package) and SBOM currency are asserted by the offline suite above, on both OSes.
+      - name: "docs-pii: documentation generators carry no real identifiers"
         run: python scripts/check-docs-pii.py
 
-  pre-commit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
-
-  package:
-    # The zip is how anyone outside a working tree gets the skill, so a PR that breaks the build
-    # or its determinism should fail here, not at release time. The version is a placeholder;
-    # real releases still build locally per CLAUDE.md and verify against the published asset.
-    # Explicitly-named output on purpose: that is make-package.py's one-off path. The release path
-    # (no output name) refuses a version with no CHANGELOG.md entry, and 0.0.0 is not a release.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-      - name: Package builds and is deterministic
+      # package. The zip is how anyone outside a working tree gets the skill, so a PR that breaks
+      # the build or its determinism should fail here, not at release time. The version is a
+      # placeholder; real releases still build locally per CLAUDE.md and verify against the
+      # published asset. Explicitly-named output on purpose: that is make-package.py's one-off path.
+      # The release path (no output name) refuses a version with no CHANGELOG.md entry, and 0.0.0
+      # is not a release.
+      - name: "package: builds and is deterministic"
+        if: ${{ !cancelled() }}
         run: |
           python scripts/make-package.py /tmp/first.skill.zip --version 0.0.0
           python scripts/make-package.py /tmp/second.skill.zip --version 0.0.0
@@ -98,3 +96,7 @@ jobs:
           sha2=$(sha256sum /tmp/second.skill.zip | cut -d' ' -f1)
           echo "build1=$sha1  build2=$sha2"
           test "$sha1" = "$sha2"
+
+      - name: "pre-commit: hooks pass on every file"
+        if: ${{ !cancelled() }}
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1

@@ -61,12 +61,30 @@ means. `snapshots list` reports count, oldest, newest and bytes.
 
 ### What `trend` refuses to compute, and why
 
-Endpoints are chosen on the stack's own ingest date (`stackDate`), never the local clock. The refusals
-are the feature:
+Endpoints are chosen on the stack's own timeline, never the local clock. **A data point is one LDG
+rebuild** (since v2.27.0 each snapshot records `ldgRebuiltUtc`, the merger run it measured). So:
+
+- two snapshots of one rebuild are one point, and the last one taken wins;
+- several rebuilds on one date (a stack that rebuilds every 4 hours) are several points, labelled
+  `<stackDate> rebuild <utc>`;
+- a snapshot taken after midnight but before that day's merge is the *same* point as the day before,
+  not a flat segment.
+
+A date on which any snapshot lacks the stamp (all history before v2.27.0; the upgrade day) keeps the
+old one-point-per-`stackDate` rule, so old history compares exactly as it did. `dataPoints` is the
+count that decides sufficiency, and `distinctStackDates` still means distinct dates.
+
+**Everything `trend`, `snapshots list` and `alerts eval` return is labelled
+`dataCurrency.class: "historical"`**, with `source` and `from`/`to`, on refusals too. However
+recent the last snapshot is, it is not the stack now. `trend --name-entities` is the one mixed case:
+the names are looked up live, so `dataCurrency.sections["entities.names"]` carries a current stamp of
+its own.
+
+The refusals are the feature:
 
 | Flag | Meaning |
 |---|---|
-| `insufficientHistory` | fewer than two **distinct stack dates** — two snapshots on one date read the same daily ingest, so a 0% between them is the flattest possible wrong answer |
+| `insufficientHistory` | fewer than two **data points** — two snapshots of one rebuild read the same LDG, so a 0% between them is the flattest possible wrong answer |
 | `coverageChanged` | the failing/degraded connector set differs; computed, but never presented as a real movement. No metric→connector attribution is invented — the API doesn't expose it |
 | `unverifiable` | connector health unreadable at an endpoint, so **nothing** is computed |
 | `notTracked` | never captured. Never `0`, `0%`, "no change" or a flat line |
@@ -159,7 +177,7 @@ It is a bit field, not an ordered severity: collapsing it would force a choice a
 alert outranks a broken one, and either answer hides half the picture. An empty rule set exits 8 for
 the same reason — a stack whose rules were lost looks exactly like a stack with nothing wrong.
 
-A rule is unevaluable when the window holds fewer than two distinct stack dates, when connector health
+A rule is unevaluable when the window holds fewer than two data points, when connector health
 was unreadable at either end (`unverifiable`), when the two endpoints identify connectors differently
 (so no name can be matched across the boundary), or when a threshold rule's metric was not captured or
 stopped resolving. A metric that did not resolve has an **unknown** count, never zero.

@@ -161,7 +161,11 @@ Match the returned `state` exactly. Frame every message with the §4 visual voca
 ### Message templates (keep the wording consistent)
 
 **A — connected** (this doubles as the first answer; don't make the user ask twice):
-> ✅ **Connected to Meridian** — `{fqdn}` is tracking **{assetCount} assets** and **{userCount} users**.
+> ✅ **Connected to Meridian** — `{fqdn}` is tracking **{assetCount} assets** and **{userCount} users**, data as of **{rebuiltUtc}** (latest Meridian rebuild).
+
+`{rebuiltUtc}` is `dataCurrency.ldgRebuiltUtc` in the §4.1 form (`2026-09-24 10:12 UTC`). It is the
+baseline every later answer's rebuild is compared against. If `dataCurrency.class` is `unknown`,
+replace the clause with "(data currency could not be confirmed: {reason})".
 
 Add a muted one-liner only if useful: `token from {tokenSource}, ending …{tokenLast4}; action token {set|not set}`.
 
@@ -305,7 +309,7 @@ inaccurate or unexplained signal reads as fact.
    ingesting fine. Put the 🟢 picture — sized from the split above, not the raw tally — first, with its
    warning messages, then the real problems:
 
-> ✅ **Connected to Meridian** — `company.lucidum.cloud` is tracking **34,201 assets** and **10,118 users**.
+> ✅ **Connected to Meridian** — `company.lucidum.cloud` is tracking **34,201 assets** and **10,118 users**, data as of **2026-07-27 10:12 UTC** (latest Meridian rebuild).
 >
 > **Feeding that inventory:** **42 of 51 connectors are actively delivering data** — 93,127 records
 > across 51 sources, most recently 27 Jul 14:58 UTC. **9 need attention** (below).
@@ -539,7 +543,8 @@ Structure every findings response like this:
 3. **Callouts for anything alarming** — use a blockquote with a warning emoji for findings the
    user should act on: "> ⚠️ 675 leaked-credential hits and MFA off in Okta — force a reset."
 4. **Trend/direction** where the data supports it (e.g. count vs. 30-day average): ▲ up · ▼ down
-   · ▬ flat, colored 🔴/🟢 by whether the direction is bad or good in context.
+   · ▬ flat, colored 🔴/🟢 by whether the direction is bad or good in context. The 30-day average
+   is **historical**, so label it (§4.1).
 5. **Caveats** last, in one line (pagination cap, null fields, "sorted client-side — no
    server-side sort", an incomplete `summary` breakdown, a `truncated` top-N). Mention the query you
    ran only briefly, or on request — the user wants the answer, not the JSON.
@@ -548,7 +553,7 @@ Structure every findings response like this:
    `config.json` across sessions, so a later question silently answers from whatever stack was left
    active. Unlabeled numbers are how someone reads production data as staging. If more than one
    stack is saved and you're about to report figures the user might act on, confirm the active one
-   rather than assuming the obvious default.
+   rather than assuming the obvious default. The data's as-of line goes beside it (§4.1).
 
 Offer the full result set as a file if it's large. For a big or highly visual result the user
 wants to study or share (a ranked dashboard, a breakdown by department, an exec summary), offer
@@ -574,6 +579,44 @@ treatment for ranked lists and multi-item findings where the visual structure ea
 > ⚠️ CEXAMPLE has the widest blast radius — 17 high-risk assets. Legal appears twice in the top 3.
 >
 > _Top 20 scored ≥ 800; sorted client-side (API has no server-side sort)._
+
+### 4.1 Current or historical: say which, every time
+
+Meridian's LDG holds **current state only**, and it changes only when a merger run completes. So a
+figure describes one **rebuild**, not the moment you asked. Stacks rebuild anywhere from daily to every
+4 hours, so a session can easily outlive one. Every data verb returns `dataCurrency`. These rules turn
+it into something the user can trust:
+
+1. **Stamp every data answer** in the caveat line, beside the stack name:
+   `_Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild) · company.lucidum.cloud_`. Write
+   `ldgRebuiltUtc` in exactly that form: absolute, ISO date, 24-hour, `UTC` spelled out. Never write
+   "2 hours ago" (a transcript is re-read later), and never convert to local time. With `mergersSplit`,
+   give both times ("Assets as of …; users as of …"). With `lastRebuildFailed`, add "(the newest
+   rebuild failed; this is the one before it)". If `class` is `unknown`, write **"Data currency could
+   not be confirmed"** with the `reason`. Never call it current, and never put the query time in its
+   place.
+2. **Label historical data every time it's used, where it's used**: on the figure, the column or
+   the heading, not only in a footer. Write **🕘 Historical** with its source and range: "🕘 Historical
+   · local snapshots, 2026-09-01 to 2026-09-24". This covers:
+   - everything from `trend`, `snapshots` and `alerts eval` (`class: historical`);
+   - every path listed in `dataCurrency.sections`: the 30-day averages, a profile's change-log
+     `stability`.
+
+   Label each part of an answer that mixes current and historical data. The word carries the
+   meaning; the 🕘 only helps the eye.
+3. **Watch for a rebuild between answers.** Compare each new result's `ldgRebuiltUtc` with the one
+   your earlier answers in this conversation used. If it is later, say so **before** the new answer:
+   "Meridian rebuilt its data at 14:05 UTC since my earlier answers (as of 10:12 UTC)". Name the
+   earlier figures that may have changed, and offer to re-run them. From then on those figures are
+   **superseded**. Never present one as current again; when you refer to it, write "1,240 (as of
+   2026-09-24 10:12 UTC; Meridian has rebuilt since)".
+4. **Never derive one figure from two rebuilds.** No ratio, difference or percentage whose parts
+   carry different `ldgRebuiltUtc`: re-run the older part first. Comparing the *same* question across
+   two rebuilds is fine, labelled as a change between rebuilds.
+5. **Before answering from Meridian rows already in the conversation, run `meridian.py asof`**
+   (one call). If the stamp moved, rule 3 applies before you build anything from the old rows.
+6. **`rebuildDuringQuery: true` is not an answer.** Say the query straddled a rebuild, and re-run it.
+7. **`api` output carries no stamp.** Treat it as currency-unknown unless you pair it with `asof`.
 
 ## 5. Safety rules
 
@@ -675,6 +718,7 @@ Pick the script from the question shape; exact flags live in
 | "compare A and B" | `meridian.py compare` |
 | "what stacks do I have" / "switch to `<name>`" | `meridian.py stacks` |
 | after a 403, or before a big investigation | `meridian.py check` |
+| *(before answering from Meridian data already in the conversation)* | `meridian.py asof`: one call. If the rebuild moved, §4.1 rule 3 applies first |
 | the user names something in **their own** vocabulary ("crown jewels", "PCI scope", "our tier-1 estate") | `meridian.py labels --search "<their term>"` **first** |
 | "what SmartLabels / labels do we have" / "what does our `<label>` label mean" | `meridian.py labels` (`--table user` for user labels; `--search` for one label's full definition) |
 | a periodic/scheduled posture review, or "send me this every week" | `meridian.py digest` → pipe to `report` |

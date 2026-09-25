@@ -9,6 +9,15 @@ for print-to-PDF and falls back to writing branded HTML when none is found.
 
 ## Usage
 
+- **Every report states what kind of data it shows**, in the masthead under the title, read from the
+  input's `dataCurrency`: *Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)* for an LDG read,
+  *Historical · local snapshots, 2026-09-01 to 2026-09-24* for a trend, or *Data currency could not
+  be confirmed: …* when the stamp was unreadable. An input with no `dataCurrency` (written before
+  v2.27.0, or `api` output) prints *Data currency not recorded in this input*, never nothing, since
+  a report with no line reads as current. Historical parts inside a current report are labelled where
+  they appear: the digest's "Now vs 30-day average (Historical)" column, and a profile's change-log
+  instability callout. No emoji in the PDF, because the word carries the meaning.
+
 - **Branded PDF reports** (`meridian.py report`) — the deliverable format for anything shareable.
   Pipe any verb's JSON in and get a **Cyderes-branded PDF** built to the official Brand Style Guide
   (v01-26): a black masthead pairing the **official Cyderes wordmark** (`assets/cyderes-logo.svg`,

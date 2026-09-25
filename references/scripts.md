@@ -13,7 +13,7 @@ Split by what you are doing, so a lookup for one verb's flags does not pull in t
 
 | For | Read |
 |---|---|
-| query verbs — `connect`, `connectors`, `top`, `list`, `summary`, `profile`, `compare`, `check`, `labels`, `stacks`, `api` | this file |
+| query verbs — `connect`, `asof`, `connectors`, `top`, `list`, `summary`, `profile`, `compare`, `check`, `labels`, `stacks`, `api` | this file |
 | `snapshot`, `trend`, `metrics`, `digest`, `alerts` | [trend-verbs.md](trend-verbs.md) |
 | scheduling any of the above on a recurring cadence, per OS | [scheduling.md](scheduling.md) |
 | `report` — branded PDFs, blast-radius graphs, trend charts | [reports.md](reports.md) |
@@ -27,6 +27,35 @@ rung cache (`topcache.<fqdn>.json`), cached field names (`fields.<fqdn>.json`) a
 
 ## Verbs
 
+**Every verb that answers from the LDG carries `dataCurrency`**: which LDG rebuild the answer describes.
+The LDG changes only when a merger run *completes*, so the stamp is the last completed, non-failed
+`Lucidum Asset Merger` / `Lucidum User Merger` run (`end_time`), never the query time and never the
+latest ingest. On the local stack at the time of measuring, the mergers finished at 10:12 UTC while a
+source ingested at 15:31, and none of that 15:31 data was in any answer yet. Shape:
+`{"class": "current", "ldgRebuiltUtc": {"asset": ..., "user": ...}, "queriedUtc": ...}`, or
+`{"class": "unknown", "reason": ...}`. The rules that make it trustworthy:
+
+- **Unknown is never current.** An unreadable stamp (scoped token, mergers not in the newest pages, a
+  renamed merger) says so with a reason. It never falls back to "now".
+- **A failed merge is skipped** (it left the LDG unchanged). The stamp is the previous good run, and
+  `lastRebuildFailed` names the failed one. The backwards search is cached per failed run, so it
+  costs up to 25 calls once, not on every question.
+- **A rebuild mid-query is not an answer.** `top`, `list --all`/`--limit >100`, `summary --by` (when
+  computed) and `digest` re-read the stamp afterwards. If it moved, the class is `unknown` with
+  `rebuildDuringQuery: true`.
+- **Mixed payloads label their past-state parts** under `dataCurrency.sections`: the 30-day averages
+  in `summary --metrics`/`digest`, and a user profile's change-log-derived `stability`.
+- `mergersSplit: true` means the asset and user stamps come from different pipeline runs, so an
+  answer spanning both has two as-of times.
+
+Cost: one call, overlapped with the verb's own, so roughly no wall clock; the multi-call verbs above
+pay a second one afterwards. `api` is a raw passthrough and is not stamped. Treat its output as
+currency-unknown unless paired with `asof`.
+
+- `asof` — **when the LDG was last rebuilt, and nothing else.** One call (a descending-sorted page of
+  the run metrics). It is the check before reusing Meridian data already in the conversation: if the
+  stamp has moved since those rows were fetched, they describe an LDG that no longer exists. `message`
+  is already in the display form: `Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)`.
 - `connect` — **onboarding preflight; run this first every session.** Resolves
   credentials, validates in one cheap call, and returns a single `state` (`connected` /
   `not_configured` / `auth_error` / `forbidden` / `unreachable` / `http_error`) with the fqdn,

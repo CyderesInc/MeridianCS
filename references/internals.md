@@ -166,6 +166,33 @@ that is the one case where the answer may not be the true top-N.
 > BOM'd file on disk. Reading it as plain `utf-8` throws inside a `try/except` that falls back
 > silently — no error, just a cold cache or an unresolved credential. Keep the `utf-8-sig`.
 
+## LDG rebuild stamp
+
+`ldg_rebuild()` reads `/CMDB/v2/system/metrics/connector?size=200&sort=_time%2Cdesc` and pages until
+it has a non-failed run of each merger. It stops after `LDG_REBUILD_MAX_PAGES` (3) when a merger never
+appears, or `LDG_REBUILD_FAILED_MAX_PAGES` (25) when only failed runs of it do.
+
+- **The endpoint ignores `platform=`/`bridge_name=` filters**. Measured: `size=20` still returned 324
+  pages of mixed platforms. So the descending sort is the only lever. This does not contradict the
+  "don't sort the runs fetch" gotcha: that one drops sources that last ran a month ago from a
+  per-source view, whereas this wants only the newest row of two known services.
+- **Names are matched exactly (`LDG_MERGERS`), on purpose.** They are stable by platform contract; a
+  rename is a platform change the skill must be updated for. So an unrecognised `ML-ENGINE` name makes
+  the table unknown and is named in the reason, and the `--live` suite fails on it. A substring match
+  would make a rename silent.
+- **Failure is `_run_health() == "fail"` or an empty status**: one definition of failure, shared with
+  connector health. That includes `Warning&Error`. A plain `Warning` merge rebuilds; the demo stack's
+  are all `Warning`, with output equal to the LDG's counts.
+- **Never derived from `summarize_connectors()`**, even though it reads the same endpoint. Its result is
+  cached for an hour, and a stamp taken from it would be up to an hour stale. That is the one failure
+  the stamp exists to prevent.
+- **Never raises, and makes no call when unconfigured.** `load_config()` would `die()`, and a
+  `SystemExit` escapes `parallel()`. `_config_resolvable()` asks the same question without dying, so
+  `connect` on a fresh install stays a clean `not_configured`.
+- **No cadence is assumed anywhere.** Stacks rebuild anywhere from daily to every 4 hours. Consecutive
+  daily merges sat on pages 0, 4 and 9 of the demo stack, so the page caps are rate-limit backstops,
+  not distance estimates.
+
 ## Aggregate result cache
 
 The API has no aggregation endpoint and no field projection, so every aggregate is paid for by
@@ -198,7 +225,7 @@ costs: a new session started shortly after the last.
 `--refresh` on `connect`/`connectors`/`summary`/`digest` bypasses; `MERIDIAN_NO_CACHE=1` disables
 read and write entirely; `refresh-fields` drops the file.
 
-**Five rules, each of which exists because breaking it is silent:**
+**Six rules, each of which exists because breaking it is silent:**
 
 - **Aggregates only, never record rows.** `list`/`top`/`profile` payloads are not cached — they carry
   the real customer PII (names, departments, leaked-credential counts, per-CVE detail) and CLAUDE.md's
@@ -215,6 +242,10 @@ read and write entirely; `refresh-fields` drops the file.
   already exists for, where an unreadable half is indistinguishable from an empty one.
 - **A breakdown with no completeness verdict is not cached** (`complete` absent = the coverage check
   could not run). Caching it pins an unanswered question in place for the TTL; re-running may answer it.
+- **A breakdown is keyed on the LDG rebuild it was computed from, and no stamp means no cache**
+  (read or write). Before this, the TTL alone would serve a count cached just before a merge as current
+  for up to 15 minutes afterwards. The stamp is read *before* the cache is asked, so a cache hit now
+  costs one call instead of zero: ~1s against 6-90s to recompute.
 - **Every served entry is stamped** with `fromCache`/`cacheAgeSeconds`, and a negative age (a clock
   moved backwards) is treated as a miss rather than a hit whose staleness cannot be stated. SKILL.md
   requires surfacing the age when the answer is time-sensitive.
