@@ -134,8 +134,9 @@ Things not to change without reading why:
 ## How `top` picks its threshold
 
 There is no server-side sort, so a correct top-N means reading **every** record above some threshold.
-`top` finds that threshold by walking a ladder (`100000, 10000, 1000, 300, 100, 30, 10, 3, 1, 0`)
-downward until enough records match, then sorts client-side. Two refinements keep the call count down:
+`top` finds that threshold by walking a ladder (`TOP_LADDER`: half-decade rungs from `100000` down to
+`0`) downward until enough records match, then sorts client-side. Every probe is a count, and counts
+download no record (`count_records`, below). These refinements keep the call count and the bytes down:
 
 - **Per-stack rung cache** (`~/.meridian/topcache.<fqdn>.json`, `{"<table>.<field>": rung}`) records
   the rung that worked, so later queries for the same field start there instead of probing
@@ -148,6 +149,22 @@ downward until enough records match, then sorts client-side. Two refinements kee
   *warm* cache the remembered rung usually matches on the first probe, so speculating would burn two
   calls every time for nothing — `batch = 1 if start > 0 else 3`. Measured on a cold field: 3 round
   trips instead of 8; the same field warm costs 1 probe.
+- **A loose warm hit climbs.** A warm cache matches on its first probe and so never learns that a
+  higher rung would also fill: cached at 1000, one stack kept reading three times the records the
+  3000 rung would have.
+  When the hit is at least `TOP_LOOSE_FACTOR` (3) times `--top` and under `TOP_REFINE_MIN`, the rung
+  above is probed once and the climb continues while it fills. A tight hit skips it, so the usual warm
+  run is still one probe. Measured on that stack: warm `top --top 10` 24.6s → 8.8s, identical
+  ranking. The 3000 and 30000 rungs were added in the same change; a rung is cached by value,
+  so a cache written against the old ladder still resolves (an older build reading a 3000 rung starts
+  cold, which is slower and still correct).
+- **Counts ask for a page past the end.** Every page carries `totalRecords`, including one with no
+  records on it, so `count_records` requests page `COUNT_PAGE` (99999) with one record per page. Page 0
+  still downloaded one whole record, which on a stack with megabyte records was the whole cost of a
+  count: 5.33MB/1.73s against 86 bytes/0.85s, same total, across every query shape the verbs send.
+  The behaviour is undocumented, so a response without an integer total, or a 400/404/416/422, falls
+  back to page 0; any other error propagates. Past 99,999 matches the page is in range again and
+  carries one record: slower, never wrong.
 - **Threshold refinement** past `TOP_REFINE_MIN` (500 records): the chosen rung can be far looser than
   needed, and every extra 100 records costs a call. `top` probes **three evenly-spaced points at once**
   in the gap between the chosen rung and the rung above it. That narrows the interval to a quarter,

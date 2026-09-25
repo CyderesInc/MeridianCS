@@ -781,6 +781,17 @@ def test_preflight_coverage(m):
           (o.get("warningGroups"), o.get("failures"), "warningIdsNote" in o),
           (orphan["warningGroups"], orphan["failures"], False))
 
+    # `connectors` prints the same index (it was ~745 tokens a call without it); `--full` does not.
+    view_in = json.loads(json.dumps(hand_copy))
+    v = m._connectors_view(view_in)
+    check("`connectors` output is indexed the same way", "warningIdsNote" in v, True)
+    rebuilt_v, fails_v = _rebuild_warnings(m, v)
+    check("...losslessly", (rebuilt_v, fails_v), (_norm_groups(hand_copy["warningGroups"]), hand_copy["failures"]))
+    check("...without mutating the coverage block it was given", view_in, hand_copy)
+    check("...smaller", len(json.dumps(v)) < len(json.dumps(hand_copy)), True)
+    check("`connectors --full` stays verbatim", m._connectors_view(view_in, full=True), hand_copy)
+    check("an unindexable block passes through untouched", m._connectors_view(orphan), orphan)
+
 
 def _norm_groups(groups):
     """Groups with member order ignored: the preflight splits rows across two lists, so the order
@@ -1159,6 +1170,18 @@ def test_api_guard(m):
         check("...nor a dot segment", bool(run("CMDB/v2/connector/./profile")), True)
         check("...nor a case variant", bool(run("CMDB/v2/Connector/Profile")), True)
         check("...nor a backslash spelling", bool(run("CMDB\\v2\\connector\\profile")), True)
+        # Found in the 2026-09-25 security review: the runs endpoint embeds each run's whole profile.
+        check("the connector RUNS endpoint is refused too", bool(run("CMDB/v2/system/metrics/connector")), True)
+        check("...in any spelling", bool(run("CMDB/v2/system/metrics/connecto%72?size=2000")), True)
+        check("ingestion job detail (a connector command line) is refused",
+              bool(run("CMDB/v2/system/metrics/data-ingestion/detail/scheduled__2026-09-01")), True)
+        check("...but the ingestion run LIST is not", run("CMDB/v2/system/metrics/data-ingestion"), None)
+        # `..`, `#` and `;` compared as one endpoint here and could reach another on the wire.
+        check("a `..` segment is refused", bool(run("CMDB/v2/connector/x/../profile")), True)
+        check("...encoded too", bool(run("CMDB/v2/connector/x/%2E%2E/profile")), True)
+        check("a `#` is refused", bool(run("CMDB/v2/data/cmdb#/../../connector/profile")), True)
+        check("a `;` is refused", bool(run("CMDB/v2/connector;x/profile")), True)
+        check("a control character is refused", bool(run("CMDB/v2/data/cmdb%0D%0AX: y")), True)
         calls.clear()
         check("the connector CATALOG is still reachable", run("CMDB/v2/connector"), None)
         check("...and went to the wire", calls, ["CMDB/v2/connector"])
@@ -1178,6 +1201,18 @@ def test_api_guard(m):
 
         run_method("GET"); run_method("POST")
         check("GET keeps its retry; POST gets none", retries_seen, [1, 0])
+
+        # A GET that changes the stack: data-ingestion/run starts a full ingestion from every connector.
+        check("the ingestion-trigger GET needs --allow-write",
+              bool(m.api_write_problem("GET", "CMDB/v2/system/data-ingestion/run")), True)
+        check("...in any spelling", bool(m.api_write_problem("GET", "/CMDB/v2/System/data-ingestion/run/")), True)
+        check("...and runs once confirmed",
+              m.api_write_problem("GET", "CMDB/v2/system/data-ingestion/run", allow_write=True), None)
+        check("an ordinary GET is still a read", m.api_write_problem("GET", "CMDB/v2/system/metrics/data-ingestion"), None)
+
+        skill = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+        check("SKILL.md names the runs endpoint as credential-bearing too",
+              "`/CMDB/v2/system/metrics/connector` embeds the same profile in each run" in skill, True)
     finally:
         m.call = real_call
 
@@ -2036,6 +2071,62 @@ def test_top_ladder(m):
         out = m.top_n("asset", "Ingest_Bytes", 10)
         check("a field beyond the climb's reach still answers", len(out["top"]), 10)
         check("...with the full tail intact", out["totalInTail"], 600)
+
+        # --- a warm cache can tighten (2026-09-25 performance review) -------------------------------
+        # The measured shape, with made-up counts: the cached 1000 rung matched about three times what
+        # 3000 did, on a stack with huge records. A warm hit used to stop at its first probe forever.
+        probes = []
+
+        def counting(count_at):
+            inner = make_call(count_at)
+
+            def f(method, endpoint, body=None, retries=1):
+                if body and (body.get("paging") or {}).get("recordsPerPage") == 1:
+                    probes.append(body["query"][0][0]["value"])
+                return inner(method, endpoint, body, retries)
+            return f
+        check("the ladder has the half-decade rungs", (3000 in m.TOP_LADDER, 30000 in m.TOP_LADDER), (True, True))
+        m._top_rung_save("asset", "Last_Seen", 1000)
+        m.call = counting(lambda t: 90 if t <= 1000 else 25 if t <= 3000 else 0)
+        out = m.top_n("asset", "Last_Seen", 10)
+        check("a loose warm hit climbs to the tighter rung", (out["matchedAtThreshold"], out["totalInTail"]), (3000.0, 25))
+        check("...in two extra probes, stopping at the first that under-fills", probes, [1000.0, 3000.0, 10000.0])
+        check("...and remembers it", m.TOP_LADDER[m._top_rung_start("asset", "Last_Seen")], 3000)
+        check("...still returning the full top N", len(out["top"]), 10)
+        probes.clear()
+        m._top_rung_save("asset", "Last_Seen", 1000)
+        m.call = counting(lambda t: 12 if t <= 1000 else 0)
+        out = m.top_n("asset", "Last_Seen", 10)
+        check("a tight warm hit stays one probe", probes, [1000.0])
+        check("...at the cached rung", out["matchedAtThreshold"], 1000.0)
+
+        # --- count_records: no record downloaded, and a fallback if the trick ever stops working --
+        sent = []
+
+        def fake(resp):
+            def f(method, endpoint, body=None, retries=1):
+                sent.append(body["paging"])
+                r = resp(body["paging"]["page"])
+                if isinstance(r, Exception):
+                    raise r
+                return r
+            return f
+        m.call = fake(lambda page: {"totalRecords": 42, "data": []})
+        check("a count asks for the page past the end", (m.count_records("asset", []), sent),
+              (42, [{"page": m.COUNT_PAGE, "recordsPerPage": 1}]))
+        sent.clear()
+        m.call = fake(lambda page: {"data": []} if page else {"totalRecords": 7, "data": [{}]})
+        check("no totalRecords there falls back to page 0", (m.count_records("asset", []), len(sent)), (7, 2))
+        sent.clear()
+        m.call = fake(lambda page: RuntimeError("HTTP 400: page out of range") if page else {"totalRecords": 5})
+        check("...so does a 400", m.count_records("asset", []), 5)
+        m.call = fake(lambda page: RuntimeError("HTTP 500: boom"))
+        try:
+            m.count_records("asset", [])
+            raised = False
+        except RuntimeError:
+            raised = True
+        check("a server error is not swallowed into a fallback", raised, True)
     finally:
         m.CFG_DIR, m.call, m.load_config = real
         m._FIELD_MAP.clear()
@@ -2326,8 +2417,12 @@ def test_clause_parsing(m):
     out = fails("Risk_Score >>> Float 500")
     check("an unknown operator is caught", bool(out), True)
     check("...naming the operator, not the type slot", "'>>>' is not an operator" in (out or ""), True)
+    check("...offering no operator it would then refuse",
+          any(w in (out or "").split("Expected one of:")[-1].split(". For")[0] for w in ("within",)), False)
+    # The example is `not match`, a multi-word operator that works: the list used to offer
+    # `not within past` too, which is always refused, so a caller following it hit a second error.
     check("...and listing the multi-word ones it could have meant",
-          "not within past" in (out or ""), True)
+          "not match" in (out or ""), True)
     check("clause_fields still reads the field off a multi-word clause",
           m.clause_fields(["First_Time_Seen not within past Datetime 30, days"]), ["First_Time_Seen"])
     check("and_query nests a multi-word clause one-per-group",
@@ -2527,6 +2622,16 @@ def test_csv_export(m):
     check("...and a list whose first item is a formula", m._csv_cell(["=1+1", "b"]), "'=1+1; b")
     check("negative numbers stay numbers, not text", m._csv_cell(-5), -5)
     check("an ordinary name is untouched", m._csv_cell("web-01"), "web-01")
+
+    # The header row too: column names come from the API, and a customer-named SmartLabel is data.
+    import contextlib, io
+    out = os.path.join(tempfile.mkdtemp(), "h.csv")
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.emit({"rows": [{"=HYPERLINK(\"https://x.example\")": 1, "Asset_Name": "a"}]}, "rows", "csv", out)
+    with open(out, encoding="utf-8-sig") as f:
+        header = f.readline()
+    check("a formula-shaped column name is neutralized in the header", header.startswith('"\'=HYPERLINK'), True)
+    check("...and an ordinary column name is untouched", header.rstrip().endswith(",Asset_Name"), True)
 
 
 def test_list(m):
@@ -3557,8 +3662,10 @@ def test_metrics(m):
         bodies.clear()
         got = m.measure_metric(rec)
         check("measuring costs exactly one API call", len(bodies), 1)
+        # The cheapest page is now one past the end: it carries totalRecords and no record at all.
+        # (COUNT_PAGE; see count_records for the measurement.)
         check("...on the cheapest possible page, never paging for a count",
-              bodies[0]["paging"], {"page": 0, "recordsPerPage": 1})
+              bodies[0]["paging"], {"page": m.COUNT_PAGE, "recordsPerPage": 1})
         check("...ANDing the clauses as separate inner arrays", len(bodies[0]["query"]), 2)
         check("...and reads totalRecords", (got["count"], got["ok"]), (458, True))
         check("...keeping the human label", got["label"], "KEV-exposed assets")
@@ -4570,10 +4677,42 @@ def test_alerts_notify(m):
             r4 = m.deliver_alerts(v4, targets=("slack", "teams"), stack_date="2026-08-20")
             check("a broken target reports its own error", "boom" in r4["sent"]["slack"]["error"], True)
             check("...without cancelling a working target", r4["sent"]["teams"]["status"], 200)
+            check("...and one delivery is enough to record the change", r4["stateSaved"], True)
         finally:
             m._post_webhook = real_post
             del os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"]
             del os.environ["MERIDIAN_ALERT_TEAMS_WEBHOOK"]
+
+        # A change that reached nobody stays pending (it used to be saved first and never re-sent).
+        attempts = []
+
+        def down_post(url, payload, timeout=10):
+            attempts.append(url)
+            raise RuntimeError("HTTP 503: down")
+
+        m._post_webhook = down_post
+        os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"] = "https://hooks.example/slack"
+        try:
+            v5 = mkv(firing=["outage-rule"], stack_date="2026-08-21")
+            r5 = m.deliver_alerts(v5, targets=("slack",), stack_date="2026-08-21")
+            check("an undelivered change is not recorded", r5["stateSaved"], False)
+            check("...and says it stays pending", "stays pending" in r5.get("note", ""), True)
+            m._post_webhook = fake_post
+            sent_log.clear()
+            r6 = m.deliver_alerts(v5, targets=("slack",), stack_date="2026-08-21")
+            check("...so the next notify sends it", (len(sent_log), r6["changed"], r6["stateSaved"]),
+                  (1, True, True))
+        finally:
+            m._post_webhook = real_post
+            del os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"]
+
+        v7 = mkv(firing=["unconfigured-rule"], stack_date="2026-08-22")
+        r7 = m.deliver_alerts(v7, targets=("slack",), stack_date="2026-08-22")
+        check("with nothing configured the change stays pending too", r7["stateSaved"], False)
+
+        teams = m.render_alerts_teams(mkv(firing=["<a href=https://x.example>click</a>"]))
+        check("Teams top-level text is HTML-escaped",
+              ("<a href" in teams["text"], "&lt;a href" in teams["text"]), (False, True))
     finally:
         (m.CFG_DIR, m.load_config) = real
 
@@ -6853,6 +6992,36 @@ def test_security_hardening(m):
                             "--out", os.path.join(work, "missing", "r.html")],
                            capture_output=True, text=True, encoding="utf-8", env=iso)
         check("report --out into a missing directory is refused", r.returncode, 2)
+
+        # --- the token files are never an input (2026-09-25 security review) ------------------------
+        cfgdir = os.path.join(work, ".meridian")
+        os.makedirs(cfgdir, exist_ok=True)
+        stacks = os.path.join(cfgdir, "stacks.json")
+        fake = "fake-token-0000-do-not-leak"
+        with open(stacks, "w", encoding="utf-8") as f:
+            json.dump({"active": "s", "stacks": {"s": {"fqdn": "s.example", "token": fake}}}, f)
+        out_html = os.path.join(work, "leak.html")
+        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", stacks,
+                            "--out", out_html], capture_output=True, text=True, encoding="utf-8", env=iso)
+        check("report --input refuses the saved-stacks file", (r.returncode, "never an input" in r.stderr),
+              (2, True))
+        check("...and writes nothing", os.path.exists(out_html), False)
+        check("...nor echoes the token", fake in r.stdout + r.stderr, False)
+        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input",
+                            os.path.join(cfgdir, ".", "stacks.json"), "--out", out_html],
+                           capture_output=True, text=True, encoding="utf-8", env=iso)
+        check("...however the path is spelled", r.returncode, 2)
+        r = subprocess.run([sys.executable, MERIDIAN_PY, "api", "-X", "POST", "CMDB/v2/data/cmdb",
+                            "--body-file", stacks], capture_output=True, text=True, encoding="utf-8", env=iso)
+        check("api --body-file refuses it too", (r.returncode, "never an input" in r.stderr), (2, True))
+        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
+                            "--out", os.path.join(work, "ok.html")],
+                           capture_output=True, text=True, encoding="utf-8", env=iso)
+        check("an ordinary input still renders", r.returncode, 0)
+        with open(os.path.join(work, "ok.html"), encoding="utf-8") as f:
+            page = f.read()
+        check("...under a Content-Security-Policy that allows no script or fetch",
+              "Content-Security-Policy\" content=\"default-src 'none'" in page and "<script" not in page, True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -7636,6 +7805,56 @@ def test_community_files(m):
            ".github/ISSUE_TEMPLATE/feature_request.yml", "CONTRIBUTING.md", "SECURITY.md"])
 
 
+def test_documented_commands(m):
+    """Every `meridian.py <verb> ...` the docs show parses with the real parser.
+
+    A documented flag that does not exist costs the model an argparse error and a retry, and the
+    docs are what it copies: trend-verbs.md showed `alerts rm --name kev-ceiling` for a verb that
+    takes the name positionally, and recipes.md said `summary` takes `--select`. Only errors that mean
+    the text is wrong fail here (unknown flags, bad choices). "Required argument missing" does not:
+    prose mentions a verb by name ("run `meridian.py report`") without meaning a whole command.
+    """
+    print("[56] documented commands parse against the real CLI")
+    import contextlib, glob, io, shlex
+    root = os.path.dirname(HERE)
+    parser = m.build_parser()
+    verbs = set(parser._subparsers._group_actions[0].choices)
+    files = [os.path.join(root, f) for f in ("SKILL.md", "README.md", "README.public.md")]
+    files += sorted(glob.glob(os.path.join(root, "references", "*.md")))
+    stop = {"|", ">", ">>", "&&", "||", ";", "2>&1", "2>"}
+    checked, bad = 0, []
+    for path in files:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        for lineno, line in enumerate(lines, 1):
+            for mt in re.finditer(r"meridian\.py\s+([^`\n]+)", line):
+                try:
+                    toks = shlex.split(mt.group(1).strip(), posix=True)
+                except ValueError:
+                    continue
+                cut = []
+                for t in toks:
+                    if t in stop or t.startswith((">", "|", "#")):
+                        break
+                    cut.append(t)
+                if not cut or cut[0] not in verbs or any(
+                        "<" in t or "[" in t or "..." in t or "\u2026" in t or t in ("-h", "--help") for t in cut):
+                    continue
+                checked += 1
+                err = io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        parser.parse_args(cut)
+                except SystemExit:
+                    msg = err.getvalue().strip().splitlines()[-1] if err.getvalue().strip() else ""
+                    if "the following arguments are required" not in msg:
+                        bad.append("%s:%d `%s` -> %s" % (os.path.relpath(path, root), lineno, " ".join(cut), msg))
+    check("the docs show commands to check", checked > 50, True)
+    check("every documented command parses (no unknown flags or bad values)", bad, [])
+
+
 def test_ci_workflow():
     """ci.yml's two supply-chain rules hold on every step, not just the ones someone remembered.
 
@@ -7644,30 +7863,56 @@ def test_ci_workflow():
     so a token left in the runner's git config is only something for a later step to read. Both are
     one-line omissions in a new job, and Dependabot rewrites these lines weekly.
     """
-    print("[47] CI workflow: actions pinned to commit SHAs, checkout persists no credentials")
-    path = os.path.join(os.path.dirname(HERE), ".github", "workflows", "ci.yml")
-    if not os.path.exists(path):
+    print("[47] CI workflows: actions pinned to commit SHAs, checkout persists no credentials")
+    wdir = os.path.join(os.path.dirname(HERE), ".github", "workflows")
+    names = sorted(n for n in os.listdir(wdir) if n.endswith((".yml", ".yaml"))) if os.path.isdir(wdir) else []
+    if "ci.yml" not in names:
         print("  SKIP  no .github/workflows/ci.yml in this tree")
         return
-    with open(path, encoding="utf-8") as f:
-        lines = f.read().splitlines()
-    uses = [(i, l.split("uses:", 1)[1].split("#", 1)[0].strip()) for i, l in enumerate(lines)
-            if l.strip().startswith(("uses:", "- uses:"))]
-    check("the workflow has steps to check", len(uses) > 0, True)
-    check("every action is pinned to a full commit SHA",
-          [u for _i, u in uses if not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", u)], [])
-    checkouts = [i for i, u in uses if u.startswith("actions/checkout@")]
-    check("... including every checkout", len(checkouts) > 0, True)
+    # Every workflow file, not just ci.yml. The Windows leg moved to its own file to trim billed
+    # minutes, and a guard that read one file would have stopped covering the other in silence.
+    texts = {}
+    for name in names:
+        with open(os.path.join(wdir, name), encoding="utf-8") as f:
+            texts[name] = f.read()
+        lines = texts[name].splitlines()
+        uses = [(i, l.split("uses:", 1)[1].split("#", 1)[0].strip()) for i, l in enumerate(lines)
+                if l.strip().startswith(("uses:", "- uses:"))]
+        check("%s: the workflow has steps to check" % name, len(uses) > 0, True)
+        check("%s: every action is pinned to a full commit SHA" % name,
+              [u for _i, u in uses if not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", u)], [])
+        checkouts = [i for i, u in uses if u.startswith("actions/checkout@")]
+        check("%s: ... including every checkout" % name, len(checkouts) > 0, True)
 
-    def step(i):
-        out = []
-        for l in lines[i + 1:]:
-            if l.strip().startswith("- ") or (l.strip() and len(l) - len(l.lstrip()) <= 6):
-                break
-            out.append(l.strip())
-        return out
-    check("every checkout sets persist-credentials: false",
-          [i + 1 for i in checkouts if "persist-credentials: false" not in step(i)], [])
+        def step(i):
+            out = []
+            for l in lines[i + 1:]:
+                if l.strip().startswith("- ") or (l.strip() and len(l) - len(l.lstrip()) <= 6):
+                    break
+                out.append(l.strip())
+            return out
+        check("%s: every checkout sets persist-credentials: false" % name,
+              [i + 1 for i in checkouts if "persist-credentials: false" not in step(i)], [])
+
+        # A draft skip without `ready_for_review` leaves a PR marked ready with no run at all. Read
+        # the `types:` line itself: the word also appears in the comment that explains it.
+        if "pull_request.draft" in texts[name]:
+            types = [l for l in lines if l.strip().startswith("types:")]
+            check("%s: skips drafts, so it also runs on ready_for_review" % name,
+                  any("ready_for_review" in l.split("#", 1)[0] for l in types), True)
+
+    # The Windows leg is the only coverage of the msvcrt lock, cp1252 and the Windows self-update
+    # swap. Trimming it to code PRs is fine; losing it, or losing it on main, is not.
+    win = [n for n, t in texts.items() if "windows-latest" in t and "evals/test_connect.py" in t]
+    check("the offline suite still runs on Windows", len(win) > 0, True)
+    for n in win:
+        on = texts[n].split("\njobs:", 1)[0]
+        push = on.split("\n  push:", 1)[1] if "\n  push:" in on else ""
+        check("%s: Windows runs on every push to main" % n, "branches: [main]" in push, True)
+        check("%s: ... with no path filter on main" % n, "paths" in push, False)
+        pr = on.split("\n  pull_request:", 1)[1].split("\n  push:", 1)[0] if "\n  pull_request:" in on else ""
+        check("%s: ... and on PRs that touch the code or the suite" % n,
+              all(p in pr for p in ('"scripts/**"', '"evals/**"')), True)
 
 
 def test_hr_sources(m):
@@ -8077,6 +8322,7 @@ def main():
     test_selfupdate_followups(m)
     test_community_files(m)
     test_ci_workflow()
+    test_documented_commands(m)
     test_hr_routing()
     test_hr_sources(m)
     test_field_cache_refetch(m)

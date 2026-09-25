@@ -3,6 +3,19 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.27.3 - 2026-09-25
+
+- **"Top" questions and counts are faster on stacks with large records.** A count no longer
+  downloads a record, and a top-10 that took about 25 seconds now takes about 9, with the same
+  results.
+- **The raw API command is safer.** It refuses the connector-runs endpoint, which can carry each
+  connector's settings, and paths written to slip past that check, and it asks before starting a
+  full data ingestion run.
+- **Commands that read a file refuse your saved-credentials folder**, so a report or API request
+  can never pick up your saved tokens.
+- **An alert that fails to send is sent again next time.** Before, a change that reached nobody
+  was treated as delivered.
+
 ## 2.27.2 - 2026-09-25
 
 - **Breakdowns now count the records that have no value for the field.** Before, those records

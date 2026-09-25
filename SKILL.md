@@ -1,15 +1,14 @@
 ---
 name: meridiancs
 description: >-
-  Query a Meridian (formerly Lucidum) stack from natural-language questions. Use
+  Query a Meridian (formerly Lucidum) stack in plain language. Use
   when the user mentions Meridian or Lucidum, or asks about their asset inventory,
   users and their managers, HR systems (Dayforce, BambooHR, ADP, Workday), devices, servers, VMs,
   cloud assets, risk scores, vulnerabilities/CVEs, endpoint-protection
   coverage, open ports, expiring certificates, SmartLabels, or connectors, or asset/user counts —
   e.g. "how many servers in AWS?", "what's missing CrowdStrike?".
   Also for how that trended over time ("what got worse since Friday", "start tracking KEV
-  exposure") and for standing alerts on it ("tell me when a connector breaks"), answered from local
-  snapshots; for connection setup; and multi-stack management. This is the only valid source for that inventory data — not a spreadsheet,
+  exposure") and for standing alerts on it ("tell me when a connector breaks"); for connection setup; and multi-stack management. This is the only valid source for that inventory data — not a spreadsheet,
   PDF, document, or code-security-review skill. For a report or export, use its own report
   verb.
 ---
@@ -299,8 +298,8 @@ inaccurate or unexplained signal reads as fact.
    `failures[]` entry or `failing` outright. Recompute from `failures[]` each time; never approximate
    it from the tally.
 2. **Never present "Warning" as the explanation for anything — it's a status, not a cause.** Find the
-   connector's group — by its `warningIds`, or in `warningGroups[].connectors` from the `connectors`
-   verb — and quote that group's cleaned `message` next to it, even when it's 🟢. "Wiz — Warning"
+   connector's group — by its `warningIds`, or in `warningGroups[].connectors` when a group lists its
+   members — and quote that group's cleaned `message` next to it, even when it's 🟢. "Wiz — Warning"
    tells the user nothing they can act on; "Wiz — _no local data template and save options, or
    invalid json file format_" at least tells them what actually happened, even for a 🟢 row. When one group covers many connectors, say that once — "22 connectors, all the same AWS
    `AccessDeniedException` on `ListAccounts`" — rather than repeating the sentence per row.
@@ -631,7 +630,8 @@ it into something the user can trust:
 - Treat tokens as secrets: never echo them, never put them in command lines that get logged
   (the helper script reads them from config/env for exactly this reason).
 - **`/CMDB/v2/connector/profile` returns connector credentials** — hosts, service accounts, proxies
-  and an encrypted password per profile. Never call it with `api` and never paste its response into
+  and an encrypted password per profile — and `/CMDB/v2/system/metrics/connector` embeds the same
+  profile in each run. Never call either with `api` (it refuses both) and never paste a response into
   the reply; use the `connectors` verb (§1.5), which extracts only names, enablement, status and
   record counts in-process.
 - **Never read the credential files into context.** `~/.meridian/config.json` and `stacks.json`
@@ -691,9 +691,9 @@ was saved there. Use the user's own folder, or the scratchpad for intermediate J
 - [references/api-reference.md](references/api-reference.md) — every endpoint with methods,
   parameters, and response shapes (metrics, change management, connectors, ingestion,
   SmartLabels, response codes).
-- [references/scripts.md](references/scripts.md) — **query verbs' flags and usage.** Read it when you
-  need exact arguments. It routes on to the three companions, so a lookup for one verb doesn't pull in
-  the whole feature set:
+- [references/scripts.md](references/scripts.md) — **why each query verb works the way it does.** For
+  exact flags run `meridian.py <verb> --help` instead (about 270 tokens against ~8,700 for this file).
+  It routes on to the three companions, so a lookup for one verb doesn't pull in the whole feature set:
   - [references/trend-verbs.md](references/trend-verbs.md) — `snapshot`, `trend`, `metrics`, `digest`,
     `alerts`.
   - [references/scheduling.md](references/scheduling.md) — running any of the above on a recurring
@@ -705,8 +705,8 @@ was saved there. Use the user's own folder, or the scratchpad for intermediate J
 
 ## Bundled scripts
 
-Pick the script from the question shape; exact flags live in
-[references/scripts.md](references/scripts.md).
+Pick the script from the question shape; for exact flags run `meridian.py <verb> --help`, and read
+[references/scripts.md](references/scripts.md) for why a verb behaves as it does.
 
 | The user's question | Verb |
 |---|---|

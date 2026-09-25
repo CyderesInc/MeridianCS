@@ -2,15 +2,20 @@
 # exit 0/1) — but nothing ran it automatically, and that is exactly how v2.7.0 shipped broken: the
 # frontmatter length check existed, and no merge ever executed it. This workflow closes that gap.
 #
-# Both OSes on purpose: the suite has platform-conditional paths that a single runner never
-# exercises — POSIX 0600 permission assertions and fcntl locking run only on Linux; the msvcrt
-# byte-range lock, cp1252 console handling, and Windows path behavior run only on Windows.
+# Linux here; Windows in ci-windows.yml. The suite has platform-conditional paths a single runner
+# never exercises -- POSIX 0600 permission assertions and fcntl locking run only on Linux; the msvcrt
+# byte-range lock, cp1252 console handling, and Windows path behavior run only on Windows. Windows
+# bills at about twice the Linux rate and a path filter is per workflow, so it lives in its own file,
+# runs on every push to main, and on PRs only when they touch code or CI. That file says why.
 # Actions are pinned to commit SHAs, not tags: a tag can be re-pointed by whoever controls the
 # action's repo, which is how the tj-actions compromise reached every workflow trusting `@v<N>`.
 name: CI
 
+# Draft PRs are skipped (each job's `if:`), so `ready_for_review` is listed: without it a draft
+# marked ready would get no run until its next push. Skipped jobs are not billed.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 
@@ -34,11 +39,9 @@ concurrency:
 
 jobs:
   offline-suite:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: offline-suite (ubuntu-latest)
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,6 +60,7 @@ jobs:
     # gets all three verdicts from one run rather than finding the second failure on the next push.
     # pre-commit goes last because its fixer hooks rewrite files in the workspace when they fail,
     # and the two checks before it should see the tree exactly as committed.
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

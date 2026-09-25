@@ -149,7 +149,7 @@ python scripts/meridian.py alerts add --name connector-regression --if coverage-
 python scripts/meridian.py alerts add --name kev-ceiling --if above --metric kev-exposed --value 1500
 python scripts/meridian.py alerts list          # rules, and whether each can be evaluated
 python scripts/meridian.py alerts eval          # verdicts; --window full, --since, --format json
-python scripts/meridian.py alerts rm --name kev-ceiling
+python scripts/meridian.py alerts rm kev-ceiling
 ```
 
 Conditions are `coverage-regressed` (a connector entered the failing set), `above` and `below` (a

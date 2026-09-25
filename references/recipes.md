@@ -11,21 +11,24 @@ query-syntax.md).
 
 ## Verb cheat-sheet
 
-- **ask** — raw call: `meridian.py api <path> [-X POST --body-file q.json]`
-- **rank** — top-N by a numeric field: `meridian.py top --table <t> --field <f> --top <n> [--where ...]`
-- **profile / investigate** — one entity + blast radius: `meridian.py profile --name <name> [--type asset]`
-- **compare** — two entities: `meridian.py compare --name1 <a> --name2 <b> [--type asset]`
-- **list** — all matching a filter: `meridian.py list --table <t> --where "<clause>" [--all | --limit N] [--count-only] [--select <cols>]`
-- **summary** — group-by / posture: `meridian.py summary --table <t> --by <field>` or `--metrics`
-- **check** — token capability preflight: `meridian.py check`
-- **refresh-fields** — cache this stack's fields: `meridian.py refresh-fields [--search <term>]`
-- **labels** — the customer's own SmartLabels: `meridian.py labels [--search "<business term>"]`
-- **digest** — whole periodic posture review in one call: `meridian.py digest [--top N]`
-- **report** — Cyderes-branded PDF from any verb's JSON: `meridian.py report --input <json> --out <file.pdf> --title "..."`
+The verb for each question shape. For a verb's exact flags run `meridian.py <verb> --help`: this list
+carries none on purpose, because a copy of the flags drifts behind the code.
+
+- **api** (ask) — raw call, for an endpoint no other verb covers
+- **top** (rank) — top-N by a numeric field
+- **profile** (investigate) — one entity and its blast radius
+- **compare** — two entities side by side
+- **list** — everything matching a filter, or just the count
+- **summary** — group-by breakdown, or whole-stack totals
+- **check** — token capability preflight
+- **refresh-fields** — cache and search this stack's fields
+- **labels** — the customer's own SmartLabels
+- **digest** — a whole periodic posture review in one call
+- **report** — Cyderes-branded PDF from any verb's JSON
 
 ## Picking the cheapest shape of the answer
 
-Every row-returning verb (`top`, `list`, `summary`) takes `--select` and `--format csv --out`, and
+The row-returning verbs take `--format csv --out` (`top`, `list`, `summary`) and `--select` (`top`, `list`), and
 which one you reach for decides whether an answer costs a few hundred characters or a few hundred
 thousand. Measured on the demo stack, the same 1,198 KEV-carrying assets:
 

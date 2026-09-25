@@ -1,0 +1,50 @@
+# The offline suite on Windows. Split out of ci.yml to trim billed minutes: a Windows runner bills at
+# about twice the Linux rate, and a path filter can only be set per workflow, not per job.
+#
+# Why Windows at all: the suite has platform-conditional paths a Linux runner never exercises --
+# the msvcrt byte-range lock, cp1252 console handling and Windows path behaviour (8.3 short names,
+# the self-update swap) run only here.
+#
+# When it runs:
+#   - every push to main, unfiltered. A merge to main is a live deploy, and this is the one check
+#     that proves what shipped works on Windows, whatever the PR touched.
+#   - PRs that change code or CI (the paths below). A docs-only PR cannot reach a Windows-only path:
+#     every doc the code or the suite reads is opened as UTF-8, so its content decodes the same on
+#     both runners. If that stops being true, widen the paths; don't drop the push-to-main run.
+#   - not on draft PRs; `ready_for_review` gives a draft the run its pushes skipped.
+#
+# Same rules as ci.yml: actions pinned to commit SHAs, checkout persists no credentials, read-only
+# token. test_ci_workflow [47] checks every file in this directory, not just ci.yml.
+name: CI (Windows)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "scripts/**"
+      - "evals/**"
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  offline-suite:
+    name: offline-suite (windows-latest)
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Offline test suite
+        run: python evals/test_connect.py

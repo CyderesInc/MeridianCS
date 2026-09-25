@@ -328,7 +328,12 @@ def mirror_active_to_config(reg):
 # walking this ladder down until enough records match. Remembering the rung that worked skips the
 # dead probes at the top of the ladder on every later query for the same field.
 
-TOP_LADDER = [100000, 10000, 1000, 300, 100, 30, 10, 3, 1, 0]
+# Half-decade rungs all the way down. 3000 and 30000 were missing, and on a stack whose records run
+# to megabytes the gap was the cost: the 1000 rung's tail page ran past 100MB where the next
+# half-decade rung matched a third as many records. A rung is stored by value, not index, so a cache
+# written against the old ladder still resolves.
+TOP_LADDER = [100000, 30000, 10000, 3000, 1000, 300, 100, 30, 10, 3, 1, 0]
+TOP_LOOSE_FACTOR = 3  # a warm hit this many times over `top` probes one rung up; see cmd_top
 TOP_MAX_PAGES = 20   # hard ceiling on records read for one top-N (100 per page)
 TOP_REFINE_MIN = 500  # only tighten the threshold past this many records; see cmd_top for the math
 
@@ -1270,9 +1275,12 @@ def clause_or_problem(clause):
             return None, ("--where takes \"<Field> <operator> <Type> [value]\" and got %r. "
                           "Example: \"Risk_Score >= Float 500\". Types: %s."
                           % (clause, ", ".join(CLAUSE_TYPES)))
-        known = ", ".join(sorted(sum((list(v) for v in CLAUSE_OPERATORS.values()), []),
-                                 key=lambda s: (len(s), s)))
-        return None, ("%r is not an operator, in --where %r. Expected one of: %s."
+        # Only operators that can succeed: the windowed six are parsed so their refusal can be
+        # specific, but offering them here would send the caller into that second refusal.
+        known = ", ".join(sorted((o for v in CLAUSE_OPERATORS.values() for o in v
+                                  if o not in WINDOWED_OPERATORS), key=lambda s: (len(s), s)))
+        return None, ("%r is not an operator, in --where %r. Expected one of: %s. For a time window "
+                      "use a relative Datetime value such as `>= Datetime -30d`."
                       % (parts[1], clause, known))
     field, op, typ, val = split
     if typ not in CLAUSE_TYPES:
@@ -1407,6 +1415,8 @@ def emit(payload, rowkey, fmt=None, out_path=None):
             if k not in cols:
                 cols.append(k)
     flat = [{k: _csv_cell(r.get(k)) for k in cols} for r in rows]
+    # The header row goes through _csv_cell too: column names come from the API, and a customer-named
+    # SmartLabel is as much customer data as a cell value.
     envelope = {k: v for k, v in payload.items() if k != rowkey}
     envelope["rowsWritten"] = len(flat)
     if out_path:
@@ -1414,12 +1424,12 @@ def emit(payload, rowkey, fmt=None, out_path=None):
         # non-ASCII in an asset name. The BOM is what makes a double-click open correctly.
         with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader(); w.writerows(flat)
+            w.writerow({c: _csv_cell(c) for c in cols}); w.writerows(flat)
         envelope["csv"] = os.path.abspath(out_path)
         jout(envelope)
     else:
         w = csv.DictWriter(sys.stdout, fieldnames=cols, lineterminator="\n")
-        w.writeheader(); w.writerows(flat)
+        w.writerow({c: _csv_cell(c) for c in cols}); w.writerows(flat)
         # stderr, so `... --format csv > out.csv` still yields a clean file with the caveats on screen.
         jout(envelope, stderr=True)
 
@@ -1437,6 +1447,32 @@ def and_query(clauses, extra=None):
     return groups
 
 
+# A count only reads `totalRecords`, and every page carries it -- including one past the end, which
+# carries no records. Page 0 with recordsPerPage 1 still downloads one whole record, and records can
+# be huge: measured on a live stack, one high-risk asset count was 5.33MB/1.73s at page 0 and 86
+# bytes/0.85s here, with the same total, across unfiltered, filtered, zero-match, OR-group,
+# exists-gated and user-table queries. It is undocumented behaviour, so count_records() checks it:
+# no integer `totalRecords`, or a 400/404/416/422, falls back to page 0. (`recordsPerPage: 0` is no
+# substitute -- it silently returns 20 records.) Past COUNT_PAGE records the page is in range again
+# and carries one record: slower, never wrong.
+COUNT_PAGE = 99999
+
+
+def count_records(table, query):
+    """totalRecords for a query, without downloading a record. See COUNT_PAGE."""
+    try:
+        r = call("POST", "/CMDB/v2/data/cmdb",
+                 {"table": table, "query": query, "paging": {"page": COUNT_PAGE, "recordsPerPage": 1}})
+        n = r.get("totalRecords") if isinstance(r, dict) else None
+        if isinstance(n, int) and not isinstance(n, bool):
+            return n
+    except Exception as e:
+        if not re.match(r"HTTP (400|404|416|422)\b", str(e)):
+            raise
+    return call("POST", "/CMDB/v2/data/cmdb",
+                {"table": table, "query": query, "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]
+
+
 def jlist(v):
     if v is None:
         return []
@@ -1444,7 +1480,14 @@ def jlist(v):
 
 
 # ---- verbs -----------------------------------------------------------------------------------
-_CREDENTIAL_ENDPOINTS = ("/cmdb/v2/connector/profile",)
+# Every endpoint whose response can carry connector credentials. `connector/profile` returns them
+# outright; `system/metrics/connector` returns each run's `profile` as the whole profile object (see
+# _profile_name), config and secret included -- the guard missed it until a security review. Both
+# are read by `connectors` through its allow-list, so refusing them here loses nothing. The
+# ingestion-detail prefix is refused on suspicion rather than proof: its `docker_cmd` is a
+# connector's command line, the shape that carries a credential, and nobody needs it via `api`.
+_CREDENTIAL_ENDPOINTS = ("/cmdb/v2/connector/profile", "/cmdb/v2/system/metrics/connector")
+_CREDENTIAL_PREFIXES = ("/cmdb/v2/system/metrics/data-ingestion/detail/",)
 
 
 def _is_credential_endpoint(endpoint):
@@ -1459,7 +1502,8 @@ def _is_credential_endpoint(endpoint):
     the spelling that happens to work is a guard that fails open the day the server relaxes. Empty
     path segments are dropped for the same reason (`connector//profile`).
     """
-    return _canonical_path(endpoint) in _CREDENTIAL_ENDPOINTS
+    path = _canonical_path(endpoint)
+    return path in _CREDENTIAL_ENDPOINTS or path.startswith(_CREDENTIAL_PREFIXES)
 
 
 def _canonical_path(endpoint):
@@ -1476,9 +1520,62 @@ def _canonical_path(endpoint):
     return path.rstrip("/").lower()
 
 
+def api_endpoint_problem(endpoint):
+    """Why an `api` endpoint is refused before either guard reads it, or None.
+
+    Both guards compare _canonical_path, which drops `.` segments but cannot resolve `..` without
+    guessing what the server does with it, and cuts the path at `#`. So `connector/x/../profile`
+    compared as a different endpoint from the one a normalising proxy would serve, and
+    `data/cmdb#/../../connector/test/async` read as the read-only query endpoint while http.client
+    sent the whole string. No real endpoint needs `..`, `#`, `;` or a control character, so they are
+    refused outright rather than interpreted.
+    """
+    raw = _normalize_endpoint(endpoint)
+    path = raw.split("?", 1)[0]
+    for _ in range(3):
+        nxt = urllib.parse.unquote(path)
+        if nxt == path:
+            break
+        path = nxt
+    path = path.replace("\\", "/")
+    if "#" in raw or "#" in path or ";" in path:
+        return "`api` refuses endpoints containing `#` or `;` (%r): no API endpoint uses them." % endpoint
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw + path):
+        return "`api` refuses endpoints containing control characters (%r)." % endpoint
+    if ".." in path.split("/"):
+        return ("`api` refuses endpoints with a `..` segment (%r): name the endpoint directly."
+                % endpoint)
+    return None
+
+
+def config_path_problem(path):
+    """Why a file argument is refused, or None.
+
+    `report --input` and `api --body-file` read whatever file they are given, and the files that
+    must never pass through them are the ones holding tokens. `report --input
+    ~/.meridian/stacks.json --html` wrote every saved stack's token into the page, and `api -X POST
+    CMDB/v2/data/cmdb --body-file ~/.meridian/stacks.json` counts as a read, so it would have sent
+    them all to the active stack. The deny rule on file tools does not reach this script's own
+    open(), so the check lives here. Nothing under CFG_DIR is ever an input, so all of it is refused.
+    """
+    try:
+        target = os.path.normcase(os.path.realpath(path))
+        home = os.path.normcase(os.path.realpath(CFG_DIR))
+        inside = os.path.commonpath([target, home]) == home
+    except ValueError:      # different drives on Windows: cannot be inside
+        inside = False
+    if inside:
+        return ("%s is inside %s, which holds your saved stack tokens; it is never an input. Save the "
+                "file somewhere else." % (path, CFG_DIR))
+    return None
+
+
 # POST is how this API takes a read query, so a POST is not by itself a write. These are the ones
 # that change nothing; every other POST, and every PUT/PATCH/DELETE, can change the stack.
 _READ_POST_ENDPOINTS = ("/cmdb/v2/data/cmdb", "/cmdb/v2/data/ldg", "/cmdb/v2/smartlabel/search")
+# And the reverse: GETs that change the stack. `data-ingestion/run` starts a full ingestion run from
+# every connector, and was treated as a read because it is a GET.
+_WRITE_GET_ENDPOINTS = ("/cmdb/v2/system/data-ingestion/run",)
 
 
 def api_write_problem(method, endpoint, allow_write=False):
@@ -1494,7 +1591,12 @@ def api_write_problem(method, endpoint, allow_write=False):
     listed yet, and the cost of the other default is an unconfirmed change to a customer's stack.
     """
     m = (method or "GET").upper()
-    if allow_write or m in ("GET", "HEAD"):
+    if allow_write:
+        return None
+    if m in ("GET", "HEAD"):
+        if _canonical_path(endpoint) in _WRITE_GET_ENDPOINTS:
+            return ("`api %s %s` starts a full ingestion run from every connector, despite being a "
+                    "GET. Confirm this with the user, then re-run with --allow-write." % (m, endpoint))
         return None
     if m == "POST" and _canonical_path(endpoint) in _READ_POST_ENDPOINTS:
         return None
@@ -1508,13 +1610,19 @@ def cmd_api(a):
     # reads it through an in-process field allow-list that the tests assert nothing
     # credential-shaped survives -- so that invariant has to hold HERE too, not just in SKILL.md
     # prose, or "show me the raw connector profile" drops credentials straight into a transcript.
+    problem = api_endpoint_problem(a.endpoint)
+    if problem:
+        die(problem, 2)
     if _is_credential_endpoint(a.endpoint):
-        die("That endpoint returns connector credentials (service accounts, hosts, config secrets). "
-            "Use `connectors`, which reads it through a credential-stripping allow-list.")
+        die("That endpoint can return connector credentials (service accounts, hosts, config "
+            "secrets). Use `connectors`, which reads connector data through a credential-stripping "
+            "allow-list.")
     problem = api_write_problem(a.method, a.endpoint, getattr(a, "allow_write", False))
     if problem:
         die(problem, 2)
     body = None
+    if a.body_file and config_path_problem(a.body_file):
+        die(config_path_problem(a.body_file), 2)
     if a.body_file:
         with open(a.body_file, encoding="utf-8-sig") as f:
             body = f.read()
@@ -1897,8 +2005,7 @@ def top_n(table, field, n, where=None, select=None):
         with calls_lock:
             calls["n"] += 1
         q = and_query(where, {"searchFieldName": a.field, "operator": ">=", "type": "Float", "value": float(t)})
-        return call("POST", "/CMDB/v2/data/cmdb", {"table": a.table, "query": q,
-                                                  "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]
+        return count_records(a.table, q)
 
     # Start the descent at the rung that worked last time for this stack+table+field, so a
     # Risk_Score query stops probing 100000/10000 on a stack whose scores top out in the hundreds.
@@ -1934,6 +2041,22 @@ def top_n(table, field, n, where=None, select=None):
     if thresh is None or total == 0:
         return {"table": a.table, "field": a.field, "top": [], "note": "no matches"}
     rung = thresh
+
+    # A warm cache hits on its first probe and so never learns that a higher rung would also fill:
+    # a stack cached at 1000 kept reading three times the records that 3000 would have. When the hit is loose,
+    # probe the rung above once -- a count, so it downloads no record (count_records) -- and climb
+    # while it still fills. A tight hit skips it, so the usual warm run stays one probe. Past
+    # TOP_REFINE_MIN the refinement below climbs anyway, so this only covers the range under it.
+    if hi is None and start > 0 and total >= TOP_LOOSE_FACTOR * a.top and total <= TOP_REFINE_MIN:
+        j = TOP_LADDER.index(rung) - 1
+        while j >= 0:
+            n = probe(TOP_LADDER[j])
+            if n >= a.top:
+                rung, thresh, total = TOP_LADDER[j], TOP_LADDER[j], n
+                j -= 1
+            else:
+                hi = TOP_LADDER[j]
+                break
 
     # There is no server-side sort, so the top N is only correct if we read EVERY record above the
     # threshold. That makes a loose threshold expensive (one call per 100 records), so tighten it
@@ -2051,7 +2174,7 @@ def list_records(a):
     # one concurrent wave; merging would serialize page 0 ahead of the rest).
     pages, api_calls = [], 1
     if a.count_only or a.all or max(1, a.limit) > 100:
-        total = call("POST", "/CMDB/v2/data/cmdb", {"table": a.table, "query": q, "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]
+        total = count_records(a.table, q)
         if a.count_only:
             return {"table": a.table, "where": where, "totalRecords": total}
     else:
@@ -2208,9 +2331,7 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     else:
         first, where_total = parallel([
             lambda: call("POST", "/CMDB/v2/data/cmdb", page_body(0)),
-            lambda: call("POST", "/CMDB/v2/data/cmdb",
-                         {"table": a.table, "query": and_query(where),
-                          "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]])
+            lambda: count_records(a.table, and_query(where))])
         if isinstance(first, Exception):
             raise first
     total = first["totalRecords"]
@@ -2264,11 +2385,9 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
         vals = sorted(sorted(freq, key=lambda k: freq[k], reverse=True)[:SUMMARY_MAX_GROUPS])
     else:
         vals = sorted(seen)
-    counts = parallel([(lambda v=v: call("POST", "/CMDB/v2/data/cmdb",
-                        {"table": a.table,
-                         "query": and_query(where, {"searchFieldName": a.by, "operator": op,
-                                                    "type": byType, "value": v}),
-                         "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"])
+    counts = parallel([(lambda v=v: count_records(
+                            a.table, and_query(where, {"searchFieldName": a.by, "operator": op,
+                                                       "type": byType, "value": v})))
                        for v in vals])
     groups = [{"value": v, "count": c, "percent": round(100.0 * c / total, 1) if total else 0}
               for v, c in zip(vals, counts) if not isinstance(c, Exception)]
@@ -2327,9 +2446,7 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
             try:
                 or_group = [{"searchFieldName": a.by, "operator": op, "type": byType, "value": v}
                             for v in vals]
-                covered = call("POST", "/CMDB/v2/data/cmdb",
-                               {"table": a.table, "query": and_query(where) + [or_group],
-                                "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]
+                covered = count_records(a.table, and_query(where) + [or_group])
             except Exception:
                 covered = None
         overlap = ("Counts sum to more than the total because one record can hold several values. "
@@ -3089,7 +3206,7 @@ def measure_metric(mt):
     if problem:
         return dict(out, count=None, ok=False, error=problem)
     try:
-        out["count"] = call("POST", "/CMDB/v2/data/cmdb", body)["totalRecords"]
+        out["count"] = count_records(body["table"], body["query"])
     except Exception as e:
         return dict(out, count=None, ok=False, error=_short(str(e), 200))
     out["ok"] = True
@@ -4755,8 +4872,13 @@ def render_alerts_teams(v):
         blocks.append({"type": "TextBlock", "text": n, "wrap": True, "isSubtle": True})
     card = {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
             "version": "1.4", "body": blocks, "msteams": {"width": "Full"}}
+    # The top-level `text` is for hand-built flows, some of which post it through an action that
+    # renders HTML. Only `<` and `>` are escaped: they are what make markup, and an `&` left alone
+    # keeps the text readable in the flows that show it as plain text. The card body is Adaptive
+    # Card markdown and is escaped separately.
+    fallback = "\n\n".join([headline] + lines + notes).replace("<", "&lt;").replace(">", "&gt;")
     return {"type": "message",
-            "text": "\n\n".join([headline] + lines + notes),
+            "text": fallback,
             "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive",
                              "contentUrl": None, "content": card}]}
 
@@ -4938,15 +5060,23 @@ def deliver_alerts(v, targets=NOTIFY_TARGETS, force=False, stack_date=None):
     Never lets one target's failure hide delivery to -- or the verdict of -- the others: `sent[target]`
     carries an error string rather than raising, because a broken Slack webhook must not also cancel
     the Teams/email delivery, or make this look like nothing fired at all.
+
+    **The new state is saved only once at least one target accepted the message.** It used to be
+    saved first, and delivery is on-change only, so a change that reached nobody -- every webhook
+    down, SMTP unreachable, nothing configured yet -- was recorded as told and never sent again:
+    "tell me when a connector breaks" went quiet exactly when it mattered. Unsent, the change stays
+    pending and the next notify sends it. A target that failed while another succeeded is not
+    retried (state is per rule, not per target); its error is in `sent`.
     """
     prev = load_alertstate()
     new_state, changes = update_alertstate(prev, v, stack_date)
-    save_alertstate(new_state)
     configs = notify_configs(targets)
     report = {"changed": bool(changes), "changes": changes,
              "configured": {t: bool(configs.get(t)) for t in targets},
              "sent": {}, "skipped": {}}
     if not (force or changes):
+        save_alertstate(new_state)      # nothing to deliver; only lastSeen moves
+        report["stateSaved"] = True
         report["note"] = ("no rule's verdict changed since the last notify attempt; nothing sent "
                           "(use --force to resend regardless)")
         return report
@@ -4968,6 +5098,13 @@ def deliver_alerts(v, targets=NOTIFY_TARGETS, force=False, stack_date=None):
                 report["sent"][target] = {"status": "sent", "to": cfg["to"]}
         except Exception as e:
             report["sent"][target] = {"error": str(e)}
+    delivered = any("error" not in r for r in report["sent"].values())
+    report["stateSaved"] = delivered
+    if delivered:
+        save_alertstate(new_state)
+    elif changes:
+        report["note"] = ("nothing was delivered, so the change stays pending: the next notify sends "
+                          "it again")
     return report
 
 
@@ -6759,6 +6896,9 @@ def _print_to_pdf(browser, tmp_html, out):
 def cmd_report(a):
     """Render a Cyderes-branded PDF (or HTML with --html) from any verb's JSON output."""
     paths = a.input if isinstance(a.input, list) else ([a.input] if a.input else [])
+    for p in paths:
+        if config_path_problem(p):
+            die(config_path_problem(p), 2)
     if len(paths) > 1:
         # Several inputs only make sense for profiles -- one document, several subjects. Combining
         # a `top` with a `digest` has no meaning, so it is refused by name rather than rendered
@@ -6830,7 +6970,12 @@ def _write_report(a, default_title, subtitle, statcards, body, section_label="",
     except SystemExit:
         pass
     gen = a.date or ""
-    html = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>%s</title>
+    # The CSP is defence in depth: every customer string is escaped, but headless Chrome renders
+    # this page from file:// with scripts and network enabled, so nothing it contains may run code
+    # or fetch anything. Fonts are data: URIs and the logo is inline SVG, so this blocks nothing.
+    html = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:">
+<title>%s</title>
 <style>%s
 %s</style></head><body>
 <div class="masthead">
@@ -7609,13 +7754,28 @@ def _index_warning_groups(out):
     return True
 
 
+def _connectors_view(cov, full=False):
+    """What `connectors` prints: the coverage block, with each warning cause stated once.
+
+    The same lossless index the preflight uses (_index_warning_groups): measured on a live stack it
+    took ~3,000 chars (~745 tokens) off every mid-session `connectors` call, and SKILL.md already
+    reads both shapes. `--full` stays verbatim, since asking for everything means everything. A copy
+    is indexed, never `cov` itself: it is summarize_connectors()' own result and may be the cached one.
+    """
+    if full or not isinstance(cov, dict):
+        return cov
+    out = dict(cov)
+    return out if _index_warning_groups(out) else cov
+
+
 def cmd_connectors(a):
     # The stamp is read fresh even when the coverage block comes from its hour-long cache: connector
     # health may be an hour old, but "which LDG are the answers about" must never be.
     jout(with_currency(["asset", "user"],
-                       lambda: summarize_connectors(a.max_failures, a.max_other, brief=not a.full,
-                                                    max_warnings=a.max_warnings, max_detail=a.max_detail,
-                                                    refresh=a.refresh)))
+                       lambda: _connectors_view(
+                           summarize_connectors(a.max_failures, a.max_other, brief=not a.full,
+                                                max_warnings=a.max_warnings, max_detail=a.max_detail,
+                                                refresh=a.refresh), full=a.full)))
 
 
 # The HR / HCM systems in Meridian's connector catalog (/CMDB/v2/connector), by bridge_name, taken from
@@ -7710,8 +7870,7 @@ def hr_sources(refresh=False):
         sts += [s for s in enabled if s not in sts]
 
     def count(q):
-        return call("POST", "/CMDB/v2/data/cmdb", {"table": "user", "query": q,
-                                                  "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]
+        return count_records("user", q)
 
     def match(s):
         return {"searchFieldName": "sourcetype", "operator": "match", "type": "List", "value": s}
@@ -8844,7 +9003,9 @@ def _add_output_flags(s):
     return s
 
 
-def main():
+def build_parser():
+    """The CLI's argparse parser. Its own function so a test can parse every command the docs show
+    without running one: a documented flag that no longer exists costs the model an error and a retry."""
     p = argparse.ArgumentParser(description="Meridian API v2 CLI (cross-platform).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -9107,8 +9268,11 @@ def main():
     s.add_argument("--html", action="store_true",
                    help="write branded HTML instead of PDF (also the fallback when no Chromium is found)")
     s.set_defaults(func=cmd_report)
+    return p
 
-    args = p.parse_args()
+
+def main():
+    args = build_parser().parse_args()
     # Checked before dispatch, so a bad path fails before any API call or render is spent on it.
     out = getattr(args, "out", None)
     if out:

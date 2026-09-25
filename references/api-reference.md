@@ -56,10 +56,10 @@ Response entries:
 |---|---|---|
 | `/CMDB/v2/system/metrics/data` | GET | `{assetCount, userCount, date, avg30DaysAssetCount, avg30DaysUserCount}`. Optional `?date=yyyy-mm-dd` |
 | `/CMDB/v2/system/metrics/license` | GET | `{licenseType, expireDate, customerName}` |
-| `/CMDB/v2/system/metrics/connector` | GET | Per-connector ingestion detail: status, error messages, input/output record counts, field mappings. Optional `?sort=display_name%2Cdesc`. Large response — save to a file |
+| `/CMDB/v2/system/metrics/connector` | GET | Per-connector ingestion detail: status, error messages, input/output record counts, field mappings. Optional `?sort=display_name%2Cdesc`. Large response — save to a file. **`api` refuses it:** a run can embed the connector's full profile, credentials included; use `meridian.py connectors` |
 | `/CMDB/v2/system/metrics/data-ingestion` | GET | `{data_ingestion_runs:[{run_type, id, status, start_date, end_date}]}` |
 | `/CMDB/v2/system/metrics/data-ingestion/next` | GET | `{next_run_at, schedule_interval_value (cron), schedule_interval_type}` |
-| `/CMDB/v2/system/metrics/data-ingestion/detail/<job id>` | GET | Job id like `scheduled__2023-07-27T01:05:00+00:00`. Returns `{task_list:[{task_id, docker_cmd, docker_image, status, start_date, end_date}]}` |
+| `/CMDB/v2/system/metrics/data-ingestion/detail/<job id>` | GET | Job id like `scheduled__2023-07-27T01:05:00+00:00`. Returns `{task_list:[{task_id, docker_cmd, docker_image, status, start_date, end_date}]}`. `api` refuses it: `docker_cmd` is a connector's command line |
 | `/CMDB/v2/system/metrics/action` | GET | Scheduled Actions (Spring page object): `{actions:[{actionId, actionName, actionType, actionGroup, scheduleType, scheduleCronExpression, lastRunAt, nextRunAt, status, createdBy}], totalPages, ...}` |
 | `/CMDB/v2/system/metrics/action-jobs/<action_id>` | GET | Runs of one Action: `[{id, action_run_date, action_status, action_status_msg, action_result_number, action_result_log_id}]` |
 
@@ -73,7 +73,7 @@ entirely and reports as idle — which claims "hasn't ingested" when the truth i
 | Endpoint | Method | Returns |
 |---|---|---|
 | `/CMDB/v2/system/data-ingestion/jobs` | GET | Airflow-style run list: `{dag_runs:[{dag_run_id, data_interval_start/end, run_type, state, start_date, end_date, external_trigger, note}], total_entries}` |
-| `/CMDB/v2/system/data-ingestion/run` | GET | **⚠ Starts a full ingestion run from all connectors** and returns the queued dag_run. It is a GET, so treat it as state-changing regardless of method — only call with explicit user confirmation |
+| `/CMDB/v2/system/data-ingestion/run` | GET | **⚠ Starts a full ingestion run from all connectors** and returns the queued dag_run. It is a GET, so treat it as state-changing regardless of method — only call with explicit user confirmation; `api` requires `--allow-write` for it |
 
 ## Connectors & profiles
 
