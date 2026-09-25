@@ -259,6 +259,16 @@ currency-unknown unless paired with `asof`.
     Coverage is measured directly instead: one extra OR query (every discovered value as objects in a
     single inner array) counts the records matching *any* of them, and the shortfall against the total
     is exact. Reported as `coveredRecords` / `unaccountedRecords` / `complete`.
+  - **Records with no value for the field are counted separately.** The breakdown's query adds an
+    `exists` gate on the field, so `total`, the percentages and `complete` cover only records that
+    *have* a value. One extra count of `--where` alone, run beside page 0, gives `whereTotal` and
+    `recordsWithoutField` (the difference), and the `note` names a non-zero gap. Each group's
+    `percent` stays a share of `total`, so quoting it against `whereTotal` overstates it. A cache
+    entry written before these keys existed is a miss, not a silent answer. `complete` keeps
+    its meaning: it measures the discovery sample's reach, and an unpopulated field is a fact about
+    the data rather than a gap in the sample, often by design. `whereTotalUnavailable` means that
+    count failed, so the gap is unknown rather than zero, and the result is not cached. A dotted
+    (nested) field has no gate, so it reports neither key.
   - **High cardinality returns partial data rather than nothing.** Past `SUMMARY_MAX_GROUPS` (40) it
     counts the largest values the sample saw, sets `groupsCapped` and `distinctValuesSeen`, is never
     `complete`, and the coverage check states how many records the dropped values hold. `--by OS`

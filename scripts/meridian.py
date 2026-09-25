@@ -2151,6 +2151,10 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     What is NOT cached is a breakdown whose coverage check could not run at all (`complete` absent),
     since re-running may well answer it.
 
+    **`total` counts only records that have a value for `by`** (the `exists` gate), so records matching
+    `where` with the field empty sit outside every group. `whereTotal` / `recordsWithoutField` state
+    that gap, separately from `complete` -- see the comment where they are set for why.
+
     **A dotted `by` (`"Details.OS"`, `"Owner_Status.Is_Admin"`) reaches into a per-source Embed_List.**
     `--by`'s stratified sample used to always come back with `distinctValuesSeen: 0` for these: a fetched
     record stores `rec["Details"] = [{"OS": ..., ...}, ...]`, never a literal top-level `"Details.OS"`
@@ -2165,7 +2169,10 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     where = a.where or []
     ck = {"table": table, "by": by, "where": sorted(where), "rebuilt": rebuilt}
     cached, age = (None, None) if refresh or not rebuilt else rescache_get("summary_by", RESCACHE_TTL, **ck)
-    if cached is not None:
+    # An entry cached before the where-only count existed carries no answer to it, and a missing key
+    # reads as nothing to report rather than as unknown -- so it is a miss. The nested path never
+    # carries one, and never needed it.
+    if cached is not None and ("whereTotal" in cached or "." in a.by):
         return _stamp_cache(cached, age)
     check_fields(a.table, a.by, *clause_fields(where))
     byType = field_type(a.table, a.by)
@@ -2191,7 +2198,21 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
 
     # Page 0 goes first because its totalRecords decides how many pages exist -- and it doubles as
     # the group-by denominator, so the separate count call this used to make was pure duplication.
-    first = call("POST", "/CMDB/v2/data/cmdb", page_body(0))
+    # Beside it, when the `exists` gate applies, one count of `where` alone: the gate is what keeps
+    # records with no value out of the denominator, so it is also what hides them. Independent of
+    # page 0, so it costs no round trip. Optional -- a failed count is flagged below, never fatal.
+    # With no --where this is an empty query, which counts every record: checked live, it equals the
+    # `Asset_Name exists` / `Owner_Name exists` count `list` uses, on both tables.
+    if nested:
+        first, where_total = call("POST", "/CMDB/v2/data/cmdb", page_body(0)), None
+    else:
+        first, where_total = parallel([
+            lambda: call("POST", "/CMDB/v2/data/cmdb", page_body(0)),
+            lambda: call("POST", "/CMDB/v2/data/cmdb",
+                         {"table": a.table, "query": and_query(where),
+                          "paging": {"page": 0, "recordsPerPage": 1}})["totalRecords"]])
+        if isinstance(first, Exception):
+            raise first
     total = first["totalRecords"]
     resps = [first]
     lastpage = max(0, (total + 99) // 100 - 1)
@@ -2329,13 +2350,54 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
                        " (and %d of %d discovered values were dropped by the group cap)"
                        % (len(seen) - len(vals), len(seen)) if capped else ""))
             else:
-                out["note"] = overlap + "Every record falls in at least one group below."
+                # Not "every record" when the gate applies: records with no value are outside `total`,
+                # and the without-field sentence below would contradict it.
+                out["note"] = overlap + ("Every record falls in at least one group below." if nested
+                                         else "Every record with a value for %r falls in at least one "
+                                              "group below." % a.by)
     if capped and "note" not in out:
         out["note"] = ("%d distinct values seen in the sample; showing the %d largest. Narrow with "
                        "--where for a complete breakdown." % (len(seen), len(vals)))
+
+    # The `exists` gate means `total`, every percentage, `accountedRecords` and `complete` describe
+    # only the records that HAVE a value for `by`. A record matching --where with the field empty was
+    # in no group and no count, so the breakdown read as the whole population when it wasn't (measured:
+    # about one in five of a filtered server population, reported complete). The where-only count
+    # states the gap.
+    #
+    # `complete` deliberately keeps its meaning -- the groups account for every record that has the
+    # field -- rather than turning false here. It answers a different question: the discovery
+    # sample's reach, whose remedy is narrowing the query. An unpopulated field is a fact about the
+    # data with no such remedy, and often by design (a cloud-provider field on on-prem servers).
+    # Folding the two together would mark most breakdowns incomplete for good, have the digest label
+    # a data fact "records unaccounted", and give snapshots written before this a different
+    # definition of `complete` from those after, which a trend would compare as if they matched.
+    # `recordsWithoutField` is the separate signal. Absent -- on older records, or the nested path,
+    # which has no gate -- means unknown, never 0.
+    if not nested:
+        if isinstance(where_total, int) and where_total >= total:
+            out["whereTotal"] = where_total
+            out["recordsWithoutField"] = where_total - total
+            if where_total > total:
+                gap = where_total - total
+                out["note"] = (
+                    "%d of %d %s (%.1f%%) have no value for %r and are in no group below; the total, "
+                    "percentages and completeness cover only the %d that do."
+                    % (gap, where_total, "records matching --where" if where else "records",
+                       100.0 * gap / where_total, a.by, total)
+                    + (" " + out["note"] if out.get("note") else ""))
+        else:
+            # A failed count, or one below the gated total (the two reads straddled a change). Either
+            # way the gap is unknown -- flagged, and kept out of the cache so a re-run can answer it.
+            out["whereTotalUnavailable"] = True
+            out["note"] = (
+                "Records matching the query with no value for %r could not be counted on this run, "
+                "so some may be missing from every group below." % a.by
+                + (" " + out["note"] if out.get("note") else ""))
     # `complete` present means the coverage question was answered, either way. Absent means the check
     # itself could not run, and caching that would fix an unanswered question in place for the TTL.
-    if "complete" in out and rebuilt:
+    # An unknown without-field count is the same kind of unanswered question.
+    if "complete" in out and rebuilt and not out.get("whereTotalUnavailable"):
         rescache_put("summary_by", out, **ck)
     return out
 
@@ -2685,7 +2747,7 @@ def _snapshot_breakdown(b):
            "groups": {g["value"]: g.get("count") for g in (b.get("groups") or []) if "value" in g}}
     for k in ("complete", "accountedRecords", "unaccountedRecords", "coveredRecords",
               "overcountedRecords", "groupsCapped", "distinctValuesSeen", "sampledForValues",
-              "countsUnavailable"):
+              "countsUnavailable", "whereTotal", "recordsWithoutField", "whereTotalUnavailable"):
         if k in b:
             out[k] = b[k]
     return out
@@ -6199,6 +6261,11 @@ def _digest_html(data):
         if brk.get("complete") is False:
             un = brk.get("unaccountedRecords") or brk.get("overcountedRecords")
             label += " — incomplete, %s records unaccounted" % n(un)
+        if brk.get("recordsWithoutField"):
+            label += " — %s records have no value and are not shown" % n(brk["recordsWithoutField"])
+        elif brk.get("whereTotalUnavailable"):
+            # Unattended: a count that failed must say so, or the breakdown reads as the whole population.
+            label += " — records with no value could not be counted, so some may be missing"
         sec.append("<div class='section-label'>%s</div>" % label + _rows_html(brk["groups"]))
 
     for key, title in [("topUsers", "Riskiest users"), ("topAssets", "Riskiest assets")]:
@@ -8926,7 +8993,9 @@ def main():
     s = sub.add_parser("summary", help="group-by breakdown, or whole-stack totals (posture)")
     s.add_argument("--table", default="asset", help="asset (default) or user")
     s.add_argument("--by", help="field to break down by. The result states its own reach -- complete, "
-                                "accountedRecords, unaccountedRecords, groupsCapped -- and that has "
+                                "accountedRecords, unaccountedRecords, groupsCapped, "
+                                "recordsWithoutField (matches with no value, in no group) -- and "
+                                "that has "
                                 "to reach the answer; a partial breakdown read as whole is a wrong one")
     s.add_argument("--where", action="append", help=_WHERE_HELP)
     s.add_argument("--metrics", action="store_true",

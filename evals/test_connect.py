@@ -1461,6 +1461,10 @@ def test_summary_completeness(m):
             groups = (body or {}).get("query") or []
             q = json.dumps(groups)
             if paging.get("recordsPerPage") == 1:
+                # The `where`-alone count (no clause on `by`) -- every record here has the field, so
+                # it matches the gated total. test_summary_without_field [55] covers the gap.
+                if not any(c.get("searchFieldName") == by for g in groups for c in g):
+                    return {"totalRecords": total, "data": []}
                 # The coverage probe ORs every value into ONE inner array; a per-value count has one.
                 if groups and len(groups[-1]) > 1:
                     return {"totalRecords": total if covered is None else covered, "data": []}
@@ -1569,6 +1573,154 @@ def test_summary_completeness(m):
     out = run("Details.OS", "String", recs, {"Linux": 500, "Windows": 100}, 1000, covered=600)
     check("missing/null/dict-shaped parent entries don't crash the sampler",
           set(g["value"] for g in out["groups"]), {"Linux", "Windows"})
+
+
+def test_summary_without_field(m):
+    """`summary --by` gates its query on `exists` for the grouping field, so `total`, the percentages
+    and `complete` describe only records that HAVE a value. A record matching --where with the field
+    empty sat in no group and no count, and nothing said so: a breakdown over a filtered population
+    read `complete: true` with about a fifth of that population absent. One count of `where` alone
+    states the gap -- and `complete` keeps its meaning, since snapshots, trends and the digest read it."""
+    print("[55] summary breakdown states records with no value for the field (offline)")
+    import tempfile
+    real = (m.call, m.field_type, m.load_config, m.CFG_DIR, m.check_fields)
+    state = {"where_total": None, "calls": []}
+
+    def fake_call(method, endpoint, body=None, retries=1):
+        body = body or {}
+        state["calls"].append(body)
+        paging, groups = body.get("paging", {}), body.get("query") or []
+        by = state["by"]
+        if paging.get("recordsPerPage") == 1:
+            if not any(c.get("searchFieldName") == by for g in groups for c in g):
+                wt = state["where_total"]
+                if isinstance(wt, Exception):
+                    raise wt
+                return {"totalRecords": wt, "data": []}
+            if groups and len(groups[-1]) > 1:                          # List/nested coverage probe
+                return {"totalRecords": state["total"], "data": []}
+            q = json.dumps(groups[-1])
+            return {"totalRecords": next((c for v, c in state["counts"].items() if '"%s"' % v in q), 0),
+                    "data": []}
+        page = paging.get("page", 0)
+        return {"totalRecords": state["total"], "data": state["records"][page * 100:(page + 1) * 100]}
+
+    def run(by, records, counts, total, where_total, where=None, dtype="String", rebuilt=None):
+        state.update(by=by, records=records, counts=counts, total=total, where_total=where_total)
+        state["calls"] = []
+        m.field_type = lambda t, f: dtype
+        return m.summarize_by("asset", by, where, rebuilt=rebuilt)
+
+    def where_only_calls(by):
+        return [b for b in state["calls"] if (b.get("paging") or {}).get("recordsPerPage") == 1
+                and not any(c.get("searchFieldName") == by for g in (b.get("query") or []) for c in g)]
+
+    m.call, m.check_fields = fake_call, (lambda *a, **k: None)
+    m.load_config, m.CFG_DIR = (lambda: ("s.example", "tok", None)), tempfile.mkdtemp(prefix="wgap-")
+    recs = [{"Provider": "aws"}] * 60 + [{"Provider": "azure"}] * 40
+    where = ["Asset_Type == String Server"]
+    try:
+        # --- some matching records have no value: the gap is counted and named ----------------------
+        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where)
+        check("the where-only population is reported", out.get("whereTotal"), 125)
+        check("records with no value are counted", out.get("recordsWithoutField"), 25)
+        check("...and the note names the count", "25 of 125 records matching --where" in (out.get("note") or ""), True)
+        check("...says they have no value and sit in no group",
+              "no value for 'Provider' and are in no group" in (out.get("note") or ""), True)
+        check("complete keeps its meaning: every record WITH the field is grouped", out.get("complete"), True)
+        check("total stays the gated denominator", out.get("total"), 100)
+        wq = where_only_calls("Provider")
+        check("exactly one where-only count is made", len(wq), 1)
+        check("...querying --where alone, no exists gate", wq[0].get("query") if wq else None,
+              m.and_query(where))
+
+        # --- no --where: the note says "records", not "matching --where" ----------------------------
+        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125)
+        check("without --where the gap is still stated", "25 of 125 records (" in (out.get("note") or ""), True)
+
+        # --- every record has the field: zero gap, stated as zero, no note -----------------------
+        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 100, where=where)
+        check("no gap -> recordsWithoutField is 0", out.get("recordsWithoutField"), 0)
+        check("...with the population alongside", out.get("whereTotal"), 100)
+        check("...and no note", "note" in out, False)
+
+        # --- NO record has the field: an empty breakdown must not read as a zero population ---------
+        out = run("Provider", [], {}, 0, 40, where=where)
+        check("an all-empty field reports every match as without it", out.get("recordsWithoutField"), 40)
+        check("...and names them", "40 of 40 records matching --where" in (out.get("note") or ""), True)
+
+        # --- the count failed: unknown, never 0, and never cached -----------------------------------
+        os.environ.pop("MERIDIAN_NO_CACHE", None)
+        stamp = "2026-09-24T10:12:12Z"
+        try:
+            out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, RuntimeError("HTTP 500: x"),
+                      where=where, rebuilt=stamp)
+            check("a failed count is flagged", out.get("whereTotalUnavailable"), True)
+            check("...and reports no gap figure at all", ("recordsWithoutField" in out, "whereTotal" in out),
+                  (False, False))
+            check("...and says so", "could not be counted" in (out.get("note") or ""), True)
+            check("...and is not cached", m.rescache_get("summary_by", m.RESCACHE_TTL, table="asset",
+                  by="Provider", where=sorted(where), rebuilt=stamp)[0], None)
+
+            # A count below the gated total is two reads that disagree -- unknown, not negative.
+            out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 90, where=where)
+            check("an inconsistent count is unknown, not negative",
+                  (out.get("whereTotalUnavailable"), "recordsWithoutField" in out), (True, False))
+
+            # --- the cached path carries the new keys -----------------------------------------------
+            m.drop_rescache()
+            fresh = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
+            served = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
+            check("a repeat is served from cache", (served.get("fromCache"), len(state["calls"])), (True, 0))
+            check("...carrying recordsWithoutField", served.get("recordsWithoutField"), 25)
+            check("...and whereTotal", served.get("whereTotal"), fresh.get("whereTotal"))
+            check("...and the note", served.get("note"), fresh.get("note"))
+
+            # An entry cached before the where-only count existed has none of its keys. Served, the
+            # gap would be silently absent -- so it is a miss and the count is made.
+            m.drop_rescache()
+            legacy = {k: v for k, v in fresh.items()
+                      if k not in ("whereTotal", "recordsWithoutField", "fromCache", "cacheAgeSeconds")}
+            m.rescache_put("summary_by", legacy, table="asset", by="Provider", where=sorted(where),
+                           rebuilt=stamp)
+            again = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
+            check("a pre-gap cache entry is a miss, not a silent answer",
+                  (again.get("fromCache"), again.get("recordsWithoutField")), (None, 25))
+        finally:
+            m.drop_rescache()
+            os.environ["MERIDIAN_NO_CACHE"] = "1"
+
+        # --- it survives into a snapshot and onto the digest ----------------------------------------
+        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where)
+        snap = m._snapshot_breakdown(out)
+        check("a snapshot breakdown keeps recordsWithoutField", snap.get("recordsWithoutField"), 25)
+        check("...and whereTotal", snap.get("whereTotal"), 125)
+        _, _, body = m._digest_html({"breakdown": out})
+        check("the digest labels the gap", "25 records have no value and are not shown" in body, True)
+        _, _, body = m._digest_html({"breakdown": run("Provider", recs, {"aws": 60, "azure": 40},
+                                                      100, 100, where=where)})
+        check("...and says nothing when there is none", "have no value" in body, False)
+        _, _, body = m._digest_html({"breakdown": run("Provider", recs, {"aws": 60, "azure": 40},
+                                                      100, RuntimeError("HTTP 500: x"), where=where)})
+        check("...and says so when the count failed", "could not be counted" in body, True)
+
+        # --- a List field with full coverage: the coverage note must not claim "every record" ------
+        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, dtype="List")
+        note = out.get("note") or ""
+        check("List + gap: the note states the gap", "25 of 125 records matching --where" in note, True)
+        check("...and does not contradict it with 'every record'", "Every record falls" in note, False)
+        check("...scoping coverage to records with a value",
+              "Every record with a value for 'Provider' falls in at least one group" in note, True)
+
+        # --- the nested path has no gate, so it is unchanged: no extra call, no new keys -------------
+        nrecs = [{"Details": [{"OS": "Linux"}]}] * 60 + [{"Details": [{"OS": "Windows"}]}] * 40
+        out = run("Details.OS", nrecs, {"Linux": 600, "Windows": 400}, 1000, 1500, where=where)
+        check("nested: no where-only count is made", len(where_only_calls("Details.OS")), 0)
+        check("nested: no gap keys", [k for k in ("whereTotal", "recordsWithoutField",
+                                                  "whereTotalUnavailable") if k in out], [])
+        check("nested: completeness unchanged", (out.get("coveredRecords"), out.get("complete")), (1000, True))
+    finally:
+        m.call, m.field_type, m.load_config, m.CFG_DIR, m.check_fields = real
 
 
 def test_transport(m):
@@ -4853,6 +5005,10 @@ def test_skill_rule_survival():
         ("...naming the records it could not place", "unaccountedRecords"),
         ("...and refusing to bless an over-count", "overcountedRecords"),
         ("...and saying when only the largest values were counted", "groupsCapped"),
+        ("matches with no value for the field are not read as absent",
+         "`recordsWithoutField` above 0 means that many matches have no value and sit in no group"),
+        ("...and a group's percent is not quoted against the wider population",
+         "group's `percent` is of `total`, not `whereTotal`"),
 
         # -- profile: the analysis is in the payload, and absence is not zero -----------------------
         ("profile's own analysis is what gets presented", "recommendations"),
@@ -4905,6 +5061,8 @@ def test_skill_rule_survival():
 
     check("scripts.md carries the breakdown-completeness reasoning",
           "overcountedRecords" in scripts_doc and "groupsCapped" in scripts_doc, True)
+    check("...including why recordsWithoutField is not folded into complete",
+          "recordsWithoutField" in scripts_doc and "`complete` keeps" in " ".join(scripts_doc.split()), True)
     check("...and the --vuln-detail measurement", "--vuln-detail" in scripts_doc, True)
     check("...and the --select/--out payload figures", "229,000 tokens" in scripts_doc, True)
     check("trend-verbs.md carries the trend refusal flags",
@@ -7879,6 +8037,7 @@ def main():
     test_compare(m)
     test_tls_posture(m)
     test_summary_completeness(m)
+    test_summary_without_field(m)
     test_transport(m)
     test_pace(m)
     test_check_classification(m)

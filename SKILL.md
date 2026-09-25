@@ -796,6 +796,9 @@ rule.** Read it when the user asks why, or when you need exact arguments — tho
   several groups. `groupsCapped` with `distinctValuesSeen` means only the largest values were counted
   — present it as partial and offer to narrow. `overcountedRecords` means the breakdown is **not
   trustworthy**: run `refresh-fields`, re-run, and don't quote the first attempt's percentages.
+  `complete` covers only records that have the field: `recordsWithoutField` above 0 means that many
+  matches have no value and sit in no group, so say so and give `whereTotal` as the population. Each
+  group's `percent` is of `total`, not `whereTotal`: label it "of those with a value", or recompute.
   → [scripts.md](references/scripts.md)
 
 - **One `profile` call is the whole investigation answer — don't rebuild it.** It returns `findings`

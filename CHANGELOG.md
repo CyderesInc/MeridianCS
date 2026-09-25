@@ -3,6 +3,12 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.27.2 - 2026-09-25
+
+- **Breakdowns now count the records that have no value for the field.** Before, those records
+  were in no group and nothing said so, so a breakdown could look complete while part of the
+  population was missing. The answer now says how many.
+
 ## 2.27.1 - 2026-09-24
 
 - **Percentages from an earlier answer are no longer reused after Meridian rebuilds.** If one part
