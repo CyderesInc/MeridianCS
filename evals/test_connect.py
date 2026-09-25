@@ -5765,6 +5765,11 @@ CURRENCY_RULES = (
     ("rule 3: a rebuild between answers is said first", "say so **before** the new answer"),
     ("...and earlier figures become superseded", "**superseded**"),
     ("...and are referred to with their rebuild", "Meridian has rebuilt since"),
+    # Added after eval 26's first run (2026-09-24): the follow-up re-ran one count, then quoted the
+    # earlier answer's all-server percentage beside it -- a share built from one re-run part and one
+    # superseded part, unlabelled. Every raw count was handled correctly; the derived figure was not.
+    ("...and so are shares and comparisons derived from them", "**That includes anything derived from them.**"),
+    ("...even when one of their parts was re-run", "even when one of its parts has since been re-run"),
     ("rule 4: never mix rebuilds in one figure", "**Never derive one figure from two rebuilds.**"),
     ("rule 5: asof before reusing earlier rows", "**Before answering from Meridian rows already in the conversation, run `meridian.py asof`**"),
     ("rule 6: a straddled query is not an answer", "**`rebuildDuringQuery: true` is not an answer.**"),

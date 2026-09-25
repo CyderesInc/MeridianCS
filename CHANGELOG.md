@@ -3,6 +3,12 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.27.1 - 2026-09-24
+
+- **Percentages from an earlier answer are no longer reused after Meridian rebuilds.** If one part
+  of a share was re-run and the other wasn't, the skill now re-runs both or marks the figure as out
+  of date, instead of quoting it as current.
+
 ## 2.27.0 - 2026-09-24
 
 - **Every answer now says which data it describes**: the time of Meridian's latest rebuild, for

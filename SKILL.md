@@ -609,7 +609,11 @@ it into something the user can trust:
    "Meridian rebuilt its data at 14:05 UTC since my earlier answers (as of 10:12 UTC)". Name the
    earlier figures that may have changed, and offer to re-run them. From then on those figures are
    **superseded**. Never present one as current again; when you refer to it, write "1,240 (as of
-   2026-09-24 10:12 UTC; Meridian has rebuilt since)".
+   2026-09-24 10:12 UTC; Meridian has rebuilt since)". **That includes anything derived from them.**
+   A percentage, share or comparison you quoted before the rebuild is superseded too, even when one
+   of its parts has since been re-run. Re-run every part before you reuse it, or label it
+   superseded. Restating an old share beside new counts is the easiest way to break rule 4 without
+   noticing.
 4. **Never derive one figure from two rebuilds.** No ratio, difference or percentage whose parts
    carry different `ldgRebuiltUtc`: re-run the older part first. Comparing the *same* question across
    two rebuilds is fine, labelled as a change between rebuilds.
