@@ -5496,6 +5496,7 @@ def test_data_currency(m):
     import io
     import tempfile
     names = ("_CFG_CACHE", "CFG_DIR", "CFG_PATH", "call", "load_config", "ldg_rebuild", "top_n", "list_records",
+             "rescache_scope_live", "summary_cache_put",
              "summarize_by", "stack_metrics", "build_profile", "hr_sources", "summarize_connectors",
              "diagnose_connection", "build_digest", "take_snapshot")
     real = {n: getattr(m, n) for n in names}
@@ -5518,17 +5519,35 @@ def test_data_currency(m):
     def filler(n, end):
         return [run("some_connector", end - i, "Success", platform="api") for i in range(n)]
 
-    served = {"calls": 0}
+    served = {"calls": 0, "endpoints": []}
 
-    def serve(pages, fail=None):
+    def serve(pages, fail=None, sort="honour"):
+        """`pages` are the TIME-sorted pages. A platform-sorted request is answered per `sort`:
+        honour (sort every row by platform asc, _time desc, and page by the requested size), ignore
+        (serve the time-sorted pages, as a server dropping the parameter would), oldest (every row
+        oldest first), platform-only (grouped by platform, times ascending inside), or error."""
         served["calls"] = 0
+        served["endpoints"] = []
+        rows = [r for pg in pages for r in pg]
 
         def fake(method, endpoint, body=None, retries=1):
             served["calls"] += 1
+            served["endpoints"].append(endpoint)
             if fail:
                 raise RuntimeError(fail)
-            check_sort = "sort=_time%2Cdesc" in endpoint
             p = int(re.search(r"[?&]page=(\d+)", endpoint).group(1))
+            if "sort=platform%2Casc" in endpoint and isinstance(sort, list):
+                return {"content": sort if p == 0 else [], "totalPages": 1}
+            if "sort=platform%2Casc" in endpoint and sort != "ignore":
+                if sort == "error":
+                    raise RuntimeError("HTTP 400: unsupported sort")
+                size = int(re.search(r"[?&]size=(\d+)", endpoint).group(1))
+                key = {"honour": lambda r: (r.get("platform") is None, r.get("platform") or "", -r["_time"]),
+                       "oldest": lambda r: r["_time"],
+                       "platform-only": lambda r: (r.get("platform") is None, r.get("platform") or "", r["_time"])}[sort]
+                ordered = sorted(rows, key=key)
+                return {"content": ordered[p * size:(p + 1) * size], "totalPages": -(-len(ordered) // size)}
+            check_sort = "sort=_time%2Cdesc" in endpoint
             return {"content": pages[p] if p < len(pages) and check_sort else [], "totalPages": len(pages)}
         m.call = fake
 
@@ -5541,22 +5560,35 @@ def test_data_currency(m):
         serve([filler(3, T0 + 50) + [run(ASSET, T0, dag="d1"), run(USER, T0, dag="d1")] + filler(5, T0)])
         s = m.ldg_rebuild()
         check("newest page holds both mergers: one call", (s["apiCalls"], served["calls"]), (1, 1))
+        check("...the platform-sorted read, 20 rows, both sort keys",
+              (s.get("runsSort"), "sortFallback" in s,
+               all(k in served["endpoints"][0] for k in ("size=20&", "sort=platform%2Casc&sort=_time%2Cdesc"))),
+              ("platform", False, True))
         check("stamp is end_time, as ISO UTC", (s["asset"].get("rebuiltUtc"), s["user"].get("rebuiltUtc")), (ISO0, ISO0))
         check("...carrying the pipeline run that produced it", s["asset"].get("dagRunId"), "d1")
         check("a Warning merge is a rebuild, not a failure", "lastRebuildFailed" in s["asset"], False)
 
         # --- found deeper: pages until both are seen ---------------------------------------------
-        serve([filler(4, T0 + 90), filler(4, T0 + 80), [run(ASSET, T0), run(USER, T0)]])
+        time_pages = [filler(4, T0 + 90), filler(4, T0 + 80), [run(ASSET, T0), run(USER, T0)]]
+        serve(time_pages)
         s = m.ldg_rebuild()
-        check("mergers on page 2 are found on page 2", (s["apiCalls"], s["asset"].get("rebuiltUtc")), (3, ISO0))
+        check("mergers three time-sorted pages deep: one platform-sorted call",
+              (s["apiCalls"], s["asset"].get("rebuiltUtc"), s["runsSort"]), (1, ISO0, "platform"))
+        serve(time_pages, sort="error")
+        s = m.ldg_rebuild()
+        check("a refused sort falls back: mergers on time page 2 are found on page 2",
+              (s["apiCalls"], s["asset"].get("rebuiltUtc"), s["runsSort"]), (3, ISO0, "time"))
+        check("...saying why the cheap read wasn't used", "failed" in s.get("sortFallback", ""), True)
 
         # --- missing within the cap: unknown with a reason, never a timestamp -------------------
         pages = [filler(4, T0 + 900 - 10 * i) for i in range(10)]
         pages[0] = pages[0] + [run(ASSET, T0)]
         serve(pages)
         s = m.ldg_rebuild()
-        check("a merger absent from the newest pages stops at the cap",
-              s["apiCalls"], m.LDG_REBUILD_MAX_PAGES)
+        check("a merger absent from the newest pages stops at the cap (after the sorted read hands over)",
+              s["apiCalls"], 1 + m.LDG_REBUILD_MAX_PAGES)
+        check("...the sorted read never decides an unknown: it names the table it couldn't stamp",
+              (s["runsSort"], "no good run for user" in s.get("sortFallback", "")), ("time", True))
         check("...its table is unknown, with a reason", ("unknown" in s["user"], "rebuiltUtc" in s["user"]), (True, False))
         check("...naming the merger it looked for", USER in s["user"]["unknown"], True)
         check("...while the table that WAS found keeps its stamp", s["asset"].get("rebuiltUtc"), ISO0)
@@ -5575,13 +5607,14 @@ def test_data_currency(m):
             pages = [[run(ASSET, T0 + DAY, status, dag="bad"), run(USER, T0 + DAY, dag="good-u")] + filler(3, T0 + DAY)]
             pages += [filler(4, T0 + DAY - 100 * i) for i in range(1, 4)]
             pages += [[run(ASSET, T0, "Success", dag="good-a")]]
-            serve(pages)
-            s = m.ldg_rebuild()
-            check("newest asset merge %r: stamps the earlier good run" % status,
-                  s["asset"].get("rebuiltUtc"), ISO0)
-            check("...flags the failed one with its status %r" % status,
-                  (s["asset"].get("lastRebuildFailed") or {}).get("status"), status)
-            check("...having paged back to find it (%r)" % status, s["apiCalls"], 5)
+            for mode, calls in (("honour", 1), ("error", 5)):
+                serve(pages, sort=mode)
+                s = m.ldg_rebuild()
+                check("newest asset merge %r (%s): stamps the earlier good run" % (status, mode),
+                      s["asset"].get("rebuiltUtc"), ISO0)
+                check("...flags the failed one with its status %r (%s)" % (status, mode),
+                      (s["asset"].get("lastRebuildFailed") or {}).get("status"), status)
+                check("...in %d call(s) (%r, %s)" % (calls, status, mode), s["apiCalls"], calls)
         check("a Warning newest run stamps itself",
               (s["user"].get("rebuiltUtc"), "lastRebuildFailed" in s["user"]),
               (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + DAY)), False))
@@ -5592,7 +5625,7 @@ def test_data_currency(m):
         serve(pages)
         s = m.ldg_rebuild()
         check("a failed newest run with no earlier success stops at the backstop",
-              s["apiCalls"], m.LDG_REBUILD_FAILED_MAX_PAGES)
+              s["apiCalls"], 1 + m.LDG_REBUILD_FAILED_MAX_PAGES)
         check("...and is unknown, saying the newest run failed",
               ("rebuiltUtc" in s["asset"], "failed" in s["asset"].get("unknown", "")), (False, True))
 
@@ -5601,7 +5634,7 @@ def test_data_currency(m):
         m.drop_rescache()
         pages = [[run(ASSET, T0 + DAY, "Error", dag="bad1"), run(USER, T0 + DAY)]]
         pages += [filler(3, T0 + DAY - 100 * i) for i in range(1, 6)] + [[run(ASSET, T0, "Success", dag="ok0")]]
-        serve(pages)
+        serve(pages, sort="error")    # the cache serves the time-sorted search, which pages back
         first = m.ldg_rebuild()
         second = m.ldg_rebuild()
         check("the backwards search runs once", first["apiCalls"] > 1, True)
@@ -5610,10 +5643,102 @@ def test_data_currency(m):
               (second["asset"].get("rebuiltUtc"), (second["asset"].get("lastRebuildFailed") or {}).get("dagRunId")),
               (ISO0, "bad1"))
         pages[0] = [run(ASSET, T0 + 2 * DAY, "Error", dag="bad2"), run(USER, T0 + 2 * DAY)]
-        serve(pages)
+        serve(pages, sort="error")
         third = m.ldg_rebuild()
         check("a NEW failed run is a new key: the search runs again", third["apiCalls"] > 1, True)
         os.environ["MERIDIAN_NO_CACHE"] = "1"
+
+        # --- the platform-sorted read is trusted only when its order checks out ---------------------
+        # Old good merges, a newer good one, and other platforms' runs in between. The right stamp is
+        # always the newest good merge (T0); each broken order must fall back and still find it.
+        mixed = [[run(ASSET, T0 - DAY * k, dag="d%d" % k), run(USER, T0 - DAY * k, dag="d%d" % k)]
+                 + filler(3, T0 - DAY * k + 500) for k in range(3)]
+        mixed[0] += [run("x", T0 + 900, "Success", platform="action")]
+        for mode, why in (("oldest", "runs came back out of time order"),
+                          ("platform-only", "'ML-ENGINE' runs came back out of time order"),
+                          ("ignore", "platforms came back out of order"), ("error", "failed")):
+            serve(mixed, sort=mode)
+            s = m.ldg_rebuild()
+            check("sort %r: not trusted, falls back to the time read" % mode,
+                  (s.get("runsSort"), why in s.get("sortFallback", "")), ("time", True))
+            check("...and still stamps the newest good merge, not an older one (%s)" % mode,
+                  (s["asset"].get("rebuiltUtc"), s["user"].get("rebuiltUtc")), (ISO0, ISO0))
+        serve(mixed)
+        s = m.ldg_rebuild()
+        check("the same runs, honestly sorted: trusted, newest good merge, one call",
+              (s.get("runsSort"), s["asset"].get("rebuiltUtc"), s["apiCalls"]), ("platform", ISO0, 1))
+
+        # Oldest first, and built to pass both order checks: one old merge's two rows (equal times),
+        # then one row each of three other platforms, ascending. Nothing on it shows a time sort was
+        # applied, so it must not answer -- trusted, it would stamp the merge a day before the latest.
+        liar = [run(ASSET, T0 - DAY, dag="old"), run(USER, T0 - DAY, dag="old")]
+        liar += [run("x", T0 - DAY + 60 * i, "Success", platform=p) for i, p in enumerate(("b", "c", "d"), 1)]
+        serve([[run(ASSET, T0, dag="new"), run(USER, T0, dag="new")] + filler(3, T0 - 10)], sort=liar)
+        s = m.ldg_rebuild()
+        check("an oldest-first page that passes both order checks: not trusted without a descending pair",
+              (s.get("runsSort"), "no sign" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")),
+              ("time", True, ISO0))
+
+        # Merger rows rising in time, with a descending pair elsewhere so the evidence rule is met, and
+        # the real newest merge off the page. Only the within-platform time check stands between this
+        # and a stamp two days old.
+        rising = [run(ASSET, T0 - 2 * DAY), run(USER, T0 - 2 * DAY), run(ASSET, T0 - DAY), run(USER, T0 - DAY)]
+        rising += [run("x", T0 + 3, "Success", platform="api"), run("x", T0 + 2, "Success", platform="api")]
+        serve([[run(ASSET, T0), run(USER, T0)] + filler(3, T0 - 10)], sort=rising)
+        s = m.ldg_rebuild()
+        check("merger runs rising in time: not trusted, and the newest merge is still the stamp",
+              ("'ML-ENGINE' runs came back out of time order" in s.get("sortFallback", ""),
+               s["asset"].get("rebuiltUtc")), (True, ISO0))
+
+        # A row with no platform sorts last; one appearing before a platform means the order is wrong.
+        serve([[{"bridge_name": "y", "_time": T0 * 1000 + 5}] + [run(ASSET, T0), run(USER, T0)]], sort="ignore")
+        s = m.ldg_rebuild()
+        check("a platform-less row ahead of the mergers: not trusted",
+              ("out of order" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")), (True, ISO0))
+
+        # A merger with no _time can't be checked against the sort, so it can't vouch for the order.
+        bare = run(ASSET, T0)
+        bare.pop("_time")
+        serve([[bare, run(USER, T0)]], sort="ignore")
+        s = m.ldg_rebuild()
+        check("a merger run with no _time: not trusted, still stamped by the time read",
+              ("no _time" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")), (True, ISO0))
+
+        # A 4-hour stack with a run of failed asset merges: the ML-ENGINE group spans sorted pages,
+        # and the sorted read pages through it to the last good one.
+        runs = [run(ASSET, T0 + 3600 * k, "Error", dag="bad%d" % k) for k in range(1, 26)]
+        runs += [run(USER, T0 + 3600 * k, dag="u%d" % k) for k in range(1, 26)]
+        runs += [run(ASSET, T0, "Success", dag="ok")] + filler(5, T0 - 10)
+        runs.sort(key=lambda r: -r["_time"])
+        serve([runs])
+        s = m.ldg_rebuild()
+        check("the ML-ENGINE group spans pages: the sorted read pages to the last good merge",
+              (s.get("runsSort"), s["asset"].get("rebuiltUtc"), s["apiCalls"],
+               (s["asset"].get("lastRebuildFailed") or {}).get("dagRunId")),
+              ("platform", ISO0, 3, "bad25"))
+
+        # --- summary --by's scope index: what makes a guaranteed miss knowable before the stamp ------
+        os.environ.pop("MERIDIAN_NO_CACHE", None)
+        m.drop_rescache()
+        sc = m._summary_scope("asset", "Risk_Level", [])
+        check("scope index: no entry is a guaranteed miss", m.rescache_scope_live("summary_by", 900, sc), False)
+        m.summary_cache_put({"complete": True, "groups": []}, "asset", "Risk_Level", [], ISO0)
+        check("...an entry for the scope, under any rebuild, may hit", m.rescache_scope_live("summary_by", 900, sc), True)
+        check("...but not for another scope",
+              m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "OS", [])), False)
+        check("...nor once it has expired", m.rescache_scope_live("summary_by", 0, sc), False)
+        check("...and it is the entry summarize_by reads under that stamp",
+              m.rescache_get("summary_by", 900, table="asset", by="Risk_Level", where=[], rebuilt=ISO0)[0],
+              {"complete": True, "groups": []})
+        m.summary_cache_put({"groups": []}, "asset", "Owner", [], ISO0)
+        check("...an unanswered coverage check is still not cached",
+              m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "Owner", [])), False)
+        m.rescache_put("summary_by", {"groups": []}, table="asset", by="OS", where=[], rebuilt=ISO0)
+        check("...an entry written before scopes existed might be the one, so it may hit",
+              m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "OS", [])), True)
+        m.drop_rescache()
+        os.environ["MERIDIAN_NO_CACHE"] = "1"
+        check("...and a disabled cache is always a guaranteed miss", m.rescache_scope_live("summary_by", 900, sc), False)
 
         # --- never raises; unconfigured makes no call ---------------------------------------------
         serve([], fail="HTTP 403: Forbidden")
@@ -5727,6 +5852,8 @@ def test_data_currency(m):
             "asof": (m.cmd_asof, NS()),
         }
         outs = {}
+        # A cache entry MIGHT answer summary --by, so it takes the serial path: stamp first, as the key.
+        m.rescache_scope_live = lambda *a_, **k: True
         for label, (fn, ns) in verbs.items():
             outs[label] = out_of(fn, ns)
             check("%s carries dataCurrency, current" % label,
@@ -5757,6 +5884,29 @@ def test_data_currency(m):
         m.summarize_by = lambda *a_, **k: {"groups": []}
         out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
         check("a computed breakdown re-reads it after", len(reads), 2)
+
+        # summary --by with nothing cached for that scope: a guaranteed miss, so the stamp is read
+        # beside the work and the entry written after, under the stamp, only if no rebuild landed.
+        m.rescache_scope_live = lambda *a_, **k: False
+        puts, seen = [], {}
+        m.summary_cache_put = lambda out, table, by, where, rebuilt: puts.append(rebuilt)
+        m.summarize_by = lambda *a_, **k: seen.update(k) or {"groups": []}
+        reads.clear()
+        o = out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+        check("no entry can answer: the breakdown runs unkeyed, bypassing the cache read",
+              (seen.get("refresh"), seen.get("rebuilt")), (True, None))
+        check("...the stamp is read beside it and re-read after", len(reads), 2)
+        check("...the answer is current", (o.get("dataCurrency") or {}).get("class"), "current")
+        check("...and cached under the stamp it was read with", puts, [ISO0])
+        moved = {"asset": dict(a, rebuiltUtc="2026-09-25T10:00:00Z"), "user": dict(u)}
+        seq = [stamp, moved]
+        m.ldg_rebuild = lambda: (reads.append(1), seq[min(len(reads) - 1, 1)])[1]
+        puts.clear()
+        reads.clear()
+        o = out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+        check("a rebuild during it: flagged, and NOT cached",
+              ((o.get("dataCurrency") or {}).get("rebuildDuringQuery"), puts), (True, []))
+        m.ldg_rebuild = lambda: reads.append(1) or stamp
 
         # Every top-level verb is classified, so a new one fails here until someone decides.
         src = open(MERIDIAN_PY, encoding="utf-8").read()
@@ -5796,6 +5946,17 @@ def test_live_currency(m):
           ("current", ["asset", "user"]))
     iso = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$"
     check("...as ISO UTC", all(re.match(iso, v or "") for v in (cur.get("ldgRebuiltUtc") or {}).values()), True)
+
+    # The platform-sorted read against the time-sorted one, on the real stack. Falling back is correct
+    # behaviour, so a failure of the first check is not a wrong answer -- it means the cheap read has
+    # stopped being used here (see `sortFallback`), which is worth knowing before a release, not after.
+    fast = m.ldg_rebuild()
+    slow = m._ldg_stamp(m._ldg_scan(False))
+    check("the platform-sorted stamp read is used on this stack",
+          (fast.get("runsSort"), fast.get("sortFallback")), ("platform", None))
+    check("...and stamps exactly what the time-sorted read does",
+          [(fast.get(t) or {}).get("rebuiltUtc") for t, _ in m.LDG_MERGERS],
+          [(slow.get(t) or {}).get("rebuiltUtc") for t, _ in m.LDG_MERGERS])
 
     rows = []
     for p in range(m.LDG_REBUILD_MAX_PAGES):
@@ -7944,6 +8105,7 @@ def test_hr_sources(m):
         return list(state["profiles"]), {secret}
 
     def fake_summary(brief=True, refresh=False, **k):
+        state["summaryProfiles"] = k.get("fetched_profiles")
         return {"connectors": [{"connector": p["connector"], "profile": p["profile"],
                                 "health": state["health"],
                                 "lastIngest": {"status": "Error", "records": 0}}
@@ -8013,6 +8175,29 @@ def test_hr_sources(m):
               ["Dayforce_Department_SmartLabel", "Workday_Status_SmartLabel",
                "alias_dayforce_employee_displayName"])
         check("no credential value reaches the output", secret in json.dumps(r), False)
+        check("the profiles hr read are handed to the connector summary, not fetched twice",
+              state.get("summaryProfiles"), (state["profiles"], {secret}))
+
+        # ...and summarize_connectors, given them, really doesn't read the profile endpoint.
+        reads = []
+        runs_empty = lambda: ({}, [], [], False)          # noqa: E731
+        m._fetch_connector_profiles = lambda: reads.append(1) or ([], set())
+        real_runs, m._fetch_connector_runs = m._fetch_connector_runs, runs_empty
+        prior_nc, os.environ["MERIDIAN_NO_CACHE"] = os.environ.get("MERIDIAN_NO_CACHE"), "1"
+        try:
+            got = real["summarize_connectors"](brief=False, refresh=True,
+                                               fetched_profiles=([], {secret}))
+            check("... summarize_connectors uses the given profiles and makes no profile read",
+                  (reads, got["fetched"].get("profiles")), ([], "ok"))
+            real["summarize_connectors"](brief=False, refresh=True)
+            check("... and without them still reads the endpoint itself", reads, [1])
+        finally:
+            m._fetch_connector_runs = real_runs
+            m._fetch_connector_profiles = fake_profiles
+            if prior_nc is None:
+                os.environ.pop("MERIDIAN_NO_CACHE", None)
+            else:
+                os.environ["MERIDIAN_NO_CACHE"] = prior_nc
         state["health"] = "failing"
         r = m.hr_sources()
         check("data from a failing connector is flagged as possibly stale", "may be stale" in r["summary"], True)

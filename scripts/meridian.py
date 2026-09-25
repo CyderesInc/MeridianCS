@@ -492,14 +492,21 @@ def rescache_get(kind, ttl, **parts):
     return None, None
 
 
-def rescache_put(kind, value, **parts):
-    """Store an aggregate. Best-effort: a cache write must never fail a query."""
+def rescache_put(kind, value, scope=None, **parts):
+    """Store an aggregate. Best-effort: a cache write must never fail a query.
+
+    `scope` is an optional second key naming what the entry answers WITHOUT the parts that version it
+    (the rebuild stamp, for summary --by), so rescache_scope_live() can tell a guaranteed miss before
+    the version is known."""
     if rescache_disabled():
         return
     try:
         data = _rescache_read() or {}
         entries = data.setdefault("entries", {})
-        entries[_rescache_key(kind, **parts)] = {"at": time.time(), "kind": kind, "value": value}
+        rec = {"at": time.time(), "kind": kind, "value": value}
+        if scope is not None:
+            rec["scope"] = scope
+        entries[_rescache_key(kind, **parts)] = rec
         if len(entries) > RESCACHE_MAX_ENTRIES:
             for k in sorted(entries, key=lambda k: entries[k].get("at") or 0)[:len(entries) - RESCACHE_MAX_ENTRIES]:
                 entries.pop(k, None)
@@ -510,6 +517,25 @@ def rescache_put(kind, value, **parts):
         _private_write(_rescache_path(), data)
     except Exception:
         pass
+
+
+def rescache_scope_live(kind, ttl, scope):
+    """Whether a live `kind` entry could answer `scope`, under any version. Never raises.
+
+    False only when it provably cannot: no live entry of that kind carries this scope. An entry with
+    no scope at all (written before scopes existed) might be the one, so it counts as a possible hit,
+    and so does an unreadable cache file -- a wrong False would skip the cache for an answer it held."""
+    if rescache_disabled():
+        return False
+    try:
+        now = time.time()
+        for rec in (_rescache_read().get("entries") or {}).values():
+            if isinstance(rec, dict) and rec.get("kind") == kind and 0 <= now - (rec.get("at") or 0) < ttl:
+                if rec.get("scope") in (None, scope):
+                    return True
+        return False
+    except Exception:
+        return True
 
 
 def drop_rescache():
@@ -541,6 +567,17 @@ def _stamp_cache(payload, age):
 # CLAUDE.md warns against: that one drops sources that last ran a month ago, whereas here only the
 # newest row of two known services is wanted, which a descending sort serves first.
 #
+# It also honours a two-key sort, `platform` ascending then `_time` descending, which puts every
+# ML-ENGINE row together, newest first. Rows carry large `event_messages`, so a 20-row page of that is
+# a small fraction of the 200-row time-sorted page (CLAUDE.md has the measurement), and the stamp is
+# read once or twice by nearly every verb. That order is not documented, so the sorted
+# read is trusted only while it VERIFIES itself (platforms never decrease; within a platform, `_time`
+# never increases) and only for a positive answer, a good run for every merger. Anything else -- an
+# error, a row out of order, a table with no good run in view -- falls back to the time-sorted read
+# below, which is unchanged and still decides every unknown. A fallback costs one small call; trusting
+# a page whose order was not checked could stamp an answer with a superseded rebuild, which is the one
+# mistake this block exists to prevent.
+#
 # The names are exact and stable by platform contract; only the timestamp changes between runs. A
 # rename must fail LOUDLY (unknown, naming what was found), never be absorbed by a looser match --
 # `--live` asserts the names so a platform rename fails the suite before it reaches a release.
@@ -556,6 +593,9 @@ LDG_REBUILD_FAILED_MAX_PAGES = 25
 # backwards from a fixed point), so it is cached keyed on the failed run itself. The key goes stale by
 # construction -- a new merger run is a new newest run -- so this TTL only bounds file growth.
 LDG_FAILED_CACHE_TTL = 90 * 86400
+LDG_SORTED_PAGE_SIZE = 20           # a daily-merging stack's whole ML-ENGINE group fits in one page
+LDG_SORTED_MAX_PAGES = 10           # 200 merger rows: 100 merges, weeks of history at a 4-hour cadence
+LDG_MERGER_PLATFORM = "ML-ENGINE"
 
 
 def _merger_end(row):
@@ -607,32 +647,105 @@ def ldg_rebuild():
     when the rebuild can't be read would make a stale answer look fresh, which is the one thing this
     exists to prevent. A failed or status-less newest run is skipped (it left the LDG unchanged) and
     reported as `lastRebuildFailed` on the run that DID rebuild it."""
-    names = {n: t for t, n in LDG_MERGERS}
     if not _config_resolvable():
         # load_config()/call() would die() -- a SystemExit, which parallel() does not contain, printed
         # beside whatever the verb itself reports -- and `connect` on an unconfigured install must stay
         # a clean, no-network `not_configured` answer.
         return {t: {"unknown": "no stack is configured"} for t, _ in LDG_MERGERS}
+    s = _ldg_scan(True)
+    fallback = s.pop("fallback", None)
+    if fallback:
+        spent = s["api_calls"]
+        s = _ldg_scan(False)
+        s["api_calls"] += spent
+        s["fallback"] = fallback
+    return _ldg_stamp(s)
+
+
+def _ldg_order_key(row):
+    """(platform, _time) as the platform sort orders them, or None for a row that can't be placed.
+    A missing platform sorts last (the search backend's default for an ascending sort)."""
+    if not isinstance(row, dict):
+        return None
+    plat = row.get("platform")
+    if plat is not None and not isinstance(plat, str):
+        return None
+    try:
+        t = float(row.get("_time"))
+    except (TypeError, ValueError):
+        t = None
+    return (plat, t)
+
+
+def _ldg_scan(platform_sorted):
+    """Page the run metrics for the newest and newest-good run of each merger. Returns the scan state;
+    with `platform_sorted`, a state carrying "fallback": <reason> means the sorted read was not used.
+
+    The sorted read is used only for a POSITIVE answer -- a good run for every merger -- on rows whose
+    order checked out: platforms never decrease, within each platform `_time` never increases, and at
+    least one same-platform pair was seen to strictly DEcrease. That last one is evidence the time sort
+    was applied at all: a server serving oldest first could otherwise hand back one old merge's two
+    rows followed by one row each of other platforms, pass both order checks, and have the oldest merge
+    stamped as current. Every other outcome (a renamed merger, a failed newest run with no good one in
+    view, no merger row at all) goes to the time-sorted read, which reaches those unknowns exactly as
+    it always did; they are rare, and a view that is newest-first but not platform-grouped can end the
+    ML-ENGINE group early and must not turn that partial view into a definitive "no"."""
+    names = {n: t for t, n in LDG_MERGERS}
     newest = {t: None for t in names.values()}   # (epoch, utc, row): newest run, any status
     good = {t: None for t in names.values()}     # (epoch, run dict): newest run that did not fail
     from_cache, checked, other = set(), set(), set()
     read = api_calls = page = 0
     err = None
+    last = None               # previous row's order key, carried across pages
+    ml_seen = group_done = descended = False
+
+    def bail(reason):
+        return {"fallback": reason, "api_calls": api_calls}
+
     while True:
+        if platform_sorted:
+            url = ("/CMDB/v2/system/metrics/connector?size=%d&page=%d&sort=platform%%2Casc&sort=_time%%2Cdesc"
+                   % (LDG_SORTED_PAGE_SIZE, page))
+        else:
+            url = ("/CMDB/v2/system/metrics/connector?size=%d&page=%d&sort=_time%%2Cdesc"
+                   % (LDG_REBUILD_PAGE_SIZE, page))
         try:
-            r = call("GET", "/CMDB/v2/system/metrics/connector?size=%d&page=%d&sort=_time%%2Cdesc"
-                     % (LDG_REBUILD_PAGE_SIZE, page), retries=0)
+            r = call("GET", url, retries=0)
         except Exception as e:  # noqa - reported as unknown with the reason, never raised
+            if platform_sorted:
+                return bail("the platform-sorted read failed (%s)" % str(e)[:200])
             err = str(e)
             break
         api_calls += 1
         content = r.get("content") if isinstance(r, dict) else None
         if not isinstance(content, list):
+            if platform_sorted:
+                return bail("the platform-sorted read returned an unexpected shape")
             err = "unexpected response shape from /CMDB/v2/system/metrics/connector"
             break
         read += len(content)
+        if platform_sorted:
+            for row in content:
+                key = _ldg_order_key(row)
+                if key is None:
+                    return bail("a row on the platform-sorted read could not be placed in the sort order")
+                if key[0] == LDG_MERGER_PLATFORM and key[1] is None:
+                    return bail("a merger run has no _time to check the sort against")
+                if last is not None:
+                    a, b = last[0], key[0]
+                    if a is None and b is not None or (a is not None and b is not None and b < a):
+                        return bail("platforms came back out of order (%r after %r)" % (b, a))
+                    if a == b and None not in (key[1], last[1]):
+                        if key[1] > last[1]:
+                            return bail("%r runs came back out of time order" % b)
+                        descended = descended or key[1] < last[1]
+                if key[0] == LDG_MERGER_PLATFORM:
+                    ml_seen = True
+                elif ml_seen:
+                    group_done = True     # past the whole ML-ENGINE group
+                last = key
         for row in content:
-            if not isinstance(row, dict) or row.get("platform") != "ML-ENGINE":
+            if not isinstance(row, dict) or row.get("platform") != LDG_MERGER_PLATFORM:
                 continue
             t = names.get(row.get("bridge_name"))
             if t is None:
@@ -658,10 +771,31 @@ def ldg_rebuild():
         page += 1
         need = [t for t in names.values() if good[t] is None]
         total_pages = r.get("totalPages")
-        if not need or not content or (isinstance(total_pages, int) and page >= total_pages):
+        end = not content or (isinstance(total_pages, int) and page >= total_pages)
+        if platform_sorted:
+            if not need:
+                if not descended:
+                    return bail("the platform-sorted read showed no sign its time order was applied")
+                break
+            if group_done or end:
+                return bail("the platform-sorted read held no good run for %s" % ", ".join(need) if ml_seen
+                            else "no merger run in the platform-sorted read")
+            if page >= (LDG_SORTED_MAX_PAGES if ml_seen else LDG_REBUILD_MAX_PAGES):
+                return bail("the platform-sorted read found no good run for %s in %d pages"
+                            % (", ".join(need), page))
+            continue
+        if not need or end:
             break
         if page >= max(LDG_REBUILD_FAILED_MAX_PAGES if newest[t] else LDG_REBUILD_MAX_PAGES for t in need):
             break
+    return {"newest": newest, "good": good, "from_cache": from_cache, "other": other, "read": read,
+            "api_calls": api_calls, "err": err, "sorted": platform_sorted}
+
+
+def _ldg_stamp(s):
+    """ldg_rebuild()'s result from a finished scan."""
+    newest, good, from_cache, other = s["newest"], s["good"], s["from_cache"], s["other"]
+    read, err = s["read"], s["err"]
     out = {}
     for t, name in LDG_MERGERS:
         if good[t] is not None:
@@ -688,7 +822,12 @@ def ldg_rebuild():
                                  % (name, read, ", ".join(repr(o) for o in sorted(other)))}
         else:
             out[t] = {"unknown": "no %r run in the newest %d runs" % (name, read)}
-    out["runsRead"], out["apiCalls"] = read, api_calls
+    out["runsRead"], out["apiCalls"] = read, s["api_calls"]
+    # Which read produced this stamp. `sortFallback` says why the cheap one wasn't trusted, so a stack
+    # that silently stopped honouring the sort shows up as a reason rather than as a slower command.
+    out["runsSort"] = "platform" if s["sorted"] else "time"
+    if s.get("fallback"):
+        out["sortFallback"] = s["fallback"]
     if other:
         out["unexpectedMergers"] = sorted(other)
     return out
@@ -768,6 +907,14 @@ def attach_currency(payload, currency, sections=None):
     return payload
 
 
+def _stamp_or_unknown(stamp):
+    """A stamp read that came back from parallel() as an exception, as the unknown it means."""
+    if isinstance(stamp, Exception):
+        return {t: {"unknown": "could not read Meridian's merger runs (%s)" % str(stamp)[:200]}
+                for t, _ in LDG_MERGERS}
+    return stamp if isinstance(stamp, dict) else {}
+
+
 def with_currency(tables, fn, straddle=False, sections=None):
     """Run `fn()` (a verb's returning half) beside a rebuild-stamp read, and stamp its result.
 
@@ -777,9 +924,7 @@ def with_currency(tables, fn, straddle=False, sections=None):
     before, out = parallel([ldg_rebuild, fn])
     if isinstance(out, Exception):
         raise out
-    if isinstance(before, Exception):
-        before = {t: {"unknown": "could not read Meridian's merger runs (%s)" % str(before)[:200]}
-                  for t, _ in LDG_MERGERS}
+    before = _stamp_or_unknown(before)
     after = ldg_rebuild() if straddle and isinstance(out, dict) and not out.get("error") else None
     return attach_currency(out, data_currency(before, tables, after), sections)
 
@@ -2223,13 +2368,27 @@ def cmd_summary(a):
         jout(with_currency(["asset", "user"], stack_metrics, sections=METRICS_HISTORICAL_SECTIONS)); return
     if not a.by:
         die("Provide --by <field> or --metrics.")
-    # Sequential, not with_currency(): the stamp is part of the cache key, so it has to be known
-    # before the cache can be asked. A cache hit made no calls, so there is nothing to straddle.
     t = _table_kind(a.table)
-    before = ldg_rebuild()
-    out = summarize_by(a.table, a.by, a.where, refresh=getattr(a, "refresh", False),
-                       rebuilt=(before.get(t) or {}).get("rebuiltUtc"))
-    after = None if out.get("fromCache") else ldg_rebuild()
+    refresh = getattr(a, "refresh", False)
+    if refresh or not rescache_scope_live("summary_by", RESCACHE_TTL, _summary_scope(a.table, a.by, a.where)):
+        # Nothing cached can answer this under ANY rebuild, so the stamp isn't needed before the work
+        # (it only keys the cache read) and is read beside it, as with_currency() does. The entry is
+        # written afterwards, and only when the re-read shows no rebuild landed: an answer flagged
+        # rebuildDuringQuery must not be served from cache as though it were clean.
+        before, out = parallel([ldg_rebuild, lambda: summarize_by(a.table, a.by, a.where, refresh=True)])
+        if isinstance(out, Exception):
+            raise out
+        before = _stamp_or_unknown(before)
+        after = ldg_rebuild()
+        rebuilt = (before.get(t) or {}).get("rebuiltUtc")
+        if rebuilt and (after.get(t) or {}).get("rebuiltUtc") == rebuilt:
+            summary_cache_put(out, a.table, a.by, a.where, rebuilt)
+    else:
+        # Sequential: the stamp is part of the cache key, so it has to be known before the cache can
+        # be asked. A cache hit made no calls, so there is nothing to straddle.
+        before = ldg_rebuild()
+        out = summarize_by(a.table, a.by, a.where, rebuilt=(before.get(t) or {}).get("rebuiltUtc"))
+        after = None if out.get("fromCache") else ldg_rebuild()
     emit(attach_currency(out, data_currency(before, [t], after)),
          "groups", getattr(a, "format", None), getattr(a, "out", None))
 
@@ -2511,12 +2670,24 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
                 "Records matching the query with no value for %r could not be counted on this run, "
                 "so some may be missing from every group below." % a.by
                 + (" " + out["note"] if out.get("note") else ""))
-    # `complete` present means the coverage question was answered, either way. Absent means the check
-    # itself could not run, and caching that would fix an unanswered question in place for the TTL.
-    # An unknown without-field count is the same kind of unanswered question.
-    if "complete" in out and rebuilt and not out.get("whereTotalUnavailable"):
-        rescache_put("summary_by", out, **ck)
+    summary_cache_put(out, table, by, where, rebuilt)
     return out
+
+
+def _summary_scope(table, by, where):
+    """What a summary --by entry answers, without the rebuild that versions it."""
+    return _rescache_key("summary_by_scope", table=table, by=by, where=sorted(where or []))
+
+
+def summary_cache_put(out, table, by, where, rebuilt):
+    """Cache a breakdown under its rebuild stamp -- if it answered its own coverage question.
+
+    `complete` present means the coverage question was answered, either way. Absent means the check
+    itself could not run, and caching that would fix an unanswered question in place for the TTL. An
+    unknown without-field count is the same kind of unanswered question. No stamp, no cache."""
+    if "complete" in out and rebuilt and not out.get("whereTotalUnavailable"):
+        rescache_put("summary_by", out, scope=_summary_scope(table, by, where),
+                     table=table, by=by, where=sorted(where or []), rebuilt=rebuilt)
 
 
 def build_digest(table="asset", by=None, field="Risk_Score", top=5, refresh=False):
@@ -2542,17 +2713,24 @@ def build_digest(table="asset", by=None, field="Risk_Score", top=5, refresh=Fals
     `fromCache`/`cacheAgeSeconds` and read by someone who can see the age.
     """
     by = by or "Risk_Level"
-    # Read first: the breakdown's cache is keyed on it. Re-read last: a digest is ~20 calls across
-    # five sections, and one assembled across a merge would mix two LDGs in one document.
-    before = ldg_rebuild()
+    # The stamp is read ahead of the breakdown, whose cache is keyed on it, but inside the batch, so
+    # the other four sections don't wait for it -- the same overlap with_currency() makes. Re-read
+    # last: a digest is ~20 calls across five sections, and one assembled across a merge would mix two
+    # LDGs in one document.
+    stamp = {}
+
+    def breakdown_section():
+        stamp["before"] = ldg_rebuild()
+        return summarize_by(table, by, refresh=refresh,
+                            rebuilt=(stamp["before"].get(_table_kind(table)) or {}).get("rebuiltUtc"))
     parts = parallel([
         lambda: stack_metrics(),
         lambda: summarize_connectors(refresh=refresh),
-        lambda: summarize_by(table, by, refresh=refresh,
-                             rebuilt=(before.get(_table_kind(table)) or {}).get("rebuiltUtc")),
+        breakdown_section,
         lambda: top_n("user", field, top),
         lambda: top_n("asset", field, top),
     ])
+    before = _stamp_or_unknown(stamp.get("before", RuntimeError("the stamp read did not run")))
     metrics, connectors, breakdown, topusers, topassets = parts
     out = {"generated": "digest", "stack": load_config()[0], "table": table,
            "rankedBy": field, "topN": top}
@@ -3302,8 +3480,11 @@ def cmd_metrics(a):
     if a.derived:
         # A derived metric is registered in answer to a question that could not be answered, so the
         # answer needs today's value to offer as a baseline.
-        out["baseline"] = measure_metric(rec)
-        out = attach_currency(out, data_currency(ldg_rebuild(), [_table_kind(rec.get("table"))]))
+        baseline, stamp = parallel([lambda: measure_metric(rec), ldg_rebuild])
+        if isinstance(baseline, Exception):
+            raise baseline
+        out["baseline"] = baseline
+        out = attach_currency(out, data_currency(_stamp_or_unknown(stamp), [_table_kind(rec.get("table"))]))
     jout(out)
 
 
@@ -4202,7 +4383,11 @@ def cmd_trend(a):
         resolve_not_tracked(out, a.metric, label=a.derive_label, table=a.table or a.derive_table,
                             where=a.derive_where, smart_label=a.derive_smart_label)
     if getattr(a, "name_entities", False) and out.get("entities"):
-        name_entities(out["entities"])
+        # The stamp is read beside the lookups rather than after them. When no name comes back it goes
+        # unused, which costs one small call; waiting to find out would cost its full latency every time.
+        named, stamp = parallel([lambda: name_entities(out["entities"]), ldg_rebuild])
+        if isinstance(named, Exception):
+            raise named
         if out["entities"].get("names") is not None:
             # The deltas are historical; the names were looked up live just now. A mixed payload, so
             # the live part is labelled -- with a real stamp, not a bare "current".
@@ -4211,7 +4396,7 @@ def cmd_trend(a):
             except Exception:  # noqa - labelling must never fail the verb
                 spec = None
             tables = [_table_kind(spec["table"])] if spec else ["asset", "user"]
-            live = data_currency(ldg_rebuild(), tables)
+            live = data_currency(_stamp_or_unknown(stamp), tables)
             live["source"] = "names looked up live; the deltas themselves are from local snapshots"
             out["dataCurrency"] = dict(out["dataCurrency"], sections={"entities.names": live})
     out["stack"] = load_config()[0]
@@ -7339,7 +7524,7 @@ def _group_failures(rows):
 
 
 def summarize_connectors(max_failures=12, max_other=15, brief=True, max_warnings=12, max_detail=10,
-                         refresh=False):
+                         refresh=False, fetched_profiles=None):
     """Data-coverage summary: which connectors are enabled, whether they're succeeding, and how much
     data each last brought in. Degrades a half at a time - a token that can only read one of the two
     endpoints still gets the other.
@@ -7357,6 +7542,10 @@ def summarize_connectors(max_failures=12, max_other=15, brief=True, max_warnings
     instead of "ok", and storing that would let one transient 403 report a connector-less stack for a
     whole hour -- the same trap `_LABELS_PROVISIONAL` exists for, where an unreadable half is
     indistinguishable from an empty one.
+
+    `fetched_profiles` is a `_fetch_connector_profiles()` result -- (profiles, secrets) -- that the caller
+    already holds (`hr` reads it to find the HR connectors), so a cache miss doesn't read the profile
+    endpoint a second time. The secrets travel with it because the run messages are scrubbed of them.
     """
     ck = {"max_failures": max_failures, "max_other": max_other}
     cached, age = (None, None) if refresh else rescache_get("connectors", RESCACHE_CONNECTOR_TTL, **ck)
@@ -7366,7 +7555,8 @@ def summarize_connectors(max_failures=12, max_other=15, brief=True, max_warnings
     result = {"fetched": {}}
     profiles, runs, actions, pipeline, runs_truncated = [], {}, [], [], False
     # Two independent endpoints, ~0.6s each against a remote stack - fetch them at the same time.
-    pr, rn = parallel([_fetch_connector_profiles, _fetch_connector_runs])
+    fetch_profiles = (lambda: fetched_profiles) if fetched_profiles is not None else _fetch_connector_profiles
+    pr, rn = parallel([fetch_profiles, _fetch_connector_runs])
     secrets = set()
     if isinstance(pr, Exception):
         result["fetched"]["profiles"] = _short(str(pr), 160)
@@ -7832,8 +8022,10 @@ def hr_sources(refresh=False):
     """
     result = {"recognized": sorted(HR_BRIDGES.values()), "fetched": {}}
     try:
-        profiles, secrets = _fetch_connector_profiles()
-        del secrets     # credential values: nothing here needs them, and nothing may carry them out
+        # The credential values ride along only to summarize_connectors, which scrubs run messages of
+        # them; nothing in this function reads them, and `fetched_profiles` is dropped once it's done.
+        fetched_profiles = _fetch_connector_profiles()
+        profiles = fetched_profiles[0]
         result["fetched"]["profiles"] = "ok"
     except Exception as e:
         result["fetched"]["profiles"] = _short(str(e), 160)
@@ -7845,13 +8037,22 @@ def hr_sources(refresh=False):
     hr = [p for p in profiles
           if p.get("bridge") in HR_BRIDGES or (p.get("connector") or "").lower() in by_name]
     health = {}
-    if hr:
+
+    def health_then_fields():
+        # Neither needs the counts, so both run beside them. They stay in sequence with each other: a
+        # changed field set drops the result cache, and summarize_connectors writes to that same file,
+        # so run concurrently the drop could land between its read and its write and be undone.
+        #
+        # An HR connector's own fields appear when it is enabled, i.e. after a field cache was likely
+        # written -- and a stale list here would hide exactly the fields this verb exists to point at.
         try:
-            health = {(r.get("connector"), r.get("profile")): r
-                      for r in summarize_connectors(brief=False, refresh=refresh).get("connectors", [])}
+            health.update({(r.get("connector"), r.get("profile")): r
+                           for r in summarize_connectors(brief=False, refresh=refresh,
+                                                         fetched_profiles=fetched_profiles).get("connectors", [])})
             result["fetched"]["health"] = "ok"
         except Exception as e:
             result["fetched"]["health"] = _short(str(e), 160)
+        _refetch_field_map("user")
 
     systems, sts = [], []
     for p in hr:
@@ -7861,11 +8062,6 @@ def hr_sources(refresh=False):
                "profile": p.get("profile"), "bridge": p.get("bridge"),
                "servicesEnabled": len(enabled), "servicesDisabled": len(p.get("services") or []) - len(enabled),
                "sourcetypes": [{"sourcetype": s} for s in enabled]}
-        h = health.get((p.get("connector"), p.get("profile")))
-        if h:
-            row["health"] = h.get("health")
-            if h.get("lastIngest"):
-                row["lastIngest"] = h["lastIngest"]
         systems.append(row)
         sts += [s for s in enabled if s not in sts]
 
@@ -7878,7 +8074,18 @@ def hr_sources(refresh=False):
     tasks = [(lambda s=s: count([[match(s)]])) for s in sts]
     if len(sts) > 1:
         tasks.append(lambda: count([[match(s) for s in sts]]))
-    got = parallel(tasks) if tasks else []
+    side = [health_then_fields] if hr else []
+    got = parallel(tasks + side) if tasks or side else []
+    fetched_profiles = None     # the credential values: nothing past this point may reach them
+    if side and isinstance(got[-1], Exception):
+        raise got[-1]      # only a bug gets here: health failures are caught inside
+    got = got[:len(tasks)]
+    for p, row in zip(hr, systems):
+        h = health.get((p.get("connector"), p.get("profile")))
+        if h:
+            row["health"] = h.get("health")
+            if h.get("lastIngest"):
+                row["lastIngest"] = h["lastIngest"]
     per = dict(zip(sts, got[:len(sts)]))
     for row in systems:
         for st in row["sourcetypes"]:
@@ -7914,11 +8121,6 @@ def hr_sources(refresh=False):
         summary = ("%s is configured but no user records carry its data -- the connector is not "
                    "delivering. See each system's health and lastIngest for why." % names)
     result.update(state=state, summary=summary, systems=systems, hrSourcetypes=sts, where=_hr_where(sts))
-
-    # An HR connector's own fields appear when it is enabled, i.e. after a field cache was likely
-    # written -- and a stale list here would hide exactly the fields this verb exists to point at.
-    if hr:
-        _refetch_field_map("user")
     m = load_field_map("user")
     result["hrFields"] = _hr_field_names(m, sts) if m else None
     if not m:

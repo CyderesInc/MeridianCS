@@ -3,6 +3,13 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.27.4 - 2026-09-25
+
+- **Answers get their data-currency stamp faster.** Checking when Meridian last rebuilt now
+  downloads a sixteenth as much and overlaps other work, so a digest or breakdown finishes a
+  second or two sooner.
+- **"Do we have HR data?" makes one fewer request** when connector details aren't cached.
+
 ## 2.27.3 - 2026-09-25
 
 - **"Top" questions and counts are faster on stacks with large records.** A count no longer
