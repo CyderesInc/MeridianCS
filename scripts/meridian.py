@@ -1118,12 +1118,137 @@ def _ssl_context():
     """
     insecure = insecure_tls()
     if insecure not in _SSL_CTX:
-        ctx = ssl.create_default_context()
         if insecure:
+            ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+        else:
+            ctx = verifying_context()
         _SSL_CTX[insecure] = ctx
     return _SSL_CTX[insecure]
+
+
+# ---- Trust anchors beyond Python's own ---------------------------------------------------------
+# Python verifies against its OWN trust store, never the operating system's: certifi or Homebrew's
+# OpenSSL bundle on macOS. A TLS-inspecting proxy (Zscaler and the like) re-signs every connection
+# with a root an administrator installed in the macOS System keychain, which gh and curl read and
+# Python does not. So on such a Mac every call here failed CERTIFICATE_VERIFY_FAILED while the same
+# URLs worked in a shell, and self-update, silent on `unknown` by design, never said why. Found on a
+# Zscaler-managed Mac left behind on 2.28.2 (2026-09-30).
+#
+# So every VERIFYING context gets extra anchors -- never fewer checks:
+#   * macOS: every certificate in the system roots keychain and the System keychain, exported by
+#     /usr/bin/security. The absolute path is deliberate: a PATH entry must not choose what we
+#     trust. The System keychain needs admin rights to change; the login keychain, which any process
+#     of the user's can write, is deliberately NOT read. Trust *settings* are not consulted, so a
+#     certificate an admin put there and then marked "Never Trust" would still be trusted here --
+#     the accepted cost of staying stdlib-only. MERIDIAN_NO_KEYCHAIN=1 turns the read off.
+#   * any OS: MERIDIAN_CA_BUNDLE (or "ca_bundle" in config.json), a PEM file of extra roots. A set
+#     but unusable bundle is an error, never ignored: a trust setting that silently does nothing is
+#     how a user ends up switching verification off instead.
+# Neither can make a connection LESS verified, and neither touches insecure_tls. Self-update uses the
+# same anchors: a package's signature is checked before it is opened, so an extra anchor can at
+# worst withhold an update, never install one.
+MACOS_SECURITY = "/usr/bin/security"
+MACOS_KEYCHAINS = ("/System/Library/Keychains/SystemRootCertificates.keychain",
+                   "/Library/Keychains/System.keychain")
+_PEM_CERT_RE = re.compile(r"-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----")
+_EXTRA_TRUST = None     # (certificates, report), built once per process -- see extra_trust()
+# The prefixes classify_connect_error() maps to `tls_untrusted`. Both are raised by this file.
+TLS_VERIFY_FAILED = "TLS certificate verification failed"
+TLS_BUNDLE_PROBLEM = "TLS CA bundle problem"
+
+
+def _env_on(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def ca_bundle_path():
+    """The configured extra-roots PEM file, or None: MERIDIAN_CA_BUNDLE, then "ca_bundle" in
+    config.json -- the same precedence as insecure_tls, read straight off disk for the same reason
+    as autoupdate_disabled(): the update check has to work before any stack is configured."""
+    p = os.environ.get("MERIDIAN_CA_BUNDLE", "").strip()
+    if not p:
+        try:
+            with open(CFG_PATH, encoding="utf-8-sig") as f:
+                p = str(json.load(f).get("ca_bundle") or "").strip()
+        except Exception:  # noqa - a missing or unreadable config names no bundle
+            p = ""
+    return os.path.expanduser(p) if p else None
+
+
+def _keychain_pems():
+    """(PEM certificates from the macOS system keychains, None) or (None, why they can't be read).
+    subprocess is imported here: only macOS pays for it, once per process."""
+    import subprocess
+    try:
+        r = subprocess.run([MACOS_SECURITY, "find-certificate", "-a", "-p", *MACOS_KEYCHAINS],
+                           capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "could not run %s: %s" % (MACOS_SECURITY, e)
+    # Parsed whatever the exit code: `security` exits non-zero if ONE keychain is missing, and still
+    # prints the other's certificates.
+    certs = _PEM_CERT_RE.findall(r.stdout.decode("ascii", "replace"))
+    if not certs:
+        return None, "%s printed no certificates (exit %s)" % (MACOS_SECURITY, r.returncode)
+    return certs, None
+
+
+def extra_trust():
+    """(PEM certificates to trust on top of Python's defaults, report). Cached per process.
+
+    Raises ValueError, prefixed TLS_BUNDLE_PROBLEM, when MERIDIAN_CA_BUNDLE / ca_bundle names a file
+    that can't be read or holds no certificate. The report is what `connect` shows as `tlsTrust`.
+    """
+    global _EXTRA_TRUST
+    if _EXTRA_TRUST is not None:
+        return _EXTRA_TRUST
+    certs, report = [], {}
+    if sys.platform == "darwin" and not _env_on("MERIDIAN_NO_KEYCHAIN"):
+        found, why = _keychain_pems()
+        report["macosKeychain"] = len(found) if found else "unavailable: %s" % why
+        certs += found or []
+    bundle = ca_bundle_path()
+    if bundle:
+        try:
+            with open(bundle, encoding="ascii", errors="replace") as f:
+                found = _PEM_CERT_RE.findall(f.read())
+        except OSError as e:
+            raise ValueError("%s: %s (MERIDIAN_CA_BUNDLE / ca_bundle) can't be read: %s"
+                             % (TLS_BUNDLE_PROBLEM, bundle, e))
+        if not found:
+            raise ValueError("%s: %s (MERIDIAN_CA_BUNDLE / ca_bundle) holds no PEM certificate"
+                             % (TLS_BUNDLE_PROBLEM, bundle))
+        report["caBundle"] = {"path": bundle, "certificates": len(found)}
+        certs += found
+    _EXTRA_TRUST = (certs, report)
+    return _EXTRA_TRUST
+
+
+def verifying_context():
+    """A certificate-verifying TLS context: Python's defaults plus extra_trust(). Never unverified,
+    whatever insecure_tls says -- self-update, webhooks and SMTP build theirs from this, not from
+    _ssl_context(). Built per call: those paths make a handful of connections per process."""
+    ctx = ssl.create_default_context()
+    certs, report = extra_trust()
+    unloadable = 0
+    for pem in certs:
+        try:
+            ctx.load_verify_locations(cadata=pem)
+        except (ssl.SSLError, ValueError):
+            unloadable += 1     # one malformed keychain entry must not cost the rest
+    if unloadable:
+        report["unloadable"] = unloadable
+    return ctx
+
+
+def tls_trust_hint():
+    """What to do when a certificate is not trusted: the same advice for the API and self-update."""
+    where = ("This Mac's System keychain is already trusted, so the proxy's root must be somewhere "
+             "else (the login keychain, or not installed). " if sys.platform == "darwin" else "")
+    return ("Usually a TLS-inspecting proxy (Zscaler and the like) on this network. %sExport the "
+            "proxy's root certificate to a PEM file and set MERIDIAN_CA_BUNDLE to its path -- for "
+            "Claude Code, in the \"env\" block of ~/.claude/settings.json." % where)
 
 
 def _normalize_endpoint(endpoint):
@@ -1258,12 +1383,15 @@ def call(method, endpoint, body=None, retries=1):
         except ssl.SSLCertVerificationError as e:
             # A rejected certificate is a configuration/trust problem, not a blip: retrying just
             # doubles the wait. Say what to do rather than surfacing it as a generic 'unreachable'.
+            # Proxy first: on a managed laptop an inspecting proxy is the usual cause, and the fix
+            # for it keeps verification on. insecure_tls is only for a stack's OWN certificate.
             raise RuntimeError(
-                "TLS certificate verification failed for %s: %s. If this stack presents a "
-                "self-signed or internally-issued certificate, set \"insecure_tls\": true in "
-                "%s (or MERIDIAN_INSECURE_TLS=1) -- but only if you trust the network path, "
-                "since the API token is sent over this connection."
-                % (fqdn, getattr(e, "verify_message", None) or e, CFG_PATH))
+                "%s for %s: %s. %s Only if the stack itself presents a self-signed or "
+                "internally-issued certificate, set \"insecure_tls\": true in %s (or "
+                "MERIDIAN_INSECURE_TLS=1) -- and only if you trust the network path, since the API "
+                "token is sent over this connection."
+                % (TLS_VERIFY_FAILED, fqdn, getattr(e, "verify_message", None) or e,
+                   tls_trust_hint(), CFG_PATH))
         except Exception as e:  # noqa - transport failure; retry per `retries`
             last_err = str(e)
             time.sleep(2)
@@ -5137,7 +5265,7 @@ def _post_webhook(url, payload, timeout=10):
     Deliberately NOT `call()`: no Authorization header, no pooled connection keyed to the Meridian
     fqdn, no same-host-only redirect handling -- none of that machinery belongs anywhere near a
     third-party webhook, and reusing it would risk the Meridian bearer token reaching whoever controls
-    the URL. TLS uses the platform default verifying context; there is no insecure-mode escape hatch
+    the URL. TLS uses verifying_context() (Python's roots plus extra_trust()); there is no insecure-mode escape hatch
     the way there is for the Meridian connection, because there is no reason a chat webhook would need
     one. `urllib.request` is imported here, not at module level -- the top of this file deliberately
     avoids it (see the import-time comment there) so every other verb keeps paying zero cost for it.
@@ -5151,7 +5279,7 @@ def _post_webhook(url, payload, timeout=10):
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=verifying_context()) as resp:
         return resp.status, resp.read().decode("utf-8", "replace")
 
 
@@ -5179,7 +5307,7 @@ def _send_email(cfg, subject, text_body, html_body, timeout=15):
                          "for an unauthenticated relay; unset _SMTP_USER/_SMTP_PASS or enable STARTTLS")
     with client(cfg["host"], cfg["port"], timeout=timeout) as s:
         if cfg.get("starttls", True):
-            s.starttls(context=ssl.create_default_context())
+            s.starttls(context=verifying_context())
         if cfg.get("user"):
             s.login(cfg["user"], cfg.get("password") or "")
         s.send_message(msg)
@@ -8141,6 +8269,10 @@ def classify_connect_error(err_str):
     these bodies carry error sub-codes (`"code":403001`) that would classify a 500 as FORBIDDEN.
     Falls back to an unanchored search so a wrapped or prefixed message still classifies rather than
     reading as `unreachable`, but the anchored match wins."""
+    # Before the HTTP match: a trust failure happens before any status exists, and it used to fall
+    # through to `unreachable`, whose advice (re-enter the FQDN) cannot fix it.
+    if (err_str or "").startswith((TLS_VERIFY_FAILED, TLS_BUNDLE_PROBLEM)):
+        return "tls_untrusted", None
     m = re.match(r"HTTP (\d{3}):", err_str or "") or re.search(r"\bHTTP (\d{3})\b", err_str or "")
     status = int(m.group(1)) if m else None
     state = ("auth_error" if status == 401 else "forbidden" if status == 403
@@ -8183,6 +8315,13 @@ def diagnose_connection():
             # Reported on every connect: an opt-out set once in config would otherwise apply to
             # every later session silently, which is exactly how an insecure posture becomes default.
             "tlsVerified": not insecure_tls()}
+    try:
+        trust = extra_trust()[1]
+    except ValueError:
+        trust = None            # call() below raises the same error, as state tls_untrusted
+    if trust:
+        # Anchors beyond Python's own are a posture too, so they are shown, like tlsVerified.
+        base["tlsTrust"] = trust
     if insecure_tls():
         base["tlsWarning"] = ("Certificate verification is DISABLED for this stack (insecure_tls). "
                               "The API token is sent over an unverified connection - only keep this "
@@ -8198,10 +8337,12 @@ def diagnose_connection():
     msgs = {"auth_error": "Reached %s but the token was rejected (HTTP 401)." % fqdn,
             "forbidden": "Reached %s but this token is forbidden (HTTP 403)." % fqdn,
             "unreachable": "Couldn't reach %s (DNS/TLS/network error)." % fqdn,
+            "tls_untrusted": "Reached %s, but Python doesn't trust the certificate it was shown." % fqdn,
             "http_error": "Reached %s but got HTTP %s." % (fqdn, status)}
     hints = {"auth_error": "Token expired/mistyped, account missing the Api_Users role, or an SSO account (SSO cannot use the API). Re-prompt for a fresh User Generated token.",
              "forbidden": "Usually a scoped/Limited token or a missing role. Try a full User Generated token.",
              "unreachable": "Check the FQDN is exact (no https://, no path) and the stack is reachable from this network. Re-prompt for the FQDN.",
+             "tls_untrusted": tls_trust_hint(),
              "http_error": "Inspect `detail` for the API error body."}
     base.update({"state": state, "httpStatus": status, "message": msgs[state], "hint": hints[state], "detail": s[:300]})
     return base
@@ -8394,7 +8535,8 @@ def cmd_check(a):
             # searched the whole string, so a 500 whose JSON body carried an error sub-code like
             # "code":403001 was misreported as FORBIDDEN -- blaming the token for a server fault.
             state, code = classify_connect_error(str(out))
-            st = {"auth_error": "UNAUTHORIZED", "forbidden": "FORBIDDEN"}.get(state) or \
+            st = {"auth_error": "UNAUTHORIZED", "forbidden": "FORBIDDEN",
+                  "tls_untrusted": "TLS_UNTRUSTED"}.get(state) or \
                  ("NOT_FOUND" if code == 404 else "HTTP_ERROR" if state == "http_error" else "UNREACHABLE")
             caps.append({"area": label, "status": st} if code is None
                         else {"area": label, "status": st, "httpStatus": code})
@@ -8452,6 +8594,8 @@ VERSION_SCHEMA = 1          # the stamp make-package.py writes; keys are additiv
 UPDATE_CHECK_CACHE_SCHEMA = 1   # separate from the stamp's: they version different files and must be
                                 # free to move independently
 UPDATE_CHECK_PATH = os.path.join(CFG_DIR, ".updatecheck")
+# A certificate the check can't verify says so at most this often; see check_update.
+UPDATE_TLS_NOTICE_INTERVAL = 24 * 3600
 UPDATE_CHECK_INTERVAL = 24 * 3600      # a launch-time check that hits the network every session is a
 UPDATE_RETRY_INTERVAL = 3600           # tax on every question; a FAILED check retries far sooner, so
 #                                        one outage cannot hide a release for a whole day
@@ -8525,7 +8669,8 @@ def _update_open(req):
                                  "github.com hosts" % newurl)
             return super().redirect_request(req, fp, code, msg, headers, newurl)
 
-    resp = urllib.request.build_opener(_HeldRedirect).open(req, timeout=UPDATE_TIMEOUT)
+    https = urllib.request.HTTPSHandler(context=verifying_context())
+    resp = urllib.request.build_opener(_HeldRedirect, https).open(req, timeout=UPDATE_TIMEOUT)
     if not _github_host(resp.geturl()):
         resp.close()
         raise ValueError("self-update fetch ended at %r, which is not an https github.com host"
@@ -8613,7 +8758,7 @@ def _gh_get(url, accept="application/vnd.github+json", max_bytes=UPDATE_MAX_JSON
     """GET a github.com URL over verified TLS and return the bytes.
 
     Independent of call() on purpose (rule 4 at the top of this section): no Authorization header, no
-    pooled connection, and the platform's default VERIFYING ssl context -- never _ssl_context(),
+    pooled connection, and a VERIFYING context from verifying_context() -- never _ssl_context(),
     which honours this stack's insecure_tls opt-out. A self-signed Meridian appliance is a reason to
     skip verification for that stack's API; it is not a reason to accept an unverified certificate
     while downloading code that is about to run. urllib.request is imported here rather than at module
@@ -8817,6 +8962,19 @@ def announce_whats_new(res, prior_cache):
     return res
 
 
+def _cert_failure(e):
+    """The ssl.SSLCertVerificationError behind a failed fetch, or None. urllib wraps it in a URLError's
+    `reason`; walk that and the exception chain rather than matching message text."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if isinstance(e, ssl.SSLCertVerificationError):
+            return e
+        reason = getattr(e, "reason", None)
+        e = reason if isinstance(reason, BaseException) else (e.__cause__ or e.__context__)
+    return None
+
+
 def check_update(force=False, now=None):
     """Is a newer release available? Returns a state dict and never raises.
 
@@ -8858,6 +9016,7 @@ def check_update(force=False, now=None):
             out = dict(cached, **base, checkedVia="cache", cacheAgeSeconds=int(age))
             out.pop("schema", None)
             out.pop("checkedAt", None)
+            out.pop("tlsNoticeAt", None)
             return out
 
     try:
@@ -8866,6 +9025,20 @@ def check_update(force=False, now=None):
         out = dict(base, state="unknown", checkedVia="network", detail=str(e)[:300],
                    message="Couldn't check for a newer version; continuing on %s."
                            % (local or "an unknown version"))
+        cert = _cert_failure(e)
+        if cert is not None:
+            # Not an outage: nothing changes until this machine trusts the certificate, so the
+            # silence SKILL.md keeps for `unknown` would leave the install stuck without a word.
+            # `notice` lets it say so -- at most once per UPDATE_TLS_NOTICE_INTERVAL, carried in the
+            # cache because each session runs its own process.
+            last = (cached or {}).get("tlsNoticeAt") if (cached or {}).get("repo") == repo else None
+            notice = not isinstance(last, (int, float)) or not 0 <= now - last < UPDATE_TLS_NOTICE_INTERVAL
+            out.update(cause="tls_untrusted", notice=notice, hint=tls_trust_hint(),
+                       verifyMessage=str(getattr(cert, "verify_message", "") or cert)[:200])
+            rec = dict(out, schema=UPDATE_CHECK_CACHE_SCHEMA, checkedAt=now, notice=False,
+                       tlsNoticeAt=now if notice else last)
+            _write_updatecheck(rec)
+            return out
         _write_updatecheck(dict(out, schema=UPDATE_CHECK_CACHE_SCHEMA, checkedAt=now))
         return out
 

@@ -32,7 +32,8 @@ def main():
         names = [n[len(PREFIX):] for n in z.namelist()]
         stamp = json.loads(z.read(PREFIX + "VERSION.json"))
         changelog = z.read(PREFIX + "CHANGELOG.md").decode("utf-8-sig")
-    problems = (member_problems(names)
+        eol = eol_problems({n[len(PREFIX):]: z.read(n) for n in z.namelist()})
+    problems = (member_problems(names) + eol
                 + stamp_problems(stamp, args.version, args.source)
                 + changelog_problems(changelog, args.version)
                 + rebuild_problems(args.package, stamp, args.source)
@@ -61,6 +62,18 @@ def member_problems(names):
                  or n.endswith(REPO_ONLY_SUFFIXES)]
     stray = [n for n in names if n.startswith("scripts/") and n != "scripts/meridian.py"]
     return problems + ["scripts/ ships only meridian.py, not %s" % n for n in stray]
+
+
+def eol_problems(members):
+    """Every text member LF-only, and SKILL.md's front matter closed by a bare `---` line. The second
+    is the check that matters: a CRLF SKILL.md loads everywhere except where a parser splits on LF,
+    so nothing on Windows noticed v2.27.4 shipping one."""
+    problems = ["%s has CR line endings; packages ship text with LF" % n
+                for n, data in sorted(members.items()) if toolkit.is_text(data) and b"\r" in data]
+    lines = members.get("SKILL.md", b"").split(b"\n")
+    if lines[0] != b"---" or b"---" not in lines[1:]:
+        problems.append("SKILL.md's front matter is not opened and closed by bare `---` lines")
+    return problems
 
 
 def stamp_problems(stamp, version, source):

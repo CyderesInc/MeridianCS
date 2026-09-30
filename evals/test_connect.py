@@ -79,6 +79,11 @@ def test_classify(m):
         ("<urlopen error [Errno 11001] getaddrinfo failed>",     ("unreachable", None)),
         ("<urlopen error [Errno -2] Name or service not known>", ("unreachable", None)),
         ("",                                                     ("unreachable", None)),
+        # A trust failure has no HTTP status and used to fall through to `unreachable`.
+        (m.TLS_VERIFY_FAILED + " for x.example: unable to get local issuer certificate. If ... HTTP 403",
+                                                                 ("tls_untrusted", None)),
+        (m.TLS_BUNDLE_PROBLEM + ": /x.pem (MERIDIAN_CA_BUNDLE / ca_bundle) can't be read",
+                                                                 ("tls_untrusted", None)),
     ]
     for err, want in cases:
         check("classify(%r)" % (err[:32] + ("..." if len(err) > 32 else "")),
@@ -1375,6 +1380,367 @@ def test_tls_posture(m, monkeypatch, tmp_path):
     check("opted-out context skips verification", ctx.verify_mode, ssl.CERT_NONE)
     check("contexts are cached, not rebuilt", m._ssl_context() is ctx, True)
 
+
+_PKI_CA_CNF = """[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = meridiancs test proxy root
+[ca_ext]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+"""
+_PKI_LEAF_CNF = """[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = localhost
+[leaf_ext]
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost, IP:127.0.0.1
+authorityKeyIdentifier = keyid
+subjectKeyIdentifier = hash
+"""
+
+
+def _test_pki(tmp):
+    """A throwaway root plus a 127.0.0.1 leaf it signed, made with the openssl CLI at test time so no
+    private key is ever committed. Returns (ca.pem, leaf.pem, leaf.key), or None without openssl.
+    Config files rather than -subj: an MSYS openssl rewrites a leading-slash argument into a path."""
+    exe = shutil.which("openssl")
+    if not exe:
+        return None
+    for name, body in (("ca.cnf", _PKI_CA_CNF), ("leaf.cnf", _PKI_LEAF_CNF)):
+        with open(os.path.join(tmp, name), "w", encoding="ascii") as f:
+            f.write(body)
+    for cmd in (["req", "-x509", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key",
+                 "-out", "ca.pem", "-days", "2", "-config", "ca.cnf", "-extensions", "ca_ext"],
+                ["req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key",
+                 "-out", "leaf.csr", "-config", "leaf.cnf"],
+                ["x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+                 "-CAcreateserial", "-out", "leaf.pem", "-days", "2", "-extfile", "leaf.cnf",
+                 "-extensions", "leaf_ext"]):
+        subprocess.run([exe, *cmd], cwd=tmp, check=True, capture_output=True, timeout=60)
+    return tuple(os.path.join(tmp, n) for n in ("ca.pem", "leaf.pem", "leaf.key"))
+
+
+def test_extra_trust(m, monkeypatch, tmp_path):
+    """A TLS-inspecting proxy's root has to be trusted WITHOUT turning verification off.
+
+    Python verifies against its own trust store, never the OS's. On a Zscaler-managed Mac (2026-09-30)
+    every github.com and stack call failed CERTIFICATE_VERIFY_FAILED while gh and curl, which read the
+    keychain, worked -- so self-update sat at `unknown` and, being silent on `unknown`, never said so.
+
+    The heart of this is a REAL handshake: a local HTTPS server whose certificate chains to a root
+    Python has never seen stands in for the proxy. It must fail with the defaults, and pass once the
+    root arrives through MERIDIAN_CA_BUNDLE, `ca_bundle` in config, or the macOS keychain read -- and
+    nothing here may produce a context that stops verifying.
+    """
+    import http.server
+    import ssl
+    import threading
+    import urllib.error
+    import urllib.request
+
+    pki = _test_pki(str(tmp_path))
+    if pki is None:
+        pytest.skip("no openssl CLI to mint a test root")
+    ca, leaf, key = pki
+
+    class _Ok(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Ok)
+    srv.handle_error = lambda *a: None          # the refused handshakes are the point, not noise
+    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    sctx.load_cert_chain(leaf, key)
+    srv.socket = sctx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = "https://127.0.0.1:%d/" % srv.server_address[1]
+
+    def fetch(ctx):
+        with urllib.request.urlopen(url, context=ctx, timeout=15) as r:
+            return r.read()
+
+    def fresh():
+        monkeypatch.setattr(m, "_EXTRA_TRUST", None)
+        monkeypatch.setattr(m, "_SSL_CTX", {})
+
+    try:
+        # The operator's own config must not leak in: its ca_bundle, or its insecure_tls.
+        monkeypatch.setattr(m, "CFG_PATH", str(tmp_path / "absent-config.json"))
+        for var in ("MERIDIAN_CA_BUNDLE", "MERIDIAN_INSECURE_TLS"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("MERIDIAN_NO_KEYCHAIN", "1")
+
+        # --- Python's defaults alone: refused, and the refusal is recognised as a trust failure ---
+        fresh()
+        err = None
+        try:
+            fetch(m.verifying_context())
+        except urllib.error.URLError as e:
+            err = e
+        check("an unknown root is refused by default", err is not None, True)
+        check("...and _cert_failure finds the certificate error inside urllib's wrapper",
+              isinstance(m._cert_failure(err), ssl.SSLCertVerificationError), True)
+        check("a timeout is not a certificate failure",
+              m._cert_failure(urllib.error.URLError(OSError("timed out"))), None)
+
+        # --- MERIDIAN_CA_BUNDLE: the handshake now verifies, through every verifying path ---------
+        monkeypatch.setenv("MERIDIAN_CA_BUNDLE", ca)
+        fresh()
+        check("MERIDIAN_CA_BUNDLE makes the proxy's root trusted", fetch(m.verifying_context()), b"ok")
+        check("...for the stack's API context too", fetch(m._ssl_context()), b"ok")
+        check("...and connect can show where the trust came from", m.extra_trust()[1],
+              {"caBundle": {"path": ca, "certificates": 1}})
+        # An extra root ADDS trust; it must never cost a check.
+        ctx = m.verifying_context()
+        check("the bundle context still requires a certificate", ctx.verify_mode, ssl.CERT_REQUIRED)
+        check("...and still checks the hostname", ctx.check_hostname, True)
+
+        # --- insecure_tls never reaches the verifying context --------------------------------------
+        monkeypatch.setenv("MERIDIAN_INSECURE_TLS", "1")
+        fresh()
+        check("self-update's context ignores insecure_tls", m.verifying_context().verify_mode,
+              ssl.CERT_REQUIRED)
+        monkeypatch.delenv("MERIDIAN_INSECURE_TLS")
+        monkeypatch.delenv("MERIDIAN_CA_BUNDLE")
+
+        # --- `ca_bundle` in config.json works the same way ------------------------------------------
+        with open(m.CFG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"ca_bundle": ca}, f)
+        fresh()
+        check("config ca_bundle makes the root trusted", fetch(m.verifying_context()), b"ok")
+        os.remove(m.CFG_PATH)
+
+        # --- a bundle that is set but unusable is an error, never silently nothing -----------------
+        for path, why in ((str(tmp_path / "no-such.pem"), "missing"), (leaf + ".empty", "empty")):
+            if why == "empty":
+                open(path, "w").close()
+            monkeypatch.setenv("MERIDIAN_CA_BUNDLE", path)
+            fresh()
+            raised = None
+            try:
+                m.verifying_context()
+            except ValueError as e:
+                raised = str(e)
+            check("a %s bundle raises" % why, bool(raised), True)
+            check("...as the tls_untrusted connect state", m.classify_connect_error(raised or ""),
+                  ("tls_untrusted", None))
+        monkeypatch.delenv("MERIDIAN_CA_BUNDLE")
+
+        # --- macOS: the system keychains are read with the absolute /usr/bin/security --------------
+        with open(ca, "rb") as f:
+            ca_bytes = f.read()
+        broken = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+        calls = []
+
+        class _Done:
+            returncode = 1            # one keychain missing still prints the other's certificates
+            stdout = b"keychain: noise\n" + ca_bytes + broken
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return _Done()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("MERIDIAN_NO_KEYCHAIN")
+        fresh()
+        check("the keychain's root makes the proxy trusted on a Mac", fetch(m.verifying_context()), b"ok")
+        cmd = calls[0] if calls else []
+        check("security is run by absolute path, never via PATH", cmd[:1], ["/usr/bin/security"])
+        check("...exporting every certificate as PEM", cmd[1:4], ["find-certificate", "-a", "-p"])
+        check("...from the system roots and the admin-only System keychain", cmd[4:],
+              list(m.MACOS_KEYCHAINS))
+        check("the user-writable login keychain is never read",
+              any("login" in part for part in cmd), False)
+        report = m.extra_trust()[1]
+        check("both exported certificates are counted", report.get("macosKeychain"), 2)
+        check("...and the malformed one is skipped, not fatal", report.get("unloadable"), 1)
+        check("the export runs once per process, not per connection",
+              (m.verifying_context() is not None, len(calls)), (True, 1))
+
+        calls.clear()
+        monkeypatch.setenv("MERIDIAN_NO_KEYCHAIN", "1")
+        fresh()
+        m.verifying_context()
+        check("MERIDIAN_NO_KEYCHAIN=1 skips the read", calls, [])
+        monkeypatch.delenv("MERIDIAN_NO_KEYCHAIN")
+
+        def no_security(cmd, **kw):
+            raise FileNotFoundError(cmd[0])
+
+        monkeypatch.setattr(subprocess, "run", no_security)
+        fresh()
+        check("no security tool degrades to Python's defaults, reported",
+              str(m.extra_trust()[1].get("macosKeychain")).startswith("unavailable"), True)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(sys, "platform", "linux")
+        calls.clear()
+        fresh()
+        m.verifying_context()
+        check("no keychain read anywhere but macOS", calls, [])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_tls_paths_use_extra_trust(m, monkeypatch):
+    """Every verifying connection gets the anchors: self-update's opener, webhooks and SMTP. One
+    left on the bare default and that path fails behind a proxy while `connect` passes."""
+    import ssl
+    import urllib.request
+    sentinel = ssl.create_default_context()
+    monkeypatch.setattr(m, "verifying_context", lambda: sentinel)
+
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise _Stop()
+
+    def build_opener(*handlers):
+        seen["handlers"] = handlers
+        return _Opener()
+
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
+    try:
+        m._update_open(urllib.request.Request("https://api.github.com/x"))
+    except _Stop:
+        pass
+    check("self-update's HTTPS handler carries verifying_context()",
+          any(getattr(h, "_context", None) is sentinel for h in seen.get("handlers", ())), True)
+
+    def urlopen(req, timeout=None, context=None):
+        seen["webhook"] = context
+        raise _Stop()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    try:
+        m._post_webhook("https://hooks.example.com/x", {"a": 1})
+    except _Stop:
+        pass
+    check("webhooks verify with verifying_context()", seen.get("webhook") is sentinel, True)
+
+    class _Smtp:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def starttls(self, context=None):
+            seen["smtp"] = context
+
+        def send_message(self, msg):
+            pass
+
+    monkeypatch.setattr(m, "_SMTP_CLIENT", _Smtp)
+    m._send_email({"host": "smtp.example.com", "port": 587, "from": "a@example.com",
+                   "to": ["b@example.com"]}, "s", "t", "<p>h</p>")
+    check("SMTP STARTTLS verifies with verifying_context()", seen.get("smtp") is sentinel, True)
+
+
+def test_update_tls_notice(m, monkeypatch):
+    """A certificate the update check can't verify is a standing problem, not a blip, so it is the
+    one `unknown` that speaks -- at most once a day, and never as "up to date"."""
+    import ssl
+    import urllib.error
+
+    def cert_fail(repo):
+        e = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        e.verify_message = "unable to get local issuer certificate"
+        raise urllib.error.URLError(e)
+
+    def timeout(repo):
+        raise urllib.error.URLError(OSError("timed out"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        install = _su_install(tmp, "2.28.3")
+        _su_env(monkeypatch, m, install, tmp)
+        monkeypatch.setenv("MERIDIAN_UPDATE_REPO", "jwood25/meridiancs-public")
+        monkeypatch.delenv("MERIDIAN_NO_AUTOUPDATE", raising=False)
+        monkeypatch.setattr(m, "latest_release", cert_fail)
+        t0 = 1_900_000_000
+
+        r = m.check_update(force=True, now=t0)
+        check("a certificate failure is still `unknown`", r["state"], "unknown")
+        check("...with its cause named", r.get("cause"), "tls_untrusted")
+        check("...and a notice the first time", r.get("notice"), True)
+        check("...carrying the fix", "MERIDIAN_CA_BUNDLE" in r.get("hint", ""), True)
+        check("...and what OpenSSL said", r.get("verifyMessage"), "unable to get local issuer certificate")
+        check("the cache never stores a pending notice", m._read_updatecheck().get("notice"), False)
+
+        r = m.check_update(now=t0 + 60)
+        check("a cached answer does not repeat the notice", (r["checkedVia"], r.get("notice")),
+              ("cache", False))
+        check("...nor expose the bookkeeping", "tlsNoticeAt" in r, False)
+        check("a re-check within the day stays quiet",
+              m.check_update(force=True, now=t0 + 2 * 3600).get("notice"), False)
+        check("...and speaks again after a day",
+              m.check_update(force=True, now=t0 + 25 * 3600).get("notice"), True)
+
+        monkeypatch.setattr(m, "latest_release", timeout)
+        r = m.check_update(force=True, now=t0 + 26 * 3600)
+        check("an ordinary outage stays silent: no cause", "cause" in r, False)
+        check("...and no notice", "notice" in r, False)
+
+
+def test_tls_routing(m, monkeypatch, tmp_path):
+    """SKILL.md is what turns these states into words, so the new ones are pinned there: a trust
+    failure must not be answered with "what's the correct address?", and the update notice must stay
+    the only `unknown` that speaks. Plus the general form: every connect state the code can return
+    has a row, since a state with no row gets whatever the model improvises."""
+    body = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+    for rule in ("| `tls_untrusted` |",
+                 "**Don't** re-prompt for the FQDN (it worked)",
+                 "don't lead with `insecure_tls`",
+                 "**F — tls_untrusted:**",
+                 "`notice: true` on an `unknown` result is the other exception.",
+                 "Without `notice`, an `unknown` stays silent, whatever its `cause`.",
+                 'Never say "up to date"'):
+        check("SKILL.md still says: %s" % rule[:48], rule in body, True)
+
+    states = {"connected", "not_configured"} | {
+        m.classify_connect_error(s)[0] for s in ("HTTP 401: x", "HTTP 403: x", "HTTP 500: x", "",
+                                                 m.TLS_VERIFY_FAILED + " for x: y")}
+    for st in sorted(states):
+        check("SKILL.md has a row for connect state %s" % st, "| `%s`" % st in body, True)
+
+    # End to end through diagnose_connection: the state, its message and the hint SKILL.md echoes.
+    monkeypatch.setattr(m, "CFG_PATH", str(tmp_path / "absent.json"))
+    monkeypatch.setenv("MERIDIAN_FQDN", "stack.example.com")
+    monkeypatch.setenv("MERIDIAN_API_TOKEN", "t0k3n-abcd")
+    monkeypatch.delenv("MERIDIAN_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("MERIDIAN_INSECURE_TLS", raising=False)
+    monkeypatch.setattr(m, "_EXTRA_TRUST", ([], {}))
+
+    def refuse(*a, **kw):
+        raise RuntimeError("%s for stack.example.com: unable to get local issuer certificate. x"
+                           % m.TLS_VERIFY_FAILED)
+
+    monkeypatch.setattr(m, "call", refuse)
+    out = m.diagnose_connection()
+    check("a refused certificate is tls_untrusted, not unreachable", out["state"], "tls_untrusted")
+    check("...whose hint is the trust fix", out["hint"], m.tls_trust_hint())
+    check("...and never offers insecure_tls as the fix", "insecure_tls" in out["hint"], False)
 
 def test_summary_completeness(m, monkeypatch, capsys, tmp_path):
     """`summary --by` discovers which values exist by sampling, then counts each exactly. A category
@@ -4350,7 +4716,7 @@ def test_alerts_notify(m, monkeypatch, tmp_path):
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, context=None):
         captured["url"] = req.full_url
         captured["headers"] = dict(req.header_items())
         captured["body"] = req.data
@@ -7212,7 +7578,7 @@ def test_whats_new(m, monkeypatch, tmp_path):
     # --- SKILL.md carries the rules, not just the code ---------------------------------------------
     with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as f:
         skill = re.sub(r"\s+", " ", f.read())
-    for rule in ('`whatsNew` on a check result is the one exception to "say nothing".',
+    for rule in ('`whatsNew` on a check result is one of two exceptions to "say nothing".',
                  "Show it **once**",
                  'never "nothing new"',
                  "read `CHANGELOG.md` in the skill folder",
@@ -7363,6 +7729,10 @@ def test_update_redirects(m, monkeypatch, tmp_path):
     routes = {}
 
     class FakeHTTPS(urllib.request.HTTPSHandler):
+        # _update_open passes its own HTTPSHandler (carrying verifying_context()); run ahead of it,
+        # since two handlers of one order are tried in the order they were added.
+        handler_order = 400
+
         def https_open(self, req):
             code, location, body = routes.get(req.full_url, (404, None, b"not found"))
             hdrs = email.message.Message()

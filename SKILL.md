@@ -76,12 +76,12 @@ python scripts/meridian.py selfupdate
 
 Cheap: the verdict is cached for a day, so most sessions answer from disk. Match the returned
 `state` exactly — and for five of the six, **say nothing at all**, unless the result carries
-`whatsNew` (below). A version check is housekeeping, not an answer:
+`whatsNew` or `notice` (below). A version check is housekeeping, not an answer:
 
 | `state` | Meaning | Your response |
 |---|---|---|
 | `current` | Newest release already installed | Nothing. |
-| `unknown` | **The check itself failed** — GitHub unreachable, a proxy, or the anonymous rate limit | Nothing. **Never say "up to date"** — the check didn't answer, and reporting silence as an all-clear is the one mistake this state exists to prevent. |
+| `unknown` | **The check itself failed** — GitHub unreachable, a proxy, or the anonymous rate limit | Nothing, unless it carries `notice: true` (below). **Never say "up to date"** — the check didn't answer, and reporting silence as an all-clear is the one mistake this state exists to prevent. |
 | `disabled` | Self-update isn't configured, or the user switched it off | Nothing. |
 | `dev` | A working tree or an unstamped copy — deliberately never overwritten | Nothing, unless they asked about versions; then quote `reasons`. |
 | `ahead` | This build is newer than the latest release | Nothing. |
@@ -104,12 +104,22 @@ from the JSON:
 now newer than the SKILL.md you are following — an update that changes behaviour without saying so is
 indistinguishable from a bug.
 
-**`whatsNew` on a check result is the one exception to "say nothing".** It appears only in the
+**`whatsNew` on a check result is one of two exceptions to "say nothing".** It appears only in the
 first session on a new version. Show it **once**, after the §0 disclaimer and before the
 greeting: a `🆕 **What's new in meridiancs {version}**` line, then up to three bullets from its
 newest entry, each cut to its bold lead-in. An applied update's `whatsNew` goes the same way, under
 its 🔄 line. Without `whatsNew`, say nothing, and never "nothing new": its absence means there was
 nothing to announce, not that nothing changed.
+
+**`notice: true` on an `unknown` result is the other exception.** It comes only with
+`cause: "tls_untrusted"`: Python on this machine doesn't trust the certificate it was shown for
+GitHub, so this copy cannot update until that changes — a standing problem, not a passing outage,
+and staying silent would leave the user on an old version indefinitely. `notice` is true at most
+once a day. Say it in **one line**, after the §0 disclaimer, then carry on:
+
+> ⚠️ **This copy of the skill can't check for updates** — Python doesn't trust the certificate it was shown for GitHub. {hint}
+
+Without `notice`, an `unknown` stays silent, whatever its `cause`.
 
 If the result has `"applied": false` — a rejected package, a failed download, anything — **say
 nothing about it** and carry on. The updater leaves a working skill on every failure path, and a
@@ -155,6 +165,7 @@ Match the returned `state` exactly. Frame every message with the §4 visual voca
 | `auth_error` (401) | Token rejected | Re-prompt for a token; **now** surface the role/SSO causes (template C). |
 | `forbidden` (403) | Token scoped/limited | Suggest a full User Generated token (template D). |
 | `unreachable` | DNS/TLS/network | Re-prompt for the FQDN (template E). |
+| `tls_untrusted` | Reached the address, but Python doesn't trust its certificate — usually a TLS-inspecting proxy | Give the fix (template F). **Don't** re-prompt for the FQDN (it worked), and don't lead with `insecure_tls`, which switches verification off. |
 | `http_error` | Other HTTP status | Report the status + `detail`; likely a transient stack issue — offer to retry. |
 
 ### Message templates (keep the wording consistent)
@@ -205,6 +216,9 @@ If they ask for the walkthrough, give this inline quick-path (full detail in
 
 **E — unreachable:**
 > ⚠️ **Couldn't reach `{fqdn}`** — DNS/TLS error. Check the FQDN is exact (no `https://`, no trailing path) and that the stack is reachable from this network. What's the correct address?
+
+**F — tls_untrusted:**
+> ⚠️ **`{fqdn}` answered, but Python doesn't trust the certificate it was shown.** {hint}
 
 ### After you collect new credentials
 

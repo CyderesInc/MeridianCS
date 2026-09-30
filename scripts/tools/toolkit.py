@@ -25,6 +25,18 @@ def is_dirty(cwd=ROOT):
     return bool(git("status", "--porcelain", cwd=cwd))
 
 
+def is_text(data):
+    """True for a file the package should carry with LF endings: no NUL byte, and valid UTF-8. The
+    PDFs and fonts all contain NULs; every doc, script, stylesheet and SVG is UTF-8."""
+    if b"\0" in data:
+        return False
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
 def sha256(path):
     with open(path, "rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()

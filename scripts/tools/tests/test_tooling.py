@@ -104,3 +104,38 @@ def test_rerun_refuses_a_pushed_but_unreleased_commit(publish_public, monkeypatc
             publish_public.refuse_unpublished_release_commit("clone", "owner/public", "2.28.1")
     else:
         publish_public.refuse_unpublished_release_commit("clone", "owner/public", "2.28.1")
+
+
+def _tool(name):
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), os.path.join(TOOLS, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_package_text_ships_lf():
+    """v2.27.4 was built on Windows and shipped SKILL.md CRLF; a parser that splits on LF then reads
+    `---\\r` and never finds the front matter's close. Text is normalised, binaries are untouched."""
+    mp = _tool("make-package")
+    assert mp.lf_endings(b"---\r\nname: x\r\n---\r\n") == b"---\nname: x\n---\n"
+    font = b"\x00\x01\r\n\x00"
+    assert mp.lf_endings(font) == font
+    not_utf8 = b"caf\xe9\r\n"
+    assert mp.lf_endings(not_utf8) == not_utf8
+    # This checkout's own SKILL.md, whatever line endings it holds on disk (CRLF on Windows).
+    assert b"\r" not in mp.read_bytes("SKILL.md")
+
+
+def test_verify_package_refuses_crlf():
+    """Both directions: a clean package passes, and the v2.27.4 shape -- or an unclosed front
+    matter -- is refused before it can ship."""
+    vp = _tool("verify-package")
+    good = {"SKILL.md": b"---\nname: x\n---\n\n# t\n", "assets/f.ttf": b"\x00\r\n", "README.md": b"a\n"}
+    assert vp.eol_problems(good) == []
+    crlf = dict(good, **{"SKILL.md": b"---\r\nname: x\r\n---\r\n"})
+    problems = vp.eol_problems(crlf)
+    assert any(p.startswith("SKILL.md has CR") for p in problems)
+    assert any("front matter" in p for p in problems)
+    assert vp.eol_problems(dict(good, **{"README.md": b"a\r\n"})) == [
+        "README.md has CR line endings; packages ship text with LF"]
+    assert any("front matter" in p for p in vp.eol_problems({"SKILL.md": b"---\nname: x\n# t\n"}))

@@ -212,9 +212,11 @@ reason it can be left on:
 - **You're told what changed.** The first session on a new version lists that release's
   highlights from [CHANGELOG.md](CHANGELOG.md), and asking "what's new in the Meridian skill?"
   reads the whole of it. A fresh install says nothing, because nothing is new to it.
-- **A failed check is silent, and never claims success.** If GitHub is unreachable, a corporate proxy
-  is in the way, or the anonymous rate limit is hit, the skill carries on with the version you have
-  and says nothing. It will not report "up to date" when it could not actually tell.
+- **A failed check never claims success.** If GitHub is unreachable or the anonymous rate limit is
+  hit, the skill carries on with the version you have and says nothing. It will not report "up to
+  date" when it could not actually tell. The one failure it mentions, at most once a day, is a
+  certificate Python doesn't trust: that won't clear up on its own, so it says how to fix it (see
+  [TLS](#tls)).
 - **A broken download can't break your install.** The new version is staged in a temporary folder,
   verified, and test-run before anything is replaced; the working copy is kept until the new one is
   in place, and restored if the swap fails.
@@ -302,6 +304,23 @@ a self-signed or internally-issued certificate, opt out with `MERIDIAN_INSECURE_
 `"insecure_tls": true` to `config.json` — but only where you trust the network path, because the API
 token travels over that connection. `connect` and `check` both report `tlsVerified`, so an opt-out
 saved once stays visible instead of becoming an invisible default.
+
+**Behind a TLS-inspecting proxy** (Zscaler and the like), don't turn verification off: give Python
+the proxy's root certificate instead. Python uses its own list of trusted certificates, not your
+operating system's, which is why `gh` and `curl` can work while the skill reports
+`CERTIFICATE_VERIFY_FAILED`.
+
+- **On macOS this is automatic.** The skill also trusts the certificates in the system keychains,
+  where a managed Mac's proxy root is normally installed. It reads them with `/usr/bin/security` and
+  never reads your login keychain. `MERIDIAN_NO_KEYCHAIN=1` turns this off.
+- **Anywhere else, or a root that isn't in the System keychain:** save the root as a PEM file and set
+  `MERIDIAN_CA_BUNDLE` to its path, or add `"ca_bundle": "<path>"` to `config.json`. For Claude
+  Code, the `env` block of `~/.claude/settings.json` is the place for the variable. The file adds to
+  Python's trusted certificates rather than replacing them.
+
+Both apply to every verified connection: your stack, update checks, and alert webhooks and email.
+`connect` shows what was added as `tlsTrust`. A certificate that still isn't trusted is reported as
+`tls_untrusted`, with these instructions.
 
 ### Recommended hardening
 

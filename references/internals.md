@@ -392,7 +392,36 @@ A stack with a self-signed or internally-issued certificate opts out with `MERID
 or `"insecure_tls": true` in `config.json`. Both `connect` and `check` report `tlsVerified`, and
 `connect` adds a `tlsWarning` when verification is off, so an opt-out saved once cannot quietly
 become the permanent posture. A rejected certificate is **not** retried — it is a trust problem, not
-a blip — and the error names both opt-out mechanisms.
+a blip.
+
+**Extra trust anchors, never fewer checks (v2.28.4).** Python verifies against its own store (certifi
+or Homebrew's OpenSSL bundle on macOS), never the OS's, so behind a TLS-inspecting proxy every call
+failed `CERTIFICATE_VERIFY_FAILED` while `gh` and `curl`, which read the keychain, worked. Found on a
+Zscaler-managed Mac whose install sat on an old version: self-update is silent on `unknown`, so it
+never said why. `verifying_context()` now adds `extra_trust()` to Python's defaults, and every
+verifying connection is built from it: the stack API (unless `insecure_tls`), self-update, webhooks
+and SMTP.
+
+- macOS: every certificate in `SystemRootCertificates.keychain` and the admin-only `System.keychain`,
+  exported once per process by `/usr/bin/security` (absolute path, so `PATH` can't choose what is
+  trusted). The user-writable login keychain is deliberately not read. Trust *settings* are not
+  consulted, so a certificate an admin placed there and marked "Never Trust" is still trusted: the
+  accepted cost of staying stdlib-only. `MERIDIAN_NO_KEYCHAIN=1` switches it off. A malformed entry
+  is skipped and counted (`unloadable`), never fatal.
+- Any OS: `MERIDIAN_CA_BUNDLE` or `"ca_bundle"`, a PEM file of extra roots. Set but unreadable or
+  empty is an **error**, reported as `tls_untrusted`, never silently ignored: a trust setting that does
+  nothing is how a user ends up switching verification off instead.
+- Neither touches `insecure_tls`, and self-update's context ignores `insecure_tls` entirely. Because
+  a package's signature is checked before it is opened, an extra anchor can at worst withhold an
+  update, never install one.
+
+A certificate failure is now its own `connect` state, `tls_untrusted`, rather than `unreachable`,
+whose advice (re-enter the FQDN) could not fix it. In the update check it is `unknown` with
+`cause: "tls_untrusted"`, and it carries `notice: true` at most once a day
+(`UPDATE_TLS_NOTICE_INTERVAL`, tracked as `tlsNoticeAt` in `.updatecheck`), because it is a standing
+problem rather than an outage. That is the one `unknown` SKILL.md §0.5 lets speak. Proven by a real
+handshake in `test_extra_trust`: a local HTTPS server whose root is minted at test time is refused
+by default and accepted through each route.
 
 ## Maintenance tools (not verbs)
 

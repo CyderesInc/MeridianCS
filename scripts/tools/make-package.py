@@ -70,7 +70,16 @@ def write_zip(out, files, stamp):
 
 def read_bytes(rel):
     with open(os.path.join(toolkit.ROOT, rel), "rb") as f:
-        return f.read()
+        return lf_endings(f.read())
+
+
+def lf_endings(data):
+    # A Windows checkout stores text CRLF (core.autocrlf, no .gitattributes), and the package used to
+    # carry whatever the checkout held: v2.27.4, built on a Windows laptop, shipped SKILL.md CRLF. A
+    # parser that splits on LF never finds the front matter's closing `---` (it reads `---\r`), which
+    # fits a Mac listing the skill with a table rule as its description. v2.28.x were built by CI on
+    # Linux and are LF. Normalising also makes a Windows and a Linux build of one commit identical.
+    return data.replace(b"\r\n", b"\n") if toolkit.is_text(data) else data
 
 
 if __name__ == "__main__":

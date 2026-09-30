@@ -3,6 +3,16 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.28.4 - 2026-09-30
+
+- **Works behind TLS-inspecting proxies such as Zscaler.** On a Mac the skill now also trusts the
+  system keychain, so it works wherever `gh` and `curl` do. Elsewhere, set `MERIDIAN_CA_BUNDLE` to
+  your proxy's root certificate.
+- **A certificate problem is now reported instead of silently blocking updates,** at most once a day,
+  with the fix. Connecting now names it too, rather than asking you to re-enter your address.
+- **The skill's description shows correctly on macOS.** Packages are now always built with Unix line
+  endings. An older Windows-built package broke the header that the skill list reads.
+
 ## 2.28.3 - 2026-09-30
 
 - **No changes to the skill.** The install guide now says to install from the release zip: a
