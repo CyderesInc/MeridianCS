@@ -39,8 +39,10 @@ before you act on it. Ask "connector status?" at any point to see it again.
 ### How you get the files
 
 The skill is a single self-contained folder — no build step and nothing to `pip install`. Download
-the packaged zip from [Releases](https://github.com/CyderesInc/MeridianCS/releases), or clone the
-repository; both land the same tree.
+the packaged zip from [Releases](https://github.com/CyderesInc/MeridianCS/releases): that is the
+install that keeps itself up to date. Cloning the repository lands the same files, but a clone never
+updates itself (see [Staying up to date](#staying-up-to-date)), so you would have to `git pull` for
+every release.
 
 ### Install on macOS — step by step
 
@@ -66,7 +68,7 @@ gh release download --repo CyderesInc/MeridianCS --pattern '*.skill.zip' --dir ~
 unzip ~/Downloads/meridiancs.v*.skill.zip -d ~/.claude/skills/
 ```
 
-Or clone it directly:
+Or clone it, if you would rather update with `git pull` yourself. A clone never updates itself:
 
 ```bash
 git clone https://github.com/CyderesInc/MeridianCS.git ~/.claude/skills/meridiancs
@@ -128,7 +130,7 @@ Get-ChildItem "$env:USERPROFILE\Downloads\meridiancs.*.skill.zip" |
   Expand-Archive -DestinationPath "$env:USERPROFILE\.claude\skills" -Force
 ```
 
-Or clone it directly:
+Or clone it, if you would rather update with `git pull` yourself. A clone never updates itself:
 
 ```powershell
 git clone https://github.com/CyderesInc/MeridianCS.git "$env:USERPROFILE\.claude\skills\meridiancs"

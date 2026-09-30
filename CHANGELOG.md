@@ -3,6 +3,11 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.28.3 - 2026-09-30
+
+- **No changes to the skill.** The install guide now says to install from the release zip: a
+  copy made with `git clone` never updates itself, so it stays on its version until you pull.
+
 ## 2.28.2 - 2026-09-30
 
 - **No changes to the skill.** This release fixes the public repository's automated checks.
