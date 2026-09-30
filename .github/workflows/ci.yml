@@ -84,8 +84,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: uv run --locked scripts/tools/verify-package.py "$RUNNER_TEMP/meridiancs.ci.skill.zip"
 
+      # Only where the reviewed public variants exist: a derived tree already substituted them.
       - name: "public tree: derives with a clean audit"
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('README.public.md') != '' }}
         run: uv run --locked scripts/tools/make-public.py "$RUNNER_TEMP/public"
 
       - name: "pre-commit: hooks pass on every file"

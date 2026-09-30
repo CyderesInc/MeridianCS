@@ -62,12 +62,15 @@ def test_only_release_workflow_can_sign():
             assert not [w for w in ("vault-action", "id-token", "sign-release.py") if w in code], name
 
 
+RELEASE_WORKFLOW = os.path.join(os.path.dirname(os.path.dirname(TOOLS)), ".github", "workflows", "release.yml")
+
+
 def _release_workflow_code():
-    workflow = os.path.join(os.path.dirname(os.path.dirname(TOOLS)), ".github", "workflows", "release.yml")
-    with open(workflow, encoding="utf-8") as f:
+    with open(RELEASE_WORKFLOW, encoding="utf-8") as f:
         return "\n".join(line.split("#", 1)[0].rstrip() for line in f.read().splitlines())
 
 
+@pytest.mark.skipif(not os.path.exists(RELEASE_WORKFLOW), reason="make-public.py drops release.yml")
 def test_public_release_follows_the_internal_one_after_approval():
     """The environment is the public release's only approval, since Vault doesn't bind it. `needs:
     release` is the job's only proof that the tag is on main, the suite passed and the internal
