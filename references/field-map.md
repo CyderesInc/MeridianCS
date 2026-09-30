@@ -12,17 +12,61 @@ the metadata endpoint to confirm the exact name/case. Field names are case-sensi
 > compute assets and ~10,000 identities. Where an exact value is itself the finding (a `0`, or two
 > queries returning an identical count), that is called out.
 
-## Risk conventions (both asset and user)
+## Risk model (both asset and user)
 
-- **`Risk_Score`** (Float) — the master risk metric. **Unbounded, NOT 0–10** — real values range
-  from single digits into the thousands. Never assume a 0–10 or 0–100 scale. Send comparison values
-  as **unquoted numbers**.
-- **`Risk_Level`** (String) — the tier. Commonly `1-low`, `2-medium` (often low-frequency),
-  `3-high`. Map to severity colour: `3-high` → 🔴, `2-*` → 🟠/🟡, `1-low` → 🟢.
-- **`Risk_STD`** (Float) — "Risk Ranking", a 0–100 percentile (100 = riskiest). Good for "top X%".
-- **`RiskReason1/2/3`** (String) — the top 3 human-readable risk factors ("Top Factor 1/2/3").
-- **`Risk_Reasons`** (List) — full list of risk factors.
-- **`RiskFactor1/2/3`** (String) — "Top Variable 1/2/3" (the driving data variables).
+Meridian scores every asset and every user the same way, with three linked fields. The metadata
+describes each one; the relationships below held with no exceptions over every record of the
+deployments they were checked on.
+
+- **`Risk_Score`** (Float, "Raw risk score (higher value, riskier)") — **unbounded, and its scale
+  differs per deployment *and* per table.** A top asset can score in the thousands while the top
+  user scores near a hundred, so a raw threshold that isolates the high-tier users catches several
+  times as many assets as the asset high tier holds. **Never threshold the raw score, and never
+  compare one across tables or deployments.** It is the right field for *ordering*
+  (`top --field Risk_Score`), because it never ties at the top. Send comparison values as
+  **unquoted numbers**.
+- **`Risk_STD`** (Float, "Risk Ranking", "Standardized/ranked risk score (1-100)") — the score
+  mapped onto 1–100, per table. It rises with `Risk_Score` within a table. **It is not a
+  population percentile:** typically well under 1% of records sit at ≥ 90, so "top 10%" is a `top`
+  call, never `Risk_STD >= 90`. **It saturates at 100** (a hundred or more records can tie there),
+  so don't order the top by it. It is the field for comparing an asset with a user, since both share
+  the 1–100 scale.
+- **`Risk_Level`** (String) — **a band of `Risk_STD`**:
+
+  | Tier | `Risk_STD` | Colour |
+  |---|---|---|
+  | `3-high` | ≥ 90 | 🔴 |
+  | `2-medium` | 50 to < 90 (an asset at exactly 50.0 can read `1-low`) | 🟡 |
+  | `1-low` | < 50 | 🟢 |
+
+  `2-medium` is a real tier, not a rare one. The tier *count* is still Meridian's to change, so
+  match the tier word, never a bare `"3"`.
+- **`1-low` includes records Meridian found nothing to score — that is not "assessed low".** A
+  record with no `RiskReason1` has no risk factor at all, and on some deployments that is most of
+  the asset table, every one tiered `1-low`. Its `Risk_STD` may be 0 or may not, so the missing
+  factor is the test, not the zero. Report those as "no risk factors identified", never fold them
+  into a "low risk" percentage.
+- **Why a record scored as it did:** `RiskReason1/2/3` ("Top Factor 1/2/3") are the human-readable
+  top factors and `Risk_Reasons` (List, "Risk Factors") the full set; `RiskFactor1/2/3` ("Top
+  Variable 1/2/3") are the data variables behind them. The factor vocabulary is short
+  (`summary --by RiskReason1` lists it):
+  - **Users:** Private Data Detected, Non-Compliance Activities, User with Termination, MFA Not
+    Configured, High Risk Assets Associated.
+  - **Assets:** Private Data Detected, Not Encrypted, High Severity Vulnerabilities, Public-facing
+    Asset, Outdated OS, Threats Detected, Missing Patches, Critical Severity Vulnerabilities, High
+    EPSS Vulnerabilities.
+
+  "High Risk Assets Associated" is how asset risk reaches a user; `High_Risk_Asset` /
+  `High_Risk_User` list the other side of that link.
+- **Defined but often empty:** `Risk_CDF` ("Statistical risk score (1-100)"), `RiskChange1/2/3`
+  ("Risk top impact 1/2/3" — the weight behind each top factor) and `Risk_Summary`. Check with
+  `exists` before quoting one; an empty field is not a zero.
+- **Customers layer their own risk vocabulary on top, as SmartLabels and custom fields** — a
+  weighted user ranking, a department multiplier, a crown-jewels flag, a `Risk Modifier` field.
+  They are deployment-specific, and they can reorder the head of a ranking even when they mostly
+  agree with `Risk_Score`. When the user names a ranking in their own words,
+  `labels --search risk` first; otherwise rank by `Risk_Score` and say that is Meridian's ranking.
+  Nothing in the API says whether an overlay feeds `Risk_Score`, so don't claim either way.
 
 ## User (table `user`) — common fields
 
@@ -56,8 +100,8 @@ the metadata endpoint to confirm the exact name/case. Field names are case-sensi
   per data source**, linked by `SAME_AS`, so one physical laptop can exist as an MDM record, an
   identity-provider device record, a network record *and* an EDR record. `all macOS − has_edr` counts
   the non-EDR *representations of covered machines* as uncovered machines. On real data this
-  overstates gaps by multiples, not percentages — an EDR gap by around **3.5×** (roughly 440 claimed
-  against roughly 125 actual) and an MDM gap by around **14×** (roughly 280 against 20). On the
+  overstates gaps by multiples, not percentages — an EDR gap by around **3.5×** and an MDM gap by
+  around **14×**. On the
   illustrative stack above, the same mistake claims **25,200** uncovered assets where the answer is
   **9,000**. The raw `/CMDB/v2/data/cmdb` endpoint does **not** traverse `SAME_AS`; the console does,
   which is why the console and a hand-rolled subtraction disagree.
@@ -153,8 +197,9 @@ the metadata endpoint to confirm the exact name/case. Field names are case-sensi
   way would flag almost nothing, since most CVEs sit far below 0.9 there.
 - **The `Risk_Level` tier count is not guaranteed.** Test the tier *word* (`high`, `critical`),
   never a bare `"3" in level`: that fires on any label whose text merely contains a 3, and tier 3
-  of 5 is the middle of the scale, not the top. For a defensible ranking quote `Risk_STD`, which is
-  an explicit 0–100 percentile.
+  of 5 is the middle of the scale, not the top. For a defensible position quote `Risk_STD` — the
+  1–100 score the tiers are bands of, **not** a percentile (see
+  [Risk model](#risk-model-both-asset-and-user)).
 - **Change-history values are arrays.** `/CMDB/v2/data/cmdb/{asset,user}/change?id=<name>` returns
   entries whose `oldValue`/`newValue` are Lists — join them for display. A record that oscillates
   the same field every day (a department flipping between two values, a `Risk_Level` flipping

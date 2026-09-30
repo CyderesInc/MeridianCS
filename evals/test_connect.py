@@ -377,7 +377,7 @@ def test_connector_warning_messages(m):
           "first distinct problem; second distinct problem")
 
     # A collapsed traceback truncated from the front is all frames and no cause. Measured on a live
-    # stack, 22 connectors shared this exact message and every visible character of it was botocore
+    # stack, a whole group of connectors shared this exact message and every visible character of it was botocore
     # frame noise; the AccessDeniedException naming an actual AWS permission gap fell off the end.
     tb = ("2026-08-19 04:21:59.880 | WARNING | loguru._logger:warning:1896 - Traceback (most recent "
           'call last): File "aws_org.py", line 73, in tmp.app.data.aws_org.get_account File '
@@ -447,10 +447,10 @@ def test_connector_warning_messages(m):
 
 def test_connector_brief_shape(m, monkeypatch):
     """`connectors` is the one call SKILL.md makes mandatory every session, so its payload is pure
-    overhead on whatever the user actually asked. Measured on a live 58-connector stack it was 75,288
-    chars (~20,900 tokens) of which 50,277 was the connector block -- while 50 of the 58 connectors
-    were ingesting *and* warning, drawing 143 note instances from just 67 distinct messages. One
-    message appeared on 22 separate connectors; 8,892 of 18,023 message chars were byte-identical
+    overhead on whatever the user actually asked. Measured on a live stack it was 75,288
+    chars (~20,900 tokens), two thirds of it the connector block -- while most connectors
+    were ingesting *and* warning, drawing twice as many note instances as distinct messages. One
+    message appeared on a large group of connectors; about half the message chars were byte-identical
     repeats.
 
     Brief mode reshapes that message-first. What this guards is the set of things it must NOT cost:
@@ -562,9 +562,9 @@ def test_preflight_coverage(m, monkeypatch):
 
     Brief already cut the payload 71% by inverting it message-first. What it could not cut is the
     row count: SKILL.md §1.5 renders roughly 6-8 delivering rows plus a rollup line and 6-8 needing
-    attention, so on a 58-connector stack the model is handed 58 full rows to print about 18 of
-    them. Measured live, 8,377 of the block's 12,933 chars described connectors that reach the
-    answer only as "+ 40 more delivering data: ...".
+    attention, so on a large stack the model is handed every connector's full row to print about a
+    third of them. Measured live, nearly two thirds of the block's chars described connectors that
+    reach the answer only as "+ N more delivering data: ...".
 
     This aligns the payload with what §1.5 already prints rather than changing what it prints, so
     the contract needs no edit -- which is the whole design, and what this guards. Every row §1.5
@@ -581,8 +581,8 @@ def test_preflight_coverage(m, monkeypatch):
       * summary passes through verbatim, and failures/warningGroups losslessly: each cause is quoted
         once, by `id`, and the rows and failures it covers point at it with `warningIds`. Rebuilding
         the original groups and failure messages from those ids has to give back exactly the input,
-        since warningGroups is how §1.5 rule 2 answers "what was the warning". Measured on the local
-        51-connector stack, the repetition this removes was 84 mentions of 51 names plus 7 of 10
+        since warningGroups is how §1.5 rule 2 answers "what was the warning". Measured on a live
+        stack, the repetition this removes was every connector name, some more than once, plus most
         failure messages, and the block went 18,810 -> 15,693 chars;
 
     And the invariant one layer down: this is presentation, applied at cmd_connect's boundary only.
@@ -2005,6 +2005,51 @@ def test_summary_without_field(m, monkeypatch, tmp_path):
     check("nested: no gap keys", [k for k in ("whereTotal", "recordsWithoutField",
                                               "whereTotalUnavailable") if k in out], [])
     check("nested: completeness unchanged", (out.get("coveredRecords"), out.get("complete")), (1000, True))
+
+
+def test_summary_numeric_values(m, monkeypatch, tmp_path):
+    """`summary --by` on an Integer or Float field must query each value as a JSON number.
+
+    Values are grouped by their string form, and they used to be sent back that way. A quoted number
+    is answered with 0 records and no error, so `--by` on an Integer SmartLabel reported every group
+    as 0 (measured live: 19 values, all 0, over every user on the stack). The fake API here answers the way the
+    real one does: a count only for an unquoted value."""
+    import tempfile
+    sent = []
+
+    def fake_call(method, endpoint, body=None, retries=1):
+        body = body or {}
+        paging, groups = body.get("paging", {}), body.get("query") or []
+        if paging.get("recordsPerPage") == 1:
+            clauses = [c for g in groups for c in g if c.get("searchFieldName") == "Rank"]
+            if not clauses:
+                return {"totalRecords": 100, "data": []}                  # the where-only count
+            sent.extend(c["value"] for c in clauses)
+            if len(groups[-1]) > 1:                                        # List coverage probe
+                return {"totalRecords": 100, "data": []}
+            v = clauses[0]["value"]
+            real = {11: 60, 12.5: 40}
+            return {"totalRecords": real.get(v, 0) if not isinstance(v, str) else 0, "data": []}
+        return {"totalRecords": 100, "data": [{"Rank": 11}] * 60 + [{"Rank": 12.5}] * 40}
+
+    monkeypatch.setattr(m, "call", fake_call)
+    monkeypatch.setattr(m, "check_fields", lambda *a, **k: None)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(prefix="num-", dir=tmp_path))
+    for dtype in ("Integer", "Float"):
+        sent.clear()
+        monkeypatch.setattr(m, "field_type", lambda t, f, d=dtype: d)
+        out = m.summarize_by("user", "Rank")
+        check("%s: every value is queried as a number" % dtype,
+              all(not isinstance(v, str) for v in sent) and bool(sent), True)
+        check("%s: so each group gets its real count" % dtype,
+              sorted((g["value"], g["count"]) for g in out["groups"]), [("11", 60), ("12.5", 40)])
+        check("%s: and the breakdown is complete" % dtype, out.get("complete"), True)
+    # String fields are unchanged: the value stays a string.
+    sent.clear()
+    monkeypatch.setattr(m, "field_type", lambda t, f: "String")
+    m.summarize_by("user", "Rank")
+    check("String: values are still sent as strings", all(isinstance(v, str) for v in sent), True)
 
 
 def test_transport(m, monkeypatch):
@@ -4359,7 +4404,7 @@ def test_alerts(m, monkeypatch, tmp_path):
     check("...but does with includeDegraded",
           len(m.evaluate_alerts(t3, c, [dict(RULE_COV, includeDegraded=True)])["firing"]), 1)
     # --- the degraded picture rides on EVERY coverage-regressed row ------------------------------
-    # Found by replaying this verb day-by-day over real snapshot history: 55 connectors entered the
+    # Found by replaying this verb day-by-day over real snapshot history: most of the fleet entered the
     # degraded set in one window and the row said "no connector entered the failing set ... and none
     # are failing now". The verdict was right; the row read as an all-clear while a third of the
     # fleet had just degraded. Informational only -- these assertions check the verdict does NOT move.
@@ -5142,6 +5187,38 @@ def test_hr_routing():
         ref = " ".join(f.read().split())
     check("scripts.md documents the verb and its states",
           "`hr` — **which HR systems feed this stack" in ref and "`configured_no_data`" in ref, True)
+
+
+def test_risk_model_routing():
+    """SKILL.md carries Meridian's risk model, and field-map.md carries the measurements behind it.
+
+    The skill used to describe `Risk_STD` as a 0-100 percentile "good for top X%" (under 1% of records
+    sit at >= 90, so that answer is wrong by an order of magnitude), guess `2-medium` was rare, and
+    colour its own worked example by raw score. Measured on two stacks, `Risk_Level` is a band of
+    `Risk_STD` with no exceptions, the raw score's scale differs per table, and most of one stack's
+    `1-low` assets had no risk factor at all. Each of those misreadings produces a confident wrong
+    answer, and SKILL.md is prose, so only a guard like this notices one being dropped. Phrases are
+    ones both field-map variants share, so the public tree's copy of this test passes too."""
+    flat = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+    check("SKILL.md has the risk-model step", "**Read risk the way Meridian defines it**" in flat, True)
+    check("...stating the tier bands", "`3-high` ≥ 90, `2-medium` 50 to < 90" in flat, True)
+    check("...ordering by score, tiering by level, never thresholding the raw score",
+          "**Order by `Risk_Score`, tier by `Risk_Level`, and never threshold or compare raw scores**"
+          in flat, True)
+    check("...that Risk_STD is not a percentile", "**`Risk_STD` is not a percentile**" in flat, True)
+    check("...that an unscored record is not assessed low",
+          "had no risk factor identified; it was not assessed low." in flat, True)
+    check("...checking customer overlays before naming a ranking", "`labels --search risk` first" in flat, True)
+    check("the colour rule no longer offers a raw-score threshold",
+          "(or a threshold on the numeric score)" in flat, False)
+    with open(os.path.join(os.path.dirname(SKILL_MD), "references", "field-map.md"), encoding="utf-8") as f:
+        ref = " ".join(f.read().split())
+    check("field-map.md has the risk model", "## Risk model (both asset and user)" in ref, True)
+    check("...with the band table", "| `3-high` | ≥ 90 | 🔴 |" in ref and "| `1-low` | < 50 | 🟢 |" in ref, True)
+    check("...saying Risk_STD is a band source, not a percentile",
+          "**a band of `Risk_STD`**" in ref and "**It is not a population percentile:**" in ref, True)
+    check("...and never calling it one", "0–100 percentile" in ref, False)
+    check("...naming the factor vocabulary", "High Risk Assets Associated" in ref and "Not Encrypted" in ref, True)
 
 
 def test_alert_routing():
@@ -8046,8 +8123,8 @@ def test_field_cache_refetch(m, monkeypatch, tmp_path):
     The disk cache never expired, so a field that appeared after it was written was refused as
     "doesn't exist" by every verb. Enabling a connector is exactly what adds fields -- an HR connector
     brings its `alias_<sourcetype>_*` copies and the customer's SmartLabels for it -- so the skill told
-    users their newly connected HR system's fields did not exist. Measured live: 280 cached against 282
-    real, the missing two the HR source's. Bounded to one metadata call per table per process, so a
+    users their newly connected HR system's fields did not exist. Measured live: the cache was two
+    fields short, both the HR source's. Bounded to one metadata call per table per process, so a
     run of typos costs one call, not one each.
     """
     monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))

@@ -73,7 +73,7 @@ currency-unknown unless paired with `asof`.
   paced and issued concurrently. Field-by-field reading guide and the presentation rules are in
   SKILL.md §1.5.
   - **The default shape is `brief` (`"shape": "brief"`), and it is the default because this is the one
-    call SKILL.md makes mandatory on every session.** Measured on a live 58-connector stack, the old
+    call SKILL.md makes mandatory on every session.** Measured on a live stack, the old
     shape was 75,288 chars (~20,900 tokens) against 21,862 (~6,100) now — a 71% cut on the payload
     that lands before the user's actual question is touched. `--full` restores per-row
     `lastIngest.notes[]` when you need to see exactly which service carried which message.
@@ -91,9 +91,9 @@ currency-unknown unless paired with `asof`.
     shipped in the first draft and the test was verified to fail against it.
   - **`connect --with-connectors` narrows it once more, to `"shape": "preflight"`.** Brief cut the
     payload but not the row count, and §1.5 renders ~6-8 delivering rows plus a rollup line and ~6-8
-    needing attention — so a 58-connector stack handed the model 58 full rows to print about 18 of
-    them, 8,377 of the block's 12,933 chars describing connectors that reach the answer only as
-    "+ 40 more delivering data: …". Rows in `failures[]`, rows `failing` outright, and the
+    needing attention — so a large stack handed the model every connector's full row to print about
+    a third of them, nearly two thirds of the block's chars describing connectors that reach the
+    answer only as "+ N more delivering data: …". Rows in `failures[]`, rows `failing` outright, and the
     detail-window rows the delivering table draws are all kept **in full**; the rest move to
     `delivering[]` as `connector`/`profile`/`records`/`warned`. Measured live: 22,174 → 18,574 chars.
     So it aligns the payload with what §1.5 already prints instead of changing what it prints —

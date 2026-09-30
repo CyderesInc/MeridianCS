@@ -306,7 +306,7 @@ inaccurate or unexplained signal reads as fact.
 
 1. **A `degraded` connector that's ingesting fine looks identical to a broken one in the tally.**
    `degraded` fires for *any* non-`ok` last-run status, including a harmless `Warning` — measured, a
-   stack with 100% of connectors actively ingesting reported "0 healthy, 58 degraded". **Use one dot
+   stack with 100% of connectors actively ingesting reported "0 healthy", every connector degraded. **Use one dot
    for "is this connector giving me data" — 🟢 — for every connector with no entry in `failures[]`,
    whether its JSON `health` says `ok` or `degraded`.** Reserve 🟠/🔴 for connectors with a
    `failures[]` entry or `failing` outright. Recompute from `failures[]` each time; never approximate
@@ -315,7 +315,7 @@ inaccurate or unexplained signal reads as fact.
    connector's group — by its `warningIds`, or in `warningGroups[].connectors` when a group lists its
    members — and quote that group's cleaned `message` next to it, even when it's 🟢. "Wiz — Warning"
    tells the user nothing they can act on; "Wiz — _no local data template and save options, or
-   invalid json file format_" at least tells them what actually happened, even for a 🟢 row. When one group covers many connectors, say that once — "22 connectors, all the same AWS
+   invalid json file format_" at least tells them what actually happened, even for a 🟢 row. When one group covers many connectors, say that once — "12 connectors, all the same AWS
    `AccessDeniedException` on `ListAccounts`" — rather than repeating the sentence per row.
 3. **Lead with the delivering-data count and its warnings, not the failing count.** A headline like
    "0 healthy, 55 degraded, 3 failing" reads as a stack in trouble even when nearly all of it is
@@ -527,6 +527,23 @@ For data queries, follow this loop:
    `crowdstrike` — and a value matching nothing returns 0 records, which in a coverage answer reads as
    "no EDR anywhere". Full detail and the measured numbers:
    [references/field-map.md](references/field-map.md) response quirks.
+8. **Read risk the way Meridian defines it**
+   ([references/field-map.md](references/field-map.md) Risk model). `Risk_Level` is a band of
+   `Risk_STD`, a 1–100 standardized score: `3-high` ≥ 90, `2-medium` 50 to < 90, `1-low` below.
+   `Risk_Score` is the raw score behind both, and **its scale differs per stack and per table** — a
+   top asset can score in the thousands while the top user scores near a hundred. So:
+   - **Order by `Risk_Score`, tier by `Risk_Level`, and never threshold or compare raw scores**
+     across tables or stacks. To compare an asset with a user, quote `Risk_STD`.
+   - **`Risk_STD` is not a percentile** (typically well under 1% of records sit at ≥ 90), so "top
+     10%" is a `top` call.
+   - **A `1-low` record with no `RiskReason1` had no risk factor identified; it was not assessed
+     low.** On some stacks that is most of the asset table. Say "no risk factors identified" and keep it
+     out of any "low risk" share.
+   - **Say why, from Meridian's own factors:** `RiskReason1/2/3` / `Risk_Reasons`, not a factor
+     inferred from other fields.
+   - **If the user names their own ranking** (a weighted score, crown jewels, a department
+     multiplier), run `labels --search risk` first: customer overlays exist and can put a different
+     record first. Otherwise say the ranking is Meridian's `Risk_Score`.
 
 Records are wide (300+ lines each). Save raw responses to files in the scratchpad; pull out only
 the fields relevant to the question.
@@ -545,7 +562,7 @@ Structure every findings response like this:
    the methodology.
 2. **A scannable table** of the relevant slice (top N rows), with:
    - A **severity dot** as the first column so the eye lands on the worst items. Map Meridian's
-     `Risk_Level` (or a threshold on the numeric score) to color:
+     `Risk_Level` to color, never a threshold on the raw `Risk_Score` (§3 step 8):
      🔴 critical/high · 🟠 elevated · 🟡 medium · 🟢 low · ⚪ none/unknown.
    - **Right-aligned numeric columns** (`|---:|`) so scores line up and are comparable.
    - An **inline magnitude bar** for the headline metric — repeat a block char proportional to
@@ -586,8 +603,8 @@ treatment for ranked lists and multi-item findings where the visual structure ea
 > | 🔴 | **AEXAMPLE** | **1500** | `██████████` | Legal | 675 | 4 |
 > | 🔴 | **BEXAMPLE** | 1434 | `█████████░` | Legal | 716 | — |
 > | 🔴 | **CEXAMPLE** | 1263 | `████████░░` | Marketing | 473 | 17 |
-> | 🟠 | **DEXAMPLE** | 1207 | `███████░░░` | Finance | 505 | 6 |
-> | 🟠 | **EEXAMPLE** | 1194 | `███████░░░` | Marketing | 484 | 9 |
+> | 🔴 | **DEXAMPLE** | 1207 | `███████░░░` | Finance | 505 | 6 |
+> | 🔴 | **EEXAMPLE** | 1194 | `███████░░░` | Marketing | 484 | 9 |
 >
 > ⚠️ CEXAMPLE has the widest blast radius — 17 high-risk assets. Legal appears twice in the top 3.
 >
@@ -692,7 +709,7 @@ was saved there. Use the user's own folder, or the scratchpad for intermediate J
   the ready-to-run command for the common questions (posture breakdowns, riskiest X, MFA gaps,
   KEV/public/unencrypted exposure, EOL OS, expiring certs, connector health, trends).
 - [references/field-map.md](references/field-map.md) — **cached field cheat-sheet**: common
-  asset/user field names, risk conventions (Risk_Score is unbounded; Risk_Level tiers), and the
+  asset/user field names, the risk model (how Risk_Score, Risk_STD and Risk_Level relate), and the
   response quirks that bite (MFA-as-object-list, Threat_List structure, Count_CVE cap, change-value
   arrays, identity-dedup oscillation). For a real (non-demo) stack, run
   `python scripts/meridian.py refresh-fields` to cache that deployment's actual fields — this doc is

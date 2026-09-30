@@ -1722,8 +1722,8 @@ def and_query(clauses, extra=None):
 
 # A count only reads `totalRecords`, and every page carries it -- including one past the end, which
 # carries no records. Page 0 with recordsPerPage 1 still downloads one whole record, and records can
-# be huge: measured on a live stack, one high-risk asset count was 5.33MB/1.73s at page 0 and 86
-# bytes/0.85s here, with the same total, across unfiltered, filtered, zero-match, OR-group,
+# be huge: measured on a live stack, one high-risk asset count downloaded megabytes at page 0 and
+# under a hundred bytes here, in half the time, with the same total, across unfiltered, filtered, zero-match, OR-group,
 # exists-gated and user-table queries. It is undocumented behaviour, so count_records() checks it:
 # no integer `totalRecords`, or a 400/404/416/422, falls back to page 0. (`recordsPerPage: 0` is no
 # substitute -- it silently returns 20 records.) Past COUNT_PAGE records the page is in range again
@@ -1985,8 +1985,8 @@ def _refetch_field_map(table):
     The disk cache never expired, so a field that appeared after it was written -- which is exactly what
     enabling a connector does: an HR connector brings `alias_dayforce_employee_*` and the customer's
     Dayforce SmartLabels -- was refused as "doesn't exist" by every verb until someone ran
-    `refresh-fields` by hand. Measured on a live stack: the cache knew 280 user fields, the API had 282,
-    and the missing two were the HR source's. Once per table per process, so a typo costs one metadata
+    `refresh-fields` by hand. Measured on a live stack: the cache was two user fields short, and both
+    were the HR source's. Once per table per process, so a typo costs one metadata
     call rather than one per query. A changed field set drops the label and result caches for the same
     reason `refresh-fields` does: both are derived from this metadata.
     """
@@ -2588,11 +2588,11 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     byType = field_type(a.table, a.by)
     op = "match" if byType == "List" else "=="
     # A dotted field (`Owner_Status.Is_Admin`) lives inside a per-source Embed_List. `match`/`==` resolve
-    # it correctly server-side (checked against a live stack), but `exists` does not: measured 4 records
-    # for `Owner_Status.Is_Admin exists` against 23 for `== Binary 1`, because most identities carry that
+    # it correctly server-side (checked against a live stack), but `exists` does not: it measured a
+    # fraction of the records `== Binary 1` found for `Owner_Status.Is_Admin`, because most identities carry that
     # sub-field null on the sources that don't report it and `exists` only passes when the array has no
     # null entries for it. Querying the *parent* field's `exists` doesn't help either -- `Owner_Status
-    # exists` was 66016 of 66016, true for every identity that has any embedded entry at all. There is no
+    # exists` matched every identity, true for every identity that has any embedded entry at all. There is no
     # reliable single-call "has this sub-field" filter, so a nested path skips the gate entirely and
     # samples the plain `where`-filtered population instead of a falsely narrow "exists" one.
     nested = "." in a.by
@@ -2641,7 +2641,12 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
                 resps.append(r)
     sampled = sum(len(r.get("data") or []) for r in resps)
 
-    freq = {}
+    # Values are grouped by their string form but queried by their original one. A numeric field's
+    # value sent as a string is a quoted number, which the API answers with 0 records and no error --
+    # so `--by` on an Integer SmartLabel reported every group as 0 (measured: 19 values, all 0, over
+    # every user on the stack). Only Integer/Float are re-typed: String already is one, and Binary is
+    # sent as before.
+    freq, raw = {}, {}
     for r in resps:
         for rec in r.get("data") or []:
             if nested:
@@ -2662,7 +2667,11 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
                 if x is None:
                     continue
                 freq[str(x)] = freq.get(str(x), 0) + 1
+                raw.setdefault(str(x), x)
     seen = set(freq)
+
+    def qval(v):
+        return raw.get(v, v) if byType in ("Integer", "Float") else v
     # High cardinality used to return no groups at all -- "break assets down by OS" (51 values) gave
     # nothing. Counting all of them would be one call each, so instead count the biggest ones the sample
     # saw and let the coverage check below state exactly how many records the rest hold. Partial and
@@ -2674,7 +2683,7 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
         vals = sorted(seen)
     counts = parallel([(lambda v=v: count_records(
                             a.table, and_query(where, {"searchFieldName": a.by, "operator": op,
-                                                       "type": byType, "value": v})))
+                                                       "type": byType, "value": qval(v)})))
                        for v in vals])
     groups = [{"value": v, "count": c, "percent": round(100.0 * c / total, 1) if total else 0}
               for v, c in zip(vals, counts) if not isinstance(c, Exception)]
@@ -2731,7 +2740,7 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
         covered = None
         if vals:
             try:
-                or_group = [{"searchFieldName": a.by, "operator": op, "type": byType, "value": v}
+                or_group = [{"searchFieldName": a.by, "operator": op, "type": byType, "value": qval(v)}
                             for v in vals]
                 covered = count_records(a.table, and_query(where) + [or_group])
             except Exception:
@@ -2766,7 +2775,7 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     # The `exists` gate means `total`, every percentage, `accountedRecords` and `complete` describe
     # only the records that HAVE a value for `by`. A record matching --where with the field empty was
     # in no group and no count, so the breakdown read as the whole population when it wasn't (measured:
-    # about one in five of a filtered server population, reported complete). The where-only count
+    # part of a filtered server population, reported complete). The where-only count
     # states the gap.
     #
     # `complete` deliberately keeps its meaning -- the groups account for every record that has the
@@ -4750,9 +4759,9 @@ def _degraded_context(cov, standing, rule):
     Informational ONLY -- nothing here changes firing/clear/unevaluable -- and it rides on every verdict
     whether or not the rule opted into `includeDegraded`.
 
-    Measured by replaying this verb day-by-day over real history: on 2026-09-12 -> 13 fifty-five
-    connectors entered the degraded set at once, and the row read "no connector entered the failing set
-    since 2026-09-12 - but 3 are STILL failing". Correct about the failing set, silent about all 55. The
+    Measured by replaying this verb day-by-day over real history: in one window most of the fleet
+    entered the degraded set at once, and the row read "no connector entered the failing set
+    since <date> - but N are STILL failing". Correct about the failing set, silent about the rest. The
     verdict was right and the row still read as an all-clear, which is the flat-line problem the trend
     layer exists to refuse, relocated into an alert. So the degraded movement travels WITH the row
     instead of being dropped along with the flag that decides whether it fires.
@@ -6226,7 +6235,8 @@ def _is_top_risk_tier(level):
 
     Earlier revisions tested `"3" in level`, which fires on any label whose text merely contains a
     3 and says nothing about where that tier sits in the scale. The word is the reliable signal;
-    callers that want a defensible ranking should quote `Risk_STD` (a 0-100 percentile) alongside it.
+    callers that want a defensible ranking should quote `Risk_STD` alongside it -- a standardized
+    1-100 score whose bands define the tiers, not a population percentile (see field-map.md).
     """
     s = str(level or "").strip().lower()
     return any(w in s for w in _TOP_RISK_WORDS)
@@ -7452,11 +7462,11 @@ _LOG_LINE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T][\d:.]+\s*\|\s*\w+\s*\|
 
 # A Python traceback arrives already collapsed onto one line, so _short()'s front truncation keeps the
 # call frames and throws away the exception -- the only part that says what went wrong. Measured on a
-# live stack: 22 connectors shared one message whose visible 200 chars were
+# live stack: a whole group of connectors shared one message whose visible 200 chars were
 #   'Traceback (most recent call last): File "aws_org.py", line 73, ... botocore/paginate.py ...'
 # while the discarded tail read 'botocore.errorfactory.AccessDeniedException: An error occurred
 # (AccessDeniedException) when calling the ListAccounts operation: You don't have permissions to
-# access this resource.' -- an actionable AWS permission finding, invisible on 22 connectors. §1.5
+# access this resource.' -- an actionable AWS permission finding, invisible on every one of them. §1.5
 # requires the message say what actually happened, so keep the exception, not the frames.
 _TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\)")
 _TB_FRAME_RE = re.compile(r'File "[^"]*", line \d+, in \S+')
@@ -7816,12 +7826,12 @@ def summarize_connectors(max_failures=12, max_other=15, brief=True, max_warnings
 def _brief_connectors(result, max_warnings=12, max_detail=10):
     """Invert the coverage summary message-first, keeping every connector row.
 
-    Measured on a live 58-connector stack: 50 of the 58 are ingesting *and* carrying a warning, and
-    only 8 are in `failures[]`. So the shape that dominated the payload was a per-row `notes[]`
-    repeating 143 note instances drawn from just 67 distinct messages -- one message appeared on 22
-    separate connectors, and 8,892 of 18,023 message chars were byte-identical repeats. Quoting the
-    same sentence 22 times is not just 22x the tokens, it also buries the actual finding, which is
-    that 22 connectors share one cause.
+    Measured on a live stack: most connectors were ingesting *and* carrying a warning, and only a
+    few were in `failures[]`. So the shape that dominated the payload was a per-row `notes[]`
+    repeating twice as many note instances as there were distinct messages -- one message appeared on
+    a large group of connectors, and about half the message chars were byte-identical repeats. Quoting
+    the same sentence once per connector is not just that many times the tokens, it also buries the
+    actual finding, which is that those connectors share one cause.
 
     So `notes[]` moves off the row and becomes `warningGroups[]`, one entry per distinct message
     naming the connectors it affects. That is what SKILL.md §1.5 asks to be narrated ("quote the
@@ -7880,7 +7890,7 @@ def _brief_connectors(result, max_warnings=12, max_detail=10):
                 g = {"severity": sev, "message": msg, "connectors": []}
                 ids[key] = g
                 groups.append(g)
-            # The connector's own identity, so a group reads as "these 22 connectors, this cause".
+            # The connector's own identity, so a group reads as "these connectors, this cause".
             # Qualified the same way _coverage_ident does it, so the two agree on what a row is.
             g["connectors"].append(_coverage_ident(row))
         if worst:
@@ -7928,8 +7938,8 @@ def _preflight_coverage(cov, detail=10):
     `connect --with-connectors` is the one call SKILL.md makes mandatory on every session, so its
     payload is pure overhead on whatever the user actually asked -- and §1.5 already caps what it
     renders at roughly 6-8 delivering rows plus a rollup line, and 6-8 needing attention. Measured on
-    a live 58-connector stack, it was handed 58 full rows to print about 18 of them: 8,377 of the
-    block's 12,933 chars described connectors that reach the answer only as "+ 40 more delivering
+    a live stack, it was handed every connector's full row to print about a third of them: nearly two
+    thirds of the block's chars described connectors that reach the answer only as "+ N more delivering
     data: ...". This aligns the payload with the contract rather than changing it -- §1.5 needs no
     edit, because every row it draws arrives unchanged.
 
@@ -8006,10 +8016,10 @@ def _preflight_coverage(cov, detail=10):
 def _index_warning_groups(out):
     """State each warning cause once: groups get an `id`, and whatever names a cause points at it.
 
-    Measured on the local 51-connector stack, after the rollup above: `warningGroups[].connectors`
-    repeated 84 mentions of 51 connector idents -- 3,857 chars, the largest single block left in the
+    Measured on a live stack, after the rollup above: `warningGroups[].connectors`
+    repeated every connector ident, some more than once -- the largest single block left in the
     preflight -- because every name already appears on its own row in `connectors[]`/`delivering[]`.
-    And 7 of 10 `failures[]` messages were byte-identical to a warning group's message, since an
+    And most `failures[]` messages were byte-identical to a warning group's message, since an
     ingestion run that fails is both a hard failure and a `fail`-severity cause. Each group now
     carries `id` ("w1", ...) and no member list; each row and each such failure carries
     `warningIds`. Measured on the same stack and data: 18,810 -> 15,693 chars (-16.6%), and the
@@ -8141,7 +8151,7 @@ def hr_sources(refresh=False):
     records carry -- `jira_user`, `intune_user`, `knowbe4_user` all match one-for-one -- so each is
     counted EXACTLY with its own query, plus one OR query for the people any HR source knows (a person
     in two HR systems is one record). Not from `summary --by sourcetype`: that samples to discover
-    values, and on a real stack where one source held over 90% of the user records, the sample never
+    values, and on a real stack where one source held nearly all of the user records, the sample never
     reached a small HR source. It says so (`unaccountedRecords`), but it reads as "not present".
 
     `state`: has_data / configured_no_data / configured_disabled / none_configured / unknown. Only

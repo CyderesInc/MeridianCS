@@ -192,7 +192,7 @@ as "nothing is failing". `stillDegradedUnknown` means the snapshot recorded no d
 unknown, never 0.
 
 `--include-degraded` makes the rule fire when a connector enters the **degraded** set too. It is
-opt-in, and measured over 30 windows of real history it fired once, as a false alarm: 55 connectors
+opt-in, and measured over 30 windows of real history it fired once, as a false alarm: most of the fleet
 flapped ok→degraded inside a single anomalous snapshot. Every genuine degraded→failing move was already
 caught without it, because such a connector enters the failing set whatever it was before. A flap also
 fires on only one side — the recovery window is silent — so one bad snapshot buys one mass alert a day

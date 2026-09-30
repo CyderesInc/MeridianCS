@@ -3,6 +3,15 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.28.5 - 2026-09-30
+
+- **Risk answers follow Meridian's own risk model.** Rankings order by `Risk_Score`, tiers come from
+  `Risk_Level`, and a record with no risk factor is reported as "no risk factors identified", never
+  as low risk.
+- **Breakdowns by a number field now count correctly.** `summary --by` on a numeric field or
+  SmartLabel used to report every group as 0.
+- **The reference docs use illustrative figures throughout.**
+
 ## 2.28.4 - 2026-09-30
 
 - **Works behind TLS-inspecting proxies such as Zscaler.** On a Mac the skill now also trusts the

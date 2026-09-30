@@ -60,8 +60,18 @@ thousand. Measured on the demo stack, the same 1,198 KEV-carrying assets:
 
 ## Risk ranking
 
+Read the [Risk model](field-map.md#risk-model-both-asset-and-user) first: order by `Risk_Score`,
+tier by `Risk_Level`, and never threshold or compare the raw score across tables.
+
 - "Top 10 riskiest assets / users" → `meridian.py top --table asset --field Risk_Score --top 10`
-- "Riskiest assets in Legal" → `meridian.py top --table user --field Risk_Score --top 10 --where "Owner_Department == String Legal"`
+- "Riskiest users in Legal" → `meridian.py top --table user --field Risk_Score --top 10 --where "Owner_Department == String Legal"`
+  (assets carry `Owner_Department` too: `--table asset` for "riskiest assets in Legal")
+- "What's driving our risk?" / "why are users high risk?" → `meridian.py summary --table user --by RiskReason1 --where "Risk_Level == String 3-high"`
+  (`--table asset` likewise). Records with no `RiskReason1` had no factor identified: report
+  `recordsWithoutField` as that, not as low risk.
+- "Is an asset riskier than a user?" → compare `Risk_STD` (both 1–100), never `Risk_Score`
+- "Our own risk ranking" / crown jewels / department weighting → `meridian.py labels --search risk`,
+  then `top --field <that label's field>`
 - "Most-vulnerable assets by KEV count" → `meridian.py top --table asset --field Count_KEV --top 10`
 
 ## Vulnerability / exposure

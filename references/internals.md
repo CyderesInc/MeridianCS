@@ -173,7 +173,7 @@ download no record (`count_records`, below). These refinements keep the call cou
 - **Counts ask for a page past the end.** Every page carries `totalRecords`, including one with no
   records on it, so `count_records` requests page `COUNT_PAGE` (99999) with one record per page. Page 0
   still downloaded one whole record, which on a stack with megabyte records was the whole cost of a
-  count: 5.33MB/1.73s against 86 bytes/0.85s, same total, across every query shape the verbs send.
+  count: megabytes against under a hundred bytes, in half the time, same total, across every query shape the verbs send.
   The behaviour is undocumented, so a response without an integer total, or a 400/404/416/422, falls
   back to page 0; any other error propagates. Past 99,999 matches the page is in range again and
   carries one record: slower, never wrong.
@@ -335,8 +335,8 @@ A 100-record page is ~1.1MB of 312-field records and costs ~2.3s against a remot
 paging dominated everything.
 
 > **Page size is a per-stack fact, not a constant — don't treat the ~1.1MB above as a ceiling.** The
-> figures in this file and in CLAUDE.md were measured on a stack of ~34k assets / ~10k users. Measured
-> on a different one (26.7k assets / **66k** users): the same 100-record request returns **5.87 MB**
+> figures in this file were measured on a stack of ~34k assets / ~10k users. Measured
+> on a larger, more heavily integrated one: the same 100-record request returns **5.87 MB**
 > across **264** populated fields — 5.3x larger, ~61.5 KB per record. Record width tracks how many
 > connectors populate how many fields, so a heavily-integrated stack is wider. Anything reasoning about
 > bytes should scale from a live measurement rather than quoting a number from here: on that stack a

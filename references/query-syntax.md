@@ -263,7 +263,9 @@ To find the riskiest user, the most-vulnerable asset, the oldest cert, etc., use
 
 1. Don't assume a field's scale — many are unbounded. `Risk_Score`, for example, is NOT 0–10 and
    not 0–100; real values run from single digits into the thousands. Sample the range first with an
-   `exists` query on page 0 and inspect the values.
+   `exists` query on page 0 and inspect the values. The scale also differs per table, so a raw
+   threshold only finds a tail to sort; it never defines "high risk" — that is `Risk_Level` (see
+   field-map.md's Risk model).
 2. Filter with a `>=` threshold and pick one high enough that the result set is small
    (tens of records, 1–2 pages), then sort those client-side to get the exact top item.
 3. If the threshold returns 0, it may be too high OR the value may be wrongly quoted — for
