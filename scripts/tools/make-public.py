@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Derive the open-source distribution tree from this repository.
 
-    python scripts/make-public.py <target-dir> [--allow-dirty] [--force]
+    python scripts/tools/make-public.py <new-target-dir>
+    python scripts/tools/make-public.py --resync
 
 This repository is the INTERNAL skill: `~/.claude/skills/meridiancs` is a symlink to this working
 tree, and merging to `main` deploys it. So the public variant is *derived*, never carved out of this
@@ -53,17 +54,18 @@ reviewed derivative, so editing the internal doc invalidates the review whicheve
 Output is a directory, not a zip -- it is what seeds the public repo, so it wants to be inspected
 and diffed before anything is pushed.
 """
+import argparse
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 
+import toolkit
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-SKILL = os.path.dirname(HERE)
 
 
 def _load_pii_gate():
@@ -84,7 +86,7 @@ def _load_pii_gate():
 PII = _load_pii_gate()
 
 # Decided 2026-09-23: never. CLAUDE.md and design/ hold counsel's advice, the PII gate's denylist and
-# dismissed scan findings -- see design/oss-release.md. test_public_variants pins this False.
+# dismissed scan findings -- see design/oss-release.md. test_internal_record_is_never_published pins this False.
 PUBLISH_INTERNAL_DOCS = False
 
 # Markdown inline links, for the dangling-link audit below.
@@ -102,9 +104,9 @@ BRANDED_DOCS = {
     "Cyderes-Meridian-Skill-Guide.pdf",
     "Cyderes-Meridian-Skill-Enhancements.pdf",
     "Cyderes-MeridianCS-Brief.pdf",
-    "scripts/make-guide.py",
-    "scripts/make-impact.py",
-    "scripts/make-brief.py",
+    "scripts/tools/make-guide.py",
+    "scripts/tools/make-impact.py",
+    "scripts/tools/make-brief.py",
 }
 
 INTERNAL_DOCS = {"CLAUDE.md"}
@@ -159,8 +161,10 @@ DERIVATION_ARTIFACTS = {SYNC_STAMP}
 
 # Source-repo automation that cannot work in a derived tree. Dependabot there would open pull
 # requests against a tree the next release commit replaces wholesale, so none could ever merge;
-# updates are taken in this repo and reach the public one through the derivation.
-SOURCE_ONLY = {".github/dependabot.yml"}
+# updates are taken in this repo and reach the public one through the derivation. The release
+# workflow signs and publishes FROM this repo, through Vault roles bound to it; in the derived tree
+# it could only fail, and it would publish the Vault role and namespace layout for nothing.
+SOURCE_ONLY = {".github/dependabot.yml", ".github/workflows/release.yml"}
 
 
 def doc_digest(path):
@@ -176,7 +180,7 @@ def doc_digest(path):
 
 
 def load_sync():
-    path = os.path.join(SKILL, SYNC_STAMP)
+    path = os.path.join(toolkit.ROOT, SYNC_STAMP)
     if not os.path.exists(path):
         return {}
     try:
@@ -190,7 +194,7 @@ def load_sync():
 
 
 def write_sync(reviewed):
-    path = os.path.join(SKILL, SYNC_STAMP)
+    path = os.path.join(toolkit.ROOT, SYNC_STAMP)
     body = {
         "schema": SYNC_SCHEMA,
         "note": ("sha256 (LF-normalised) of each internal reference doc as of the last review of "
@@ -208,7 +212,7 @@ def stale_variants():
     reviewed = load_sync()
     out = []
     for internal in sorted(SUBSTITUTE_REQUIRED):
-        path = os.path.join(SKILL, internal)
+        path = os.path.join(toolkit.ROOT, internal)
         if not os.path.exists(path):
             continue
         actual = doc_digest(path)
@@ -216,17 +220,6 @@ def stale_variants():
         if recorded != actual:
             out.append((internal, recorded, actual))
     return out
-
-
-def dirty_paths():
-    out = subprocess.run(["git", "status", "--porcelain"], cwd=SKILL,
-                         capture_output=True, text=True)
-    return [l for l in out.stdout.splitlines() if l.strip()]
-
-
-def tracked_files():
-    out = subprocess.run(["git", "ls-files"], cwd=SKILL, capture_output=True, text=True, check=True)
-    return [f.strip() for f in out.stdout.splitlines() if f.strip()]
 
 
 def plan(files):
@@ -261,7 +254,7 @@ def plan(files):
 
 def copy_tree(keep, subs, target):
     for rel in keep:
-        src = os.path.join(SKILL, subs.get(rel, rel))
+        src = os.path.join(toolkit.ROOT, subs.get(rel, rel))
         dst = os.path.join(target, rel)
         parent = os.path.dirname(dst)
         if parent:
@@ -344,100 +337,26 @@ def audit(target):
 
 
 def main():
-    argv = sys.argv[1:]
-    allow_dirty = "--allow-dirty" in argv
-    force = "--force" in argv
-
-    if "--resync" in argv:
-        # Stamp the current internal docs as reviewed. Run this only after actually re-reading the
-        # diff and updating the variant -- it is the button that says "I looked", so a habit of
-        # pressing it to make a build pass turns the whole gate off.
-        reviewed = load_sync()
-        stale = stale_variants()
-        if not stale:
-            print("Already in sync; nothing to stamp.")
-            return 0
-        for internal, _recorded, actual in stale:
-            reviewed[internal] = actual
-            print("stamped %s" % internal)
-        write_sync(reviewed)
-        print("Wrote %s" % SYNC_STAMP)
-        return 0
-
-    positional = [a for a in argv if not a.startswith("--")]
-    if len(positional) != 1:
-        print(__doc__.strip().splitlines()[2].strip())
-        return 2
-    target = os.path.abspath(positional[0])
-
-    if os.path.abspath(SKILL) == target:
-        print("Refusing to write over this repository. The public tree is a separate directory.")
-        return 2
-
-    dirty = dirty_paths()
-    if dirty and not allow_dirty:
-        print("Working tree is dirty; the derived tree would not match any commit:")
-        for line in dirty[:20]:
-            print("   " + line)
-        print("Commit first, or pass --allow-dirty if you know that's what you want.")
-        return 2
-
-    files = tracked_files()
-    keep, subs, dropped, missing = plan(files)
-
+    args = parse_args()
+    if args.resync:
+        return resync()
+    keep, subs, dropped, missing = plan(toolkit.tracked_files())
     if missing:
-        print("Refusing to derive a public tree: %d doc(s) have no reviewed public "
-              "variant.\n" % len(missing))
-        for internal, variant in missing:
-            why = ("brand prose, and links to files the public build drops"
-                   if internal in REBRAND_REQUIRED else
-                   "vendor-API detail beyond Lucidum's public documentation")
-            print("   %s  ->  needs  %s   (%s)" % (internal, variant, why))
-        print("\nA reference doc here describes the vendor API beyond what Lucidum's")
-        print("public documentation states -- endpoint corrections, undocumented quirks,")
-        print("live-tenant statistics. README asserts a brand this distribution does not")
-        print("carry. Either way: write the variant by hand and review it. There is no flag")
-        print("to skip this.")
-        return 1
-
+        return refuse_missing(missing)
     stale = stale_variants()
     if stale:
-        print("Refusing to derive a public tree: %d internal doc(s) changed since their public "
-              "variant was reviewed." % len(stale))
-        print("")
-        for internal, recorded, actual in stale:
-            variant = internal[:-3] + ".public.md"
-            state = "never reviewed" if recorded is None else "reviewed at %s" % recorded[:12]
-            print("   %s  (%s, now %s)" % (internal, state, actual[:12]))
-            print("       -> re-read the diff, update %s, then: make-public.py --resync" % variant)
-        print("")
-        print("A public variant is a reviewed derivative, so a change to its source invalidates")
-        print("the review. This fails loudly because the alternative is silent: the internal doc")
-        print("gains a measured figure, the public one keeps saying something slightly false, and")
-        print("nothing looks broken.")
-        return 1
+        return refuse_stale(stale)
 
+    os.makedirs(args.target)
+    copy_tree(keep, subs, args.target)
+    problems = audit(args.target)
 
-    if os.path.exists(target) and os.listdir(target):
-        if not force:
-            print("Target exists and is not empty: %s\nPass --force to replace it." % target)
-            return 2
-        shutil.rmtree(target)
-    os.makedirs(target, exist_ok=True)
-
-    copy_tree(keep, subs, target)
-    problems = audit(target)
-
-    print("Derived public tree: %s" % target)
+    print("Derived public tree: %s" % args.target)
     print("  kept        %d files" % len(keep))
-    print("  substituted %d reference doc(s): %s"
-          % (len(subs), ", ".join(sorted(subs)) or "none"))
+    print("  substituted %d reference doc(s): %s" % (len(subs), ", ".join(sorted(subs)) or "none"))
     print("  dropped     %d files" % len(dropped))
     for f in sorted(dropped):
         print("                - %s" % f)
-    if dirty:
-        print("  NOTE: built from a DIRTY tree")
-
     if problems:
         print("\nNOT PUBLISHABLE -- %d problem(s):" % len(problems))
         for p in problems:
@@ -445,6 +364,58 @@ def main():
         return 1
     print("\nAudit clean: no brand assets, no unallowed identifiers, licence files present.")
     return 0
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="Derive the open-source distribution tree.")
+    what = ap.add_mutually_exclusive_group(required=True)
+    what.add_argument("target", nargs="?", help="directory to create (must not exist)")
+    what.add_argument("--resync", action="store_true",
+                      help="stamp the current internal docs as reviewed, after updating their variants")
+    return ap.parse_args()
+
+
+def resync():
+    """Stamp the current internal docs as reviewed.
+
+    Run only after re-reading the diff and updating the variant: this is the button that says
+    "I looked", so pressing it to make a build pass turns the whole gate off.
+    """
+    reviewed = load_sync()
+    stale = stale_variants()
+    if not stale:
+        print("Already in sync; nothing to stamp.")
+        return 0
+    for internal, _recorded, actual in stale:
+        reviewed[internal] = actual
+        print("stamped %s" % internal)
+    write_sync(reviewed)
+    print("Wrote %s" % SYNC_STAMP)
+    return 0
+
+
+def refuse_missing(missing):
+    print("Refusing to derive a public tree: %d doc(s) have no reviewed public variant.\n" % len(missing))
+    for internal, variant in missing:
+        why = ("brand prose, and links to files the public build drops" if internal in REBRAND_REQUIRED
+               else "vendor-API detail beyond Lucidum's public documentation")
+        print("   %s  ->  needs  %s   (%s)" % (internal, variant, why))
+    print("\nWrite the variant by hand and review it. There is no flag to skip this.")
+    return 1
+
+
+def refuse_stale(stale):
+    print("Refusing to derive a public tree: %d internal doc(s) changed since their public "
+          "variant was reviewed.\n" % len(stale))
+    for internal, recorded, actual in stale:
+        variant = internal[:-3] + ".public.md"
+        state = "never reviewed" if recorded is None else "reviewed at %s" % recorded[:12]
+        print("   %s  (%s, now %s)" % (internal, state, actual[:12]))
+        print("       -> re-read the diff, update %s, then: make-public.py --resync" % variant)
+    print("\nA public variant is a reviewed derivative, so a change to its source invalidates the")
+    print("review. This fails loudly because the alternative is silent: the internal doc gains a")
+    print("measured figure, the public one keeps saying something slightly false.")
+    return 1
 
 
 if __name__ == "__main__":

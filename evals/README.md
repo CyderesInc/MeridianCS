@@ -65,8 +65,8 @@ The deterministic slice is covered by an automated test — the state classifica
 a fixture) all run fully offline, no stack needed:
 
 ```bash
-python evals/test_connect.py            # offline; CI-safe; exit 0 = pass
-python evals/test_connect.py --live      # also assert connected + coverage + redaction on your stack
+uv run --project scripts/tools pytest evals            # offline; CI-safe; exit 0 = pass
+uv run --project scripts/tools pytest evals --live     # also assert connected + coverage + redaction on your stack
 ```
 
 It shares `classify_connect_error()` and `summarize_connectors()` with `meridian.py`, so a regression

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Regenerate sbom.cdx.json -- the CycloneDX software bill of materials.
 
-    python scripts/make-sbom.py            # write sbom.cdx.json
-    python scripts/make-sbom.py --check    # exit 1 if the committed file is stale
+    python scripts/tools/make-sbom.py            # write sbom.cdx.json
+    python scripts/tools/make-sbom.py --check    # exit 1 if the committed file is stale or invalid
 
 Not a skill verb -- a maintenance tool, alongside make-package.py. The SBOM itself ships (it is
 not in make-package.py's EXCLUDE), because the question it answers is asked of the distributed
@@ -32,7 +32,10 @@ import os
 import sys
 import uuid
 
-SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from cyclonedx.schema import SchemaVersion
+from cyclonedx.validation.json import JsonStrictValidator
+
+SKILL = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(SKILL, "sbom.cdx.json")
 
 # (family, file, SPDX licence id, copyright, upstream, licence text file)
@@ -158,16 +161,20 @@ def render():
 def main(argv):
     text = render()
     if "--check" in argv:
+        error = JsonStrictValidator(SchemaVersion.V1_6).validate_str(text)
+        if error:
+            print("sbom.cdx.json would not be valid CycloneDX 1.6: %s" % error)
+            return 1
         if not os.path.exists(OUT):
-            print("sbom.cdx.json is missing; run: python scripts/make-sbom.py")
+            print("sbom.cdx.json is missing; run: python scripts/tools/make-sbom.py")
             return 1
         with open(OUT, encoding="utf-8") as f:
             current = f.read()
         if current != text:
             print("sbom.cdx.json is stale (a bundled component changed).")
-            print("Regenerate it with: python scripts/make-sbom.py")
+            print("Regenerate it with: python scripts/tools/make-sbom.py")
             return 1
-        print("sbom.cdx.json is current.")
+        print("sbom.cdx.json is current and valid CycloneDX 1.6.")
         return 0
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)

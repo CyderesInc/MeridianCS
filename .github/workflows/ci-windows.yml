@@ -14,7 +14,7 @@
 #   - not on draft PRs; `ready_for_review` gives a draft the run its pushes skipped.
 #
 # Same rules as ci.yml: actions pinned to commit SHAs, checkout persists no credentials, read-only
-# token. test_ci_workflow [47] checks every file in this directory, not just ci.yml.
+# token. zizmor (a pre-commit hook) checks every file in this directory.
 name: CI (Windows)
 
 on:
@@ -34,6 +34,10 @@ concurrency:
   group: ci-windows-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# The uv project for all tooling, including the offline suite, lives in scripts/tools/.
+env:
+  UV_PROJECT: scripts/tools
+
 jobs:
   offline-suite:
     name: offline-suite (windows-latest)
@@ -43,8 +47,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Offline test suite
-        run: python evals/test_connect.py
+        run: uv run --locked pytest evals

@@ -27,13 +27,16 @@ tree here with a fresh derivation. So a pull request is not merged here directly
 
 To make one easy to accept:
 
-- **Python 3 standard library only.** `scripts/meridian.py` has no pip dependencies, and that is
-  deliberate. Only `report` needs anything more (a Chromium browser for PDF output).
-- **Run the offline suite and the lint hooks.** CI runs both, on Ubuntu and Windows:
+- **The skill stays on the Python standard library.** `scripts/meridian.py` has no pip dependencies,
+  and that is deliberate: it has to run on any Python 3.9+ with nothing to install. Only `report`
+  needs anything more (a Chromium browser for PDF output). Repo tooling may use dependencies, locked
+  in `scripts/tools/uv.lock`.
+- **Run the offline suite and the lint hooks** with [uv](https://docs.astral.sh/uv/). CI runs both,
+  on Ubuntu and Windows:
 
   ```bash
-  python evals/test_connect.py
-  pre-commit run --all-files
+  uv run --locked --project scripts/tools --group release pytest evals
+  uv run --locked --project scripts/tools --group dev pre-commit run --all-files
   ```
 
 - **`SKILL.md` is behaviour, not documentation.** It is the instruction set the model follows at

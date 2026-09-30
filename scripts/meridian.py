@@ -5909,7 +5909,7 @@ def _load_css():
 def _branded():
     """True when this install carries the Cyderes brand assets.
 
-    Public builds ship without them (see scripts/make-public.py). A build that cannot render the
+    Public builds ship without them (see scripts/tools/make-public.py). A build that cannot render the
     wordmark must not assert it in text either: "cyderes" spelled out in the masthead, or a footer
     naming Cyderes, is the same trademark use as the artwork with the artwork taken away. So this
     gates the words too, not only the SVG -- which is the whole reason it exists rather than each
@@ -8434,6 +8434,10 @@ def cmd_check(a):
 #      not a licence to fetch executable code over an unverified connection.
 #   5. The swap is recoverable. The new tree is staged, smoke-tested by running its own --help, and
 #      only then moved into place; the old tree is kept until that succeeds, and restored if it fails.
+#   6. A package installs only with a signature by a key in RELEASE_SIGNING_KEYS, checked over the
+#      raw downloaded bytes BEFORE the zip is parsed, extracted or run. Rules 1-5 prove where it came
+#      from; this proves a release key built it. No env var or config key adds a trusted key: that
+#      would be rule 3's remote code execution again.
 
 # The PUBLIC distribution repo, "owner/name". EMPTY MEANS THE FEATURE IS INERT: check_update returns
 # `disabled` without touching the network, which is the correct behaviour while the public repo does
@@ -8471,6 +8475,16 @@ UPDATE_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 # release says, and installing it would leave the user with no working skill at all.
 UPDATE_REQUIRED_MEMBERS = ("SKILL.md", "scripts/meridian.py", "VERSION.json")
 UPDATE_UA = "meridiancs-skill-selfupdate"
+UPDATE_SIG_SUFFIX = ".sig"                     # the signature asset is "<package name>.sig"
+UPDATE_MAX_SIG_BYTES = 64 * 1024               # a few armored blocks are ~1KB; this is a runaway stop
+
+# The prod Vault Transit release key (design/release-signing.md). An install trusts the list it
+# already has, never the new package's, so changing this strands every install unless the release
+# that changes it is signed by a key already here; the suite pins its fingerprint for that reason.
+RELEASE_SIGNING_KEYS = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPYtuETdYl+SD4h3N/1f8gOT3biRfmoMJpg++ty7EWrA meridiancs-release-vault-v1",)
+RELEASE_SIG_NAMESPACE = "meridiancs-release"
+RELEASE_SIG_HASHES = ("sha512", "sha256")      # the two SSHSIG allows; ssh-keygen defaults to sha512
+RELEASE_SIG_MAX_BLOCKS = 8                     # co-signed releases carry several blocks in one file
 
 
 def _github_host(url, api=False):
@@ -8644,8 +8658,16 @@ def latest_release(repo):
         raise ValueError("release %s carries %d %s assets; expected exactly one"
                          % (tag, len(assets), UPDATE_ASSET_SUFFIX))
     a = assets[0]
+    # Required at check time, not only at apply time: `outdated` for a release no install will accept
+    # would have every session download ~1MB and fail. `unknown` is the honest state.
+    sig_name = str(a.get("name")) + UPDATE_SIG_SUFFIX
+    sigs = [s for s in (rel.get("assets") or []) if s.get("name") == sig_name]
+    if len(sigs) != 1:
+        raise ValueError("release %s carries %s %s; a release is installed only with exactly one"
+                         % (tag, "no" if not sigs else len(sigs), sig_name))
     return {"version": "%d.%d.%d" % ver, "tag": tag, "assetName": a.get("name"),
-            "assetUrl": a.get("browser_download_url"), "assetSize": a.get("size")}
+            "assetUrl": a.get("browser_download_url"), "assetSize": a.get("size"),
+            "sigUrl": sigs[0].get("browser_download_url")}
 
 
 def _read_updatecheck():
@@ -8855,9 +8877,230 @@ def check_update(force=False, now=None):
                      % (local, rel["version"])}
     out = dict(base, state=state, latestVersion=rel["version"], latestTag=rel["tag"],
                assetUrl=rel["assetUrl"], assetName=rel["assetName"], assetSize=rel["assetSize"],
-               checkedVia="network", message=msgs[state])
+               sigUrl=rel.get("sigUrl"), checkedVia="network", message=msgs[state])
     _write_updatecheck(dict(out, schema=UPDATE_CHECK_CACHE_SCHEMA, checkedAt=now))
     return out
+
+
+# --- Release signatures: Ed25519 verification, in pure Python ------------------------------------
+#
+# RFC 8032 verification written out, because installs run stdlib-only Python and the standard
+# library has no Ed25519. Verification only: every input is public, so pure-Python timing is no risk.
+#
+# The format is OpenSSH's SSHSIG (PROTOCOL.sshsig) rather than a raw signature: its namespace stops a
+# signature the key made for anything else passing as a release, and anyone can check a release with
+# `ssh-keygen -Y verify` without trusting this code.
+
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+_ED_IDENTITY = (0, 1, 1, 0)
+
+
+def _ed_add(P, Q):
+    """Point addition in extended coordinates (X, Y, Z, T), x = X/Z, y = Y/Z, xy = T/Z. Complete for
+    Ed25519, so it also doubles -- one formula, no special cases to get wrong."""
+    p = _ED_P
+    a = (P[1] - P[0]) * (Q[1] - Q[0]) % p
+    b = (P[1] + P[0]) * (Q[1] + Q[0]) % p
+    c = 2 * P[3] * Q[3] * _ED_D % p
+    d = 2 * P[2] * Q[2] % p
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % p, g * h % p, f * g % p, e * h % p)
+
+
+def _ed_mul(s, P):
+    Q = _ED_IDENTITY
+    while s > 0:
+        if s & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        s >>= 1
+    return Q
+
+
+def _ed_equal(P, Q):
+    p = _ED_P
+    return (P[0] * Q[2] - Q[0] * P[2]) % p == 0 and (P[1] * Q[2] - Q[1] * P[2]) % p == 0
+
+
+def _ed_recover_x(y, sign):
+    p = _ED_P
+    if y >= p:
+        return None                    # non-canonical encoding: RFC 8032 5.1.3 says reject
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, p - 2, p) % p
+    if x2 == 0:
+        return None if sign else 0     # x = 0 has no negative; a set sign bit is malformed
+    x = pow(x2, (p + 3) // 8, p)
+    if (x * x - x2) % p:
+        x = x * _ED_SQRT_M1 % p
+    if (x * x - x2) % p:
+        return None                    # not on the curve
+    return p - x if (x & 1) != sign else x
+
+
+def _ed_decode(b):
+    if len(b) != 32:
+        return None
+    y = int.from_bytes(b, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    x = _ed_recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _ED_P)
+
+
+_ED_BASE = _ed_decode((4 * pow(5, _ED_P - 2, _ED_P) % _ED_P).to_bytes(32, "little"))
+
+
+def ed25519_verify(public_key, message, signature):
+    """RFC 8032 section 5.1.7. True only for a valid signature; any malformed input is False."""
+    import hashlib
+    if len(public_key) != 32 or len(signature) != 64:
+        return False
+    A, R = _ed_decode(public_key), _ed_decode(signature[:32])
+    if A is None or R is None:
+        return False
+    s = int.from_bytes(signature[32:], "little")
+    if s >= _ED_L:
+        return False                   # malleability: the RFC requires 0 <= S < L
+    k = int.from_bytes(hashlib.sha512(signature[:32] + public_key + message).digest(), "little") % _ED_L
+    return _ed_equal(_ed_mul(s, _ED_BASE), _ed_add(R, _ed_mul(k, A)))
+
+
+def _ssh_string(b):
+    return len(b).to_bytes(4, "big") + b
+
+
+def _ssh_read(buf, off):
+    if off + 4 > len(buf):
+        raise ValueError("truncated")
+    n = int.from_bytes(buf[off:off + 4], "big")
+    if off + 4 + n > len(buf):
+        raise ValueError("truncated")
+    return buf[off + 4:off + 4 + n], off + 4 + n
+
+
+def _ssh_ed25519_key(blob):
+    """An OpenSSH public-key blob -> the raw 32-byte Ed25519 key. Refuses any other key type."""
+    kt, off = _ssh_read(blob, 0)
+    key, off = _ssh_read(blob, off)
+    if kt != b"ssh-ed25519" or len(key) != 32 or off != len(blob):
+        raise ValueError("not an ssh-ed25519 public key")
+    return key
+
+
+def parse_ssh_pubkey(line):
+    """"ssh-ed25519 AAAA... comment" -> {"key": 32 bytes, "blob", "comment", "fingerprint"}."""
+    import base64
+    parts = (line or "").strip().split(None, 2)
+    if len(parts) < 2 or parts[0] != "ssh-ed25519":
+        raise ValueError("not an ssh-ed25519 public-key line")
+    blob = base64.b64decode(parts[1], validate=True)
+    return {"key": _ssh_ed25519_key(blob), "blob": blob,
+            "comment": parts[2].strip() if len(parts) > 2 else "",
+            "fingerprint": ssh_fingerprint(blob)}
+
+
+def ssh_fingerprint(blob):
+    """The SHA256:... form `ssh-keygen -l` prints, so a signer can be matched by eye."""
+    import base64, hashlib
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+
+
+def sshsig_signed_data(message, namespace=RELEASE_SIG_NAMESPACE, hash_alg="sha512"):
+    """The exact bytes an SSHSIG signature covers: the namespace and a hash of the message."""
+    import hashlib
+    if hash_alg not in RELEASE_SIG_HASHES:
+        raise ValueError("unsupported SSHSIG hash %r" % hash_alg)
+    return (b"SSHSIG" + _ssh_string(namespace.encode()) + _ssh_string(b"")
+            + _ssh_string(hash_alg.encode()) + _ssh_string(hashlib.new(hash_alg, message).digest()))
+
+
+def sshsig_armor(public_blob, signature, namespace=RELEASE_SIG_NAMESPACE, hash_alg="sha512"):
+    """Wrap a raw 64-byte Ed25519 signature as an armored SSHSIG block, as ssh-keygen writes it."""
+    import base64
+    body = (b"SSHSIG" + (1).to_bytes(4, "big") + _ssh_string(public_blob)
+            + _ssh_string(namespace.encode()) + _ssh_string(b"") + _ssh_string(hash_alg.encode())
+            + _ssh_string(_ssh_string(b"ssh-ed25519") + _ssh_string(signature)))
+    b64 = base64.b64encode(body).decode("ascii")
+    lines = [b64[i:i + 70] for i in range(0, len(b64), 70)]
+    return "-----BEGIN SSH SIGNATURE-----\n%s\n-----END SSH SIGNATURE-----\n" % "\n".join(lines)
+
+
+_SSHSIG_BLOCK_RE = re.compile(r"-----BEGIN SSH SIGNATURE-----(.*?)-----END SSH SIGNATURE-----", re.S)
+
+
+def _sshsig_check(body, message, trusted, namespace):
+    """One decoded SSHSIG block -> the trusted key record it verifies under. Raises why not."""
+    if body[:6] != b"SSHSIG":
+        raise ValueError("not an SSHSIG blob")
+    off = 6
+    if body[off:off + 4] != (1).to_bytes(4, "big"):
+        raise ValueError("unsupported SSHSIG version")
+    off += 4
+    pub, off = _ssh_read(body, off)
+    ns, off = _ssh_read(body, off)
+    reserved, off = _ssh_read(body, off)
+    halg, off = _ssh_read(body, off)
+    sigblob, off = _ssh_read(body, off)
+    if off != len(body):
+        raise ValueError("trailing data after the signature")
+    # The namespace is compared BEFORE any key is considered, and exactly: it is what stops a
+    # signature the same key made for any other purpose from standing in for a release.
+    if ns != namespace.encode():
+        raise ValueError("namespace is %r, not %r" % (ns.decode("utf-8", "replace"), namespace))
+    if halg.decode("ascii", "replace") not in RELEASE_SIG_HASHES:
+        raise ValueError("unsupported hash %r" % halg.decode("ascii", "replace"))
+    key = _ssh_ed25519_key(pub)
+    rec = next((t for t in trusted if t["key"] == key), None)
+    if rec is None:
+        raise ValueError("signed by %s, which is not a release key" % ssh_fingerprint(pub))
+    st, soff = _ssh_read(sigblob, 0)
+    raw, soff = _ssh_read(sigblob, soff)
+    if st != b"ssh-ed25519" or len(raw) != 64 or soff != len(sigblob):
+        raise ValueError("not an ssh-ed25519 signature")
+    import hashlib
+    signed = (b"SSHSIG" + _ssh_string(ns) + _ssh_string(reserved) + _ssh_string(halg)
+              + _ssh_string(hashlib.new(halg.decode("ascii"), message).digest()))
+    if not ed25519_verify(key, signed, raw):
+        raise ValueError("signature by %s does not match this package" % rec["fingerprint"])
+    return rec
+
+
+def verify_release_signature(message, sig_text, keys=None, namespace=RELEASE_SIG_NAMESPACE):
+    """Return the trusted key that signed `message` (bytes), or raise ValueError saying why none did.
+
+    `sig_text` may hold several armored blocks -- a co-signed release -- and ONE valid block by a
+    trusted key is enough. Every other block is ignored rather than fatal, so a co-signature by a key
+    this install does not know yet cannot stop it installing a release its own key list accepts.
+    `keys` defaults to RELEASE_SIGNING_KEYS; an empty list verifies nothing, which is the point.
+    """
+    import base64
+    trusted = []
+    for line in (RELEASE_SIGNING_KEYS if keys is None else keys):
+        try:
+            trusted.append(parse_ssh_pubkey(line))
+        except Exception:  # noqa - a malformed embedded key is skipped, and the suite catches it
+            continue
+    if not trusted:
+        raise ValueError("this build trusts no release signing key, so it can verify no release")
+    if isinstance(sig_text, bytes):
+        sig_text = sig_text.decode("ascii", "replace")
+    blocks = _SSHSIG_BLOCK_RE.findall(sig_text or "")
+    if not blocks:
+        raise ValueError("the signature file holds no SSH signature block")
+    if len(blocks) > RELEASE_SIG_MAX_BLOCKS:
+        raise ValueError("the signature file holds %d blocks; refusing more than %d"
+                         % (len(blocks), RELEASE_SIG_MAX_BLOCKS))
+    why = []
+    for b in blocks:
+        try:
+            body = base64.b64decode("".join(b.split()), validate=True)
+            rec = _sshsig_check(body, message, trusted, namespace)
+            return {"fingerprint": rec["fingerprint"], "comment": rec["comment"]}
+        except Exception as e:  # noqa - collected: the error names every block's reason
+            why.append(str(e))
+    raise ValueError("no valid release signature: " + "; ".join(why))
 
 
 def _validate_package(zf, want_version):
@@ -9073,6 +9316,8 @@ def apply_update(rel):
     want = rel.get("latestVersion")
     if not rel.get("assetUrl") or not parse_version(want):
         raise ValueError("no comparable release asset to install")
+    if not rel.get("sigUrl"):
+        raise ValueError("the release carries no signature, so it cannot be verified; not installing")
     parent = os.path.dirname(INSTALL_REAL)
     # Temp dir BESIDE the install, not in the system temp dir: os.replace cannot rename across
     # filesystems, and ~/.claude/skills is routinely on a different volume from /tmp.
@@ -9081,6 +9326,18 @@ def apply_update(rel):
     try:
         pkg = os.path.join(tmp, "package.zip")
         size = _download_asset(rel["assetUrl"], pkg)
+        sig_path = os.path.join(tmp, "package.zip.sig")
+        _download_asset(rel["sigUrl"], sig_path)
+        if os.path.getsize(sig_path) > UPDATE_MAX_SIG_BYTES:
+            raise ValueError("signature asset exceeds %d bytes" % UPDATE_MAX_SIG_BYTES)
+        # Rule 6: verified over the raw bytes, before zipfile parses a single header. Everything
+        # after this line -- the zip parser, the extraction, the smoke test that RUNS the new code --
+        # only ever sees a package a release key signed.
+        with open(pkg, "rb") as f:
+            body = f.read()
+        with open(sig_path, "rb") as f:
+            signer = verify_release_signature(body, f.read())
+        del body
         staged_root = os.path.join(tmp, "unpacked")
         os.makedirs(staged_root)
         with zipfile.ZipFile(pkg) as zf:
@@ -9137,7 +9394,7 @@ def apply_update(rel):
         return {"applied": True, "fromVersion": rel.get("installedVersion"), "toVersion": want,
                 **({"whatsNew": notes, "changelog": _changelog_path()} if notes else {}),
                 "commit": (stamp or {}).get("commit"), "installDir": INSTALL_REAL,
-                "assetBytes": size, "swap": swap,
+                "assetBytes": size, "swap": swap, "signedBy": signer,
                 # The skill's instructions were loaded into this session BEFORE the swap, so the
                 # scripts on disk are now newer than the SKILL.md the model is following. Saying so is
                 # the difference between an update and an unexplained change in behaviour.

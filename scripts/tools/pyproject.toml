@@ -1,0 +1,33 @@
+# The tooling that works ON the skill: every script in this directory, and the offline suite in
+# evals/. The skill itself (scripts/meridian.py) is not part of it: it stays stdlib-only so it runs
+# on any Python 3.9+ with nothing to install, and make-package.py leaves this directory out.
+# Run tools from the repo root with `uv run --project scripts/tools` (or UV_PROJECT=scripts/tools).
+#
+# requires-python is the skill's floor, not the tooling's: the suite has to run on 3.9 to prove the
+# skill does. Only the `test` group resolves that far; every other group is held to the tooling's
+# own Python, so a tooling dependency never has to support 3.9.
+[project]
+name = "meridiancs-tooling"
+version = "0"  # uv requires one; the skill's version lives only in its git tag
+requires-python = ">=3.9"
+
+[dependency-groups]
+test = [
+    "cryptography>=44",
+    "pytest>=8",
+    "pytest-check>=2",
+]
+release = ["hvac>=2.4"]
+dev = [
+    "cyclonedx-python-lib[json-validation]>=11",
+    "pre-commit>=4",
+    "zizmor>=1.30",
+]
+
+[tool.uv]
+package = false
+default-groups = ["test", "dev"]
+
+[tool.uv.dependency-groups]
+release = { requires-python = ">=3.12" }
+dev = { requires-python = ">=3.12" }

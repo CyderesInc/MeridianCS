@@ -22,17 +22,17 @@ Covers the *deterministic* parts of onboarding — the bits that don't need a li
                              Chrome), and a human-looking name resolves in one round trip.
 
 These map to evals 14 (not_configured) and the state logic behind 15/16/http_error in evals.json.
-Runs fully offline; safe for CI. Exit code 0 = all passed, 1 = a failure.
+Runs fully offline; safe for CI.
 
 Optional live check (needs a reachable stack + valid config or MERIDIAN_* env):
-    python evals/test_connect.py --live
+    uv run --project scripts/tools pytest evals --live
 It asserts a real `connect` returns state=connected with numeric asset/user counts, never leaks more
 than the last 4 chars of the token, and that `connectors` returns a coherent coverage summary with no
 credential fields in it.
 
 Usage:
-    python evals/test_connect.py            # offline deterministic tests
-    python evals/test_connect.py --live     # also hit the configured stack
+    uv run --project scripts/tools pytest evals             # offline deterministic tests
+    uv run --project scripts/tools pytest evals --live      # also hit the configured stack
 """
 import argparse
 import datetime
@@ -47,40 +47,15 @@ import sys
 import tempfile
 import time
 
+import pytest
+import pytest_check
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MERIDIAN_PY = os.path.join(os.path.dirname(HERE), "scripts", "meridian.py")
 
-_passed = 0
-_failed = 0
-
-
-def derived_tree():
-    """True when the suite is running inside make-public.py's OUTPUT rather than the source repo.
-
-    Four tests here assert properties OF the derivation -- that this tree is branded [29], that
-    the .public.md sources exist and are in sync [30], that deriving produces a clean audit [32],
-    and that publishing a derivation commits before it builds [36]. None of them can hold in the
-    derived tree itself, which has no brand assets, no variants and no design/ record. The public
-    repository runs this same suite, so they skip there instead of failing assertions that
-    describe work already done correctly (17 of them before [36] existed).
-
-    Joint signal, for the same reason check-docs-pii.py uses one: an absent design/ on its own,
-    or an absent variant on its own, is a source-repo defect that has to stay loud. Only the
-    combination means "derived".
-    """
-    root = os.path.dirname(HERE)
-    return (not os.path.isdir(os.path.join(root, "design"))
-            and not os.path.exists(os.path.join(root, "references", "api-reference.public.md")))
-
 
 def check(name, got, want):
-    global _passed, _failed
-    if got == want:
-        _passed += 1
-        print("  PASS  %s" % name)
-    else:
-        _failed += 1
-        print("  FAIL  %s\n          got:  %r\n          want: %r" % (name, got, want))
+    pytest_check.equal(got, want, name)
 
 
 def load_meridian():
@@ -90,8 +65,12 @@ def load_meridian():
     return mod
 
 
+@pytest.fixture(scope="session")
+def m():
+    return load_meridian()
+
+
 def test_classify(m):
-    print("[1] error classification (offline)")
     cases = [
         ("HTTP 401: {\"code\":401001}",                          ("auth_error", 401)),
         ("HTTP 403: Forbidden",                                  ("forbidden", 403)),
@@ -106,7 +85,21 @@ def test_classify(m):
               m.classify_connect_error(err), want)
 
 
-def test_lazy_imports():
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="sys.stdlib_module_names is 3.10+")
+def test_skill_is_stdlib_only():
+    """The suite runs with test dependencies installed, so only this catches a third-party import."""
+    import ast
+    with open(MERIDIAN_PY, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+                for alias in node.names}
+    imported |= {node.module for node in ast.walk(tree)
+                 if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module}
+    third_party = sorted(name for name in imported if name.split(".")[0] not in sys.stdlib_module_names)
+    check("meridian.py imports only the standard library", third_party, [])
+
+
+def test_lazy_imports(monkeypatch):
     """Four stdlib modules are deferred to their call sites; assert they stay deferred.
 
     One process runs per verb, so import cost is paid on every single invocation. Measured with
@@ -123,7 +116,6 @@ def test_lazy_imports():
     means restructuring the one HTTP chokepoint; and `csv`/`datetime`, whose 0.9ms combined is below
     noise. `shutil` cannot be deferred at all -- argparse imports it itself for the terminal width.
     """
-    print("[3f] deferred imports stay deferred (offline)")
     DEFERRED = ("concurrent.futures", "hashlib", "difflib", "secrets")
     probe = (
         "import importlib.util, sys\n"
@@ -146,20 +138,15 @@ def test_lazy_imports():
     check("hashlib reachable: salt id", len(m.salt_id("salt")), 8)
     check("concurrent.futures reachable: parallel()", m.parallel([lambda: 1, lambda: 2]), [1, 2])
 
-    real_fm = dict(m._FIELD_MAP)
+    monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))
     m._FIELD_MAP["asset"] = {"Asset_Type": "String", "Asset_Name": "String"}
-    try:
-        # field_problem() is the difflib caller: it must still produce the did-you-mean.
-        msg = m.field_problem("asset", "Asset_Typo")
-        check("difflib reachable: did-you-mean is produced", "Did you mean" in (msg or ""), True)
-        check("...naming the near match", "Asset_Type" in (msg or ""), True)
-    finally:
-        m._FIELD_MAP.clear()
-        m._FIELD_MAP.update(real_fm)
+    # field_problem() is the difflib caller: it must still produce the did-you-mean.
+    msg = m.field_problem("asset", "Asset_Typo")
+    check("difflib reachable: did-you-mean is produced", "Did you mean" in (msg or ""), True)
+    check("...naming the near match", "Asset_Type" in (msg or ""), True)
 
 
 def test_not_configured():
-    print("[2] not_configured end-to-end (offline, no network call)")
     with tempfile.TemporaryDirectory() as tmp:
         env = {k: v for k, v in os.environ.items() if not k.startswith("MERIDIAN_")}
         # Point HOME/USERPROFILE at an empty dir so no config.json is found on any OS.
@@ -248,8 +235,7 @@ FIXTURE_RUNS = {"content": [
 ]}
 
 
-def test_connector_rollup(m):
-    print("[3] connector / data-coverage rollup (offline, fixture-driven)")
+def test_connector_rollup(m, monkeypatch):
     calls = []
 
     def fake_call(method, endpoint, body=None, retries=1):
@@ -260,20 +246,16 @@ def test_connector_rollup(m):
             return FIXTURE_RUNS
         raise AssertionError("unexpected endpoint %r" % endpoint)
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        out = m.summarize_connectors()
-        brief_calls = len(calls)
-        # The --full shape as well, because the leak assertions below are worthless without it.
-        # `brief` (the default) reshapes rows through _brief_connectors, which rebuilds them from
-        # named keys -- so a field leaking out of summarize_connectors itself is invisible in the
-        # brief output while sitting in plain view of anyone running `connectors --full`. Proven,
-        # not assumed: adding a passthrough key to the profile extraction left every one of these
-        # checks passing until this second call existed.
-        full = m.summarize_connectors(brief=False)
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    out = m.summarize_connectors()
+    brief_calls = len(calls)
+    # The --full shape as well, because the leak assertions below are worthless without it.
+    # `brief` (the default) reshapes rows through _brief_connectors, which rebuilds them from
+    # named keys -- so a field leaking out of summarize_connectors itself is invisible in the
+    # brief output while sitting in plain view of anyone running `connectors --full`. Proven,
+    # not assumed: adding a passthrough key to the profile extraction left every one of these
+    # checks passing until this second call existed.
+    full = m.summarize_connectors(brief=False)
 
     check("both endpoints read, once each", brief_calls, 2)
     check("whole run history in one call", any("size=2000" in c for c in calls), True)
@@ -355,22 +337,16 @@ def test_connector_rollup(m):
             return FIXTURE_PROFILES
         raise RuntimeError('HTTP 403: {"code":403001,"message":"Forbidden"}')
 
-    m.call = half_blocked
-    try:
-        part = m.summarize_connectors()
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", half_blocked)
+    part = m.summarize_connectors()
     check("blocked half reported, not raised", part["fetched"]["profiles"], "ok")
     check("...with the error on the other half", "403" in part["fetched"]["ingestion"], True)
     check("connectors still enumerated", part["summary"]["connectorsEnabled"], 4)
     check("no connector called idle without run data", part["summary"]["idle"], 0)
     check("connection tests still judged", part["summary"]["failing"], 1)
 
-    m.call = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden"))
-    try:
-        none = m.summarize_connectors()
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden")))
+    none = m.summarize_connectors()
     check("both halves blocked still returns a summary", none["summary"]["connectorsEnabled"], 0)
     check("...and says why for each half",
           ["403" in none["fetched"]["profiles"], "403" in none["fetched"]["ingestion"]], [True, True])
@@ -381,7 +357,6 @@ def test_connector_warning_messages(m):
     service `event_messages` were read, mangled through _short() into a raw loguru dump, and then
     discarded entirely once several services rolled up into one connector verdict. `connectors[].
     lastIngest.notes` now carries the actual cause, in the reader's terms rather than a log line."""
-    print("[3c] connector warning/failure messages, cleaned and surfaced (offline)")
     loguru_list = [{"WARNING": "2026-08-26 04:29:19.400 | WARNING  | loguru._logger:warning:1979 - "
                                 "no local data template and save options, or invalid json file format\n"},
                    {"WARNING": "2026-08-26 04:29:19.401 | WARNING  | loguru._logger:warning:1979 - "
@@ -465,7 +440,7 @@ def test_connector_warning_messages(m):
     check("overall verdict is the worse of the two", mixed["health"], "fail")
 
 
-def test_connector_brief_shape(m):
+def test_connector_brief_shape(m, monkeypatch):
     """`connectors` is the one call SKILL.md makes mandatory every session, so its payload is pure
     overhead on whatever the user actually asked. Measured on a live 58-connector stack it was 75,288
     chars (~20,900 tokens) of which 50,277 was the connector block -- while 50 of the 58 connectors
@@ -483,7 +458,6 @@ def test_connector_brief_shape(m):
         detail budget, which is exactly the bug the first draft shipped with;
       * `--full` has to still produce the per-row notes[] the shape replaced.
     """
-    print("[3d] connectors brief shape (offline)")
 
     # 24 connectors: 2 fail their connection test, 20 ingest fine but share only 3 distinct warnings
     # (so the message table dedupes hard), and 2 are clean. Enough to trip both caps.
@@ -512,13 +486,9 @@ def test_connector_brief_shape(m):
             return {"content": runs}
         raise AssertionError("unexpected endpoint %r" % endpoint)
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        brief = m.summarize_connectors(brief=True)
-        full = m.summarize_connectors(brief=False)
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    brief = m.summarize_connectors(brief=True)
+    full = m.summarize_connectors(brief=False)
 
     check("brief is labelled as such", brief["shape"], "brief")
     check("full carries no shape marker", "shape" in full, False)
@@ -582,7 +552,7 @@ def test_connector_brief_shape(m):
     check("group is dropped from brief rows", any("group" in c for c in brief["connectors"]), False)
 
 
-def test_preflight_coverage(m):
+def test_preflight_coverage(m, monkeypatch):
     """`_preflight_coverage` -- the rollup `connect --with-connectors` applies on top of brief.
 
     Brief already cut the payload 71% by inverting it message-first. What it could not cut is the
@@ -615,7 +585,6 @@ def test_preflight_coverage(m):
     what it saw before -- asserted here by deriving coverage from the input after the rollup ran,
     which also catches the shape mutating its argument in place.
     """
-    print("[3g] preflight coverage rollup (offline)")
 
     # Same population shape as the brief fixture: 2 fail their connection test, 20 ingest with a
     # shared cause, 2 are clean -- enough that the detail window closes and rows actually roll up.
@@ -643,12 +612,8 @@ def test_preflight_coverage(m):
             return {"content": runs}
         raise AssertionError("unexpected endpoint %r" % endpoint)
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        brief = m.summarize_connectors(brief=True)
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    brief = m.summarize_connectors(brief=True)
 
     baseline = json.loads(json.dumps(brief))          # what cmd_connect --coverage-full would print
     pre = m._preflight_coverage(brief)
@@ -815,7 +780,7 @@ def _rebuild_warnings(m, pre):
     return _norm_groups(list(groups.values())), fails
 
 
-def test_result_cache(m):
+def test_result_cache(m, monkeypatch, tmp_path):
     """The aggregate cache, and the one thing it must never do: feed a snapshot.
 
     Why it exists: the API has no aggregation endpoint and no field projection, so an aggregate is paid
@@ -829,15 +794,11 @@ def test_result_cache(m):
     that was never measured today with today's date -- inventing a flat segment, which per
     design/trends.md is the most convincing wrong answer this tool can produce. Both paths must refetch.
     """
-    print("[3e] aggregate result cache (offline)")
-    import tempfile
-    real = (m.CFG_DIR, m.call, m.load_config, m.check_fields, m.field_type)
-    tmp = tempfile.mkdtemp(prefix="rescache-")
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("s.example", "tok", None)
-    m.check_fields = lambda *a, **k: None
-    m.field_type = lambda t, f: "String"
-    os.environ.pop("MERIDIAN_NO_CACHE", None)   # this test is the one that exercises cached reads
+    monkeypatch.setattr(m, "CFG_DIR", str(tmp_path))
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "check_fields", lambda *a, **k: None)
+    monkeypatch.setattr(m, "field_type", lambda t, f: "String")
+    monkeypatch.delenv("MERIDIAN_NO_CACHE")   # this test is the one that exercises cached reads
 
     calls = []
 
@@ -849,7 +810,7 @@ def test_result_cache(m):
         return {"totalRecords": 120,
                 "data": [{"Risk_Level": "1-low"} for _ in range(100)]}
 
-    m.call = fake_call
+    monkeypatch.setattr(m, "call", fake_call)
     # Every breakdown here passes a rebuild stamp. Since design/data-currency.md the stamp is part of
     # the key and NO stamp means NO cache, so a call without one would make each "is a miss" check
     # below pass trivially -- and leave the 0600 check stat()-ing a file that was never written.
@@ -859,199 +820,176 @@ def test_result_cache(m):
         kw.setdefault("rebuilt", stamp)
         return m.summarize_by(*args, **kw)
 
-    try:
-        # --- a second identical breakdown costs nothing ---------------------------------------
-        first = sb("asset", "Risk_Level")
-        n_first = len(calls)
-        second = sb("asset", "Risk_Level")
-        check("a repeated breakdown issues no further calls", len(calls), n_first)
-        check("...and the first one actually cost calls", n_first > 1, True)
-        check("cached groups match the computed ones", second["groups"], first["groups"])
-        check("a fresh result carries no cache stamp", "fromCache" in first, False)
-        check("a served result is stamped", second.get("fromCache"), True)
-        check("...with an age, so staleness is statable", isinstance(second.get("cacheAgeSeconds"), int), True)
+    # --- a second identical breakdown costs nothing ---------------------------------------
+    first = sb("asset", "Risk_Level")
+    n_first = len(calls)
+    second = sb("asset", "Risk_Level")
+    check("a repeated breakdown issues no further calls", len(calls), n_first)
+    check("...and the first one actually cost calls", n_first > 1, True)
+    check("cached groups match the computed ones", second["groups"], first["groups"])
+    check("a fresh result carries no cache stamp", "fromCache" in first, False)
+    check("a served result is stamped", second.get("fromCache"), True)
+    check("...with an age, so staleness is statable", isinstance(second.get("cacheAgeSeconds"), int), True)
 
-        # --- the cache key discriminates ------------------------------------------------------
-        calls.clear()
-        sb("asset", "Risk_Level", where=["OS == String Windows"])
-        check("a different --where is a different entry", len(calls) > 0, True)
-        calls.clear()
-        sb("user", "Risk_Level")
-        check("a different table is a different entry", len(calls) > 0, True)
+    # --- the cache key discriminates ------------------------------------------------------
+    calls.clear()
+    sb("asset", "Risk_Level", where=["OS == String Windows"])
+    check("a different --where is a different entry", len(calls) > 0, True)
+    calls.clear()
+    sb("user", "Risk_Level")
+    check("a different table is a different entry", len(calls) > 0, True)
 
-        # --- the LDG rebuild is part of the key ------------------------------------------------
-        # A count cached just before a merge must not be served after it: the TTL alone would do
-        # exactly that for up to RESCACHE_TTL.
-        calls.clear()
-        sb("asset", "Risk_Level", rebuilt="2026-09-24T14:05:00Z")
-        check("a later rebuild is a miss, not a pre-merge hit", len(calls) > 0, True)
-        calls.clear()
-        back = sb("asset", "Risk_Level")
-        check("...and the original rebuild's entry still hits", (len(calls), back.get("fromCache")), (0, True))
+    # --- the LDG rebuild is part of the key ------------------------------------------------
+    # A count cached just before a merge must not be served after it: the TTL alone would do
+    # exactly that for up to RESCACHE_TTL.
+    calls.clear()
+    sb("asset", "Risk_Level", rebuilt="2026-09-24T14:05:00Z")
+    check("a later rebuild is a miss, not a pre-merge hit", len(calls) > 0, True)
+    calls.clear()
+    back = sb("asset", "Risk_Level")
+    check("...and the original rebuild's entry still hits", (len(calls), back.get("fromCache")), (0, True))
 
-        # --- no stamp, no cache: read AND write ---------------------------------------------------
-        calls.clear()
-        unstamped = m.summarize_by("asset", "Risk_Level", rebuilt=None)
-        check("an unknown rebuild never reads the cache", (len(calls) > 0, "fromCache" in unstamped), (True, False))
-        before = set((m._rescache_read().get("entries") or {}))
-        m.summarize_by("asset", "Risk_Level", where=["OS == String Solaris"], rebuilt=None)
-        check("...and never writes to it", set((m._rescache_read().get("entries") or {})), before)
+    # --- no stamp, no cache: read AND write ---------------------------------------------------
+    calls.clear()
+    unstamped = m.summarize_by("asset", "Risk_Level", rebuilt=None)
+    check("an unknown rebuild never reads the cache", (len(calls) > 0, "fromCache" in unstamped), (True, False))
+    before = set((m._rescache_read().get("entries") or {}))
+    m.summarize_by("asset", "Risk_Level", where=["OS == String Solaris"], rebuilt=None)
+    check("...and never writes to it", set((m._rescache_read().get("entries") or {})), before)
 
-        # --- refresh bypasses -----------------------------------------------------------------
-        calls.clear()
-        again = sb("asset", "Risk_Level", refresh=True)
-        check("--refresh recomputes", len(calls) > 0, True)
-        check("...and its result is unstamped", "fromCache" in again, False)
+    # --- refresh bypasses -----------------------------------------------------------------
+    calls.clear()
+    again = sb("asset", "Risk_Level", refresh=True)
+    check("--refresh recomputes", len(calls) > 0, True)
+    check("...and its result is unstamped", "fromCache" in again, False)
 
-        # --- the kill switch ------------------------------------------------------------------
-        os.environ["MERIDIAN_NO_CACHE"] = "1"
-        calls.clear()
-        sb("asset", "Risk_Level")
-        check("MERIDIAN_NO_CACHE=1 disables reads", len(calls) > 0, True)
-        os.environ.pop("MERIDIAN_NO_CACHE", None)
+    # --- the kill switch ------------------------------------------------------------------
+    monkeypatch.setenv("MERIDIAN_NO_CACHE", "1")
+    calls.clear()
+    sb("asset", "Risk_Level")
+    check("MERIDIAN_NO_CACHE=1 disables reads", len(calls) > 0, True)
+    monkeypatch.delenv("MERIDIAN_NO_CACHE")
 
-        # --- TTL expiry -----------------------------------------------------------------------
-        # Age the stored entry past its TTL rather than sleeping.
-        data = m._rescache_read()
-        for rec in (data.get("entries") or {}).values():
-            rec["at"] = time.time() - (m.RESCACHE_TTL + 60)
-        m._private_write(m._rescache_path(), data)
-        calls.clear()
-        sb("asset", "Risk_Level")
-        check("an entry past its TTL is a miss", len(calls) > 0, True)
+    # --- TTL expiry -----------------------------------------------------------------------
+    # Age the stored entry past its TTL rather than sleeping.
+    data = m._rescache_read()
+    for rec in (data.get("entries") or {}).values():
+        rec["at"] = time.time() - (m.RESCACHE_TTL + 60)
+    m._private_write(m._rescache_path(), data)
+    calls.clear()
+    sb("asset", "Risk_Level")
+    check("an entry past its TTL is a miss", len(calls) > 0, True)
 
-        # --- a future timestamp is a miss, not an un-ageable hit ------------------------------
-        data = m._rescache_read()
-        for rec in (data.get("entries") or {}).values():
-            rec["at"] = time.time() + 86400
-        m._private_write(m._rescache_path(), data)
-        calls.clear()
-        sb("asset", "Risk_Level")
-        check("a backwards clock is a miss, not a hit with an unstatable age", len(calls) > 0, True)
+    # --- a future timestamp is a miss, not an un-ageable hit ------------------------------
+    data = m._rescache_read()
+    for rec in (data.get("entries") or {}).values():
+        rec["at"] = time.time() + 86400
+    m._private_write(m._rescache_path(), data)
+    calls.clear()
+    sb("asset", "Risk_Level")
+    check("a backwards clock is a miss, not a hit with an unstatable age", len(calls) > 0, True)
 
-        # --- an unverifiable breakdown is not cached ------------------------------------------
-        # `complete` absent means the coverage check could not run; caching that would pin an
-        # unanswered question in place for the whole TTL.
-        m.drop_rescache()
-        broken = dict(sb("asset", "Risk_Level"))
-        broken.pop("complete", None)
-        check("a breakdown without a completeness verdict is refused by the cache",
-              m.rescache_get("summary_by", m.RESCACHE_TTL,
-                             table="asset", by="NeverComputed", where=[])[0], None)
+    # --- an unverifiable breakdown is not cached ------------------------------------------
+    # `complete` absent means the coverage check could not run; caching that would pin an
+    # unanswered question in place for the whole TTL.
+    m.drop_rescache()
+    broken = dict(sb("asset", "Risk_Level"))
+    broken.pop("complete", None)
+    check("a breakdown without a completeness verdict is refused by the cache",
+          m.rescache_get("summary_by", m.RESCACHE_TTL,
+                         table="asset", by="NeverComputed", where=[])[0], None)
 
-        # --- THE ONE THAT MATTERS: a snapshot must never be served from cache -----------------
-        m.drop_rescache()
-        seen = {"digest": 0}
-        real_bd = m.build_digest
+    # --- THE ONE THAT MATTERS: a snapshot must never be served from cache -----------------
+    m.drop_rescache()
+    seen = {"digest": 0}
 
-        def counting_digest(table="asset", by=None, field="Risk_Score", top=5, refresh=False):
-            seen["digest"] += 1
-            seen["last_refresh"] = refresh
-            return {"generated": "digest", "stack": "s.example", "table": table,
-                    "metrics": {"metrics": {"assetCount": 1}}, "headline": {}}
+    def counting_digest(table="asset", by=None, field="Risk_Score", top=5, refresh=False):
+        seen["digest"] += 1
+        seen["last_refresh"] = refresh
+        return {"generated": "digest", "stack": "s.example", "table": table,
+                "metrics": {"metrics": {"assetCount": 1}}, "headline": {}}
 
-        m.build_digest = counting_digest
-        try:
-            class A:
-                table, by, field, top, snapshot = "asset", None, "Risk_Score", 5, True
-            import contextlib, io
-            buf = io.StringIO()
-            real_ts = m.take_snapshot
-            m.take_snapshot = lambda **k: {"written": True}
-            try:
-                with contextlib.redirect_stdout(buf):
-                    m.cmd_digest(A())
-            finally:
-                m.take_snapshot = real_ts
-            check("digest --snapshot computes with refresh=True", seen["last_refresh"], True)
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "build_digest", counting_digest)
+        mp.setattr(m, "take_snapshot", lambda **k: {"written": True})
 
-            class B:
-                table, by, field, top, snapshot = "asset", None, "Risk_Score", 5, False
-            with contextlib.redirect_stdout(io.StringIO()):
-                m.cmd_digest(B())
-            check("a plain digest may serve from cache", seen["last_refresh"], False)
-        finally:
-            m.build_digest = real_bd
+        class A:
+            table, by, field, top, snapshot = "asset", None, "Risk_Score", 5, True
+        m.cmd_digest(A())
+        check("digest --snapshot computes with refresh=True", seen["last_refresh"], True)
 
-        # The standalone `snapshot` verb goes through take_snapshot, not cmd_digest, so it needs its
-        # own guard -- it computes the digest itself when none is handed in.
-        seen["last_refresh"] = None
-        m.build_digest = counting_digest
-        real_metrics, real_load = m.measure_metrics, m.load_metrics
-        m.measure_metrics, m.load_metrics = (lambda mm: {}), (lambda: {})
+        class B:
+            table, by, field, top, snapshot = "asset", None, "Risk_Score", 5, False
+        m.cmd_digest(B())
+        check("a plain digest may serve from cache", seen["last_refresh"], False)
+
+    # The standalone `snapshot` verb goes through take_snapshot, not cmd_digest, so it needs its
+    # own guard -- it computes the digest itself when none is handed in.
+    seen["last_refresh"] = None
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "build_digest", counting_digest)
+        mp.setattr(m, "measure_metrics", lambda mm: {})
+        mp.setattr(m, "load_metrics", lambda: {})
         try:
             m.take_snapshot(table="asset", by="Risk_Level", with_metrics=False)
         except Exception:
             pass   # storage side-effects are not what this asserts
-        finally:
-            m.measure_metrics, m.load_metrics = real_metrics, real_load
-            m.build_digest = real_bd
-        check("take_snapshot computes with refresh=True too", seen["last_refresh"], True)
+    check("take_snapshot computes with refresh=True too", seen["last_refresh"], True)
 
-        # build_digest itself must forward refresh to both cached building blocks.
-        got = {}
-        real_sc, real_sb, real_tn, real_sm = (m.summarize_connectors, m.summarize_by,
-                                             m.top_n, m.stack_metrics)
-        def note_connectors(*a, **k):
-            got["connectors"] = k.get("refresh")
-            return {"summary": {}}
+    # build_digest itself must forward refresh to both cached building blocks.
+    got = {}
 
-        def note_summary(t, b, w=None, **k):
-            got["summary"] = k.get("refresh")
-            return {}
+    def note_connectors(*a, **k):
+        got["connectors"] = k.get("refresh")
+        return {"summary": {}}
 
-        m.stack_metrics = lambda: {"metrics": {}}
-        m.summarize_connectors = note_connectors
-        m.summarize_by = note_summary
-        m.top_n = lambda *a, **k: {}
-        try:
-            real_bd("asset", "Risk_Level", "Risk_Score", 5, refresh=True)
-            check("build_digest(refresh=True) refreshes the coverage block", got.get("connectors"), True)
-            check("...and the breakdown", got.get("summary"), True)
-        finally:
-            m.summarize_connectors, m.summarize_by = real_sc, real_sb
-            m.top_n, m.stack_metrics = real_tn, real_sm
+    def note_summary(t, b, w=None, **k):
+        got["summary"] = k.get("refresh")
+        return {}
 
-        # --- the file itself -------------------------------------------------------------------
-        # Not a token file, but not public either: the cached coverage block carries connector
-        # warning messages, and those were measured to contain customer hostnames. So it goes through
-        # _private_write for the same 0600-and-atomic treatment as config.json, and a read-modify-write
-        # racing a scheduled digest must not leave a temp file or half-written JSON behind.
-        m.drop_rescache()
-        sb("asset", "Risk_Level")
-        check("no temp file survives a cache write",
-              [f for f in os.listdir(tmp) if f.endswith(".tmp")], [])
-        if os.name == "posix":
-            import stat
-            mode = stat.S_IMODE(os.stat(m._rescache_path()).st_mode)
-            check("rescache is owner-only (0600)", oct(mode), oct(0o600))
-        check("a corrupt cache file is a miss, not a crash", (lambda: (
-            open(m._rescache_path(), "w", encoding="utf-8").write("{not json"),
-            sb("asset", "Risk_Level").get("groups") is not None)[1])(), True)
-        m.drop_rescache()
-        check("a wrong-schema file is ignored", (lambda: (
-            open(m._rescache_path(), "w", encoding="utf-8").write('{"schema": 99, "entries": {}}'),
-            m._rescache_read())[1])(), {})
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "stack_metrics", lambda: {"metrics": {}})
+        mp.setattr(m, "summarize_connectors", note_connectors)
+        mp.setattr(m, "summarize_by", note_summary)
+        mp.setattr(m, "top_n", lambda *a, **k: {})
+        m.build_digest("asset", "Risk_Level", "Risk_Score", 5, refresh=True)
+        check("build_digest(refresh=True) refreshes the coverage block", got.get("connectors"), True)
+        check("...and the breakdown", got.get("summary"), True)
 
-        # --- a partial connector fetch is never cached ----------------------------------------
-        m.drop_rescache()
-        real_fp, real_fr = m._fetch_connector_profiles, m._fetch_connector_runs
-        m._fetch_connector_profiles = lambda: (_ for _ in ()).throw(RuntimeError("HTTP 403: nope"))
-        m._fetch_connector_runs = lambda: ({}, [], [], False)
-        try:
-            partial = m.summarize_connectors()
-            check("a half-read coverage summary still answers", partial["fetched"]["ingestion"], "ok")
-            check("...and is NOT cached, so one 403 can't hide the stack for an hour",
-                  m.rescache_get("connectors", m.RESCACHE_CONNECTOR_TTL,
-                                 max_failures=12, max_other=15)[0], None)
-        finally:
-            m._fetch_connector_profiles, m._fetch_connector_runs = real_fp, real_fr
-    finally:
-        m.CFG_DIR, m.call, m.load_config, m.check_fields, m.field_type = real
-        os.environ["MERIDIAN_NO_CACHE"] = "1"
+    # --- the file itself -------------------------------------------------------------------
+    # Not a token file, but not public either: the cached coverage block carries connector
+    # warning messages, and those were measured to contain customer hostnames. So it goes through
+    # _private_write for the same 0600-and-atomic treatment as config.json, and a read-modify-write
+    # racing a scheduled digest must not leave a temp file or half-written JSON behind.
+    m.drop_rescache()
+    sb("asset", "Risk_Level")
+    check("no temp file survives a cache write",
+          [f for f in os.listdir(tmp_path) if f.endswith(".tmp")], [])
+    if os.name == "posix":
+        import stat
+        mode = stat.S_IMODE(os.stat(m._rescache_path()).st_mode)
+        check("rescache is owner-only (0600)", oct(mode), oct(0o600))
+    check("a corrupt cache file is a miss, not a crash", (lambda: (
+        open(m._rescache_path(), "w", encoding="utf-8").write("{not json"),
+        sb("asset", "Risk_Level").get("groups") is not None)[1])(), True)
+    m.drop_rescache()
+    check("a wrong-schema file is ignored", (lambda: (
+        open(m._rescache_path(), "w", encoding="utf-8").write('{"schema": 99, "entries": {}}'),
+        m._rescache_read())[1])(), {})
+
+    # --- a partial connector fetch is never cached ----------------------------------------
+    m.drop_rescache()
+    monkeypatch.setattr(m, "_fetch_connector_profiles",
+                        lambda: (_ for _ in ()).throw(RuntimeError("HTTP 403: nope")))
+    monkeypatch.setattr(m, "_fetch_connector_runs", lambda: ({}, [], [], False))
+    partial = m.summarize_connectors()
+    check("a half-read coverage summary still answers", partial["fetched"]["ingestion"], "ok")
+    check("...and is NOT cached, so one 403 can't hide the stack for an hour",
+          m.rescache_get("connectors", m.RESCACHE_CONNECTOR_TTL,
+                         max_failures=12, max_other=15)[0], None)
 
 
-def test_connector_runs_pagination(m):
+def test_connector_runs_pagination(m, monkeypatch):
     """`/CMDB/v2/system/metrics/connector?size=2000` is a page SIZE, not a history depth, and the
     endpoint returns runs unsorted. A stack with more than one page of history used to be read from
     page 0 only - on a real stack that page happened to hold only the 3 oldest days of an 8-day
@@ -1059,7 +997,6 @@ def test_connector_runs_pagination(m):
     looked like an old, resolved one. This drives summarize_connectors() through a 2-page and an
     over-cap history to prove every page is read (up to CONNECTOR_RUNS_MAX_PAGES) and merged, and
     that exceeding the cap is reported rather than silently truncated."""
-    print("[3a] connector run history pagination (offline, fixture-driven)")
     profiles = {"connectorProfiles": [
         {"display_name": "Amazon Web Services (AWS)", "bridge_name": "aws", "profile_name": "Prod",
          "group": "Cloud Infrastructure",
@@ -1085,12 +1022,8 @@ def test_connector_runs_pagination(m):
             return page1 if "page=1" in endpoint else page0
         raise AssertionError("unexpected endpoint %r" % endpoint)
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        out = m.summarize_connectors()
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    out = m.summarize_connectors()
 
     metrics_calls = [c for c in calls if "metrics/connector" in c]
     check("both pages fetched", len(metrics_calls), 2)
@@ -1118,11 +1051,8 @@ def test_connector_runs_pagination(m):
             return {"totalPages": m.CONNECTOR_RUNS_MAX_PAGES + 5, "content": []}
         raise AssertionError("unexpected endpoint %r" % endpoint)
 
-    m.call = fake_call_many
-    try:
-        capped = m.summarize_connectors()
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call_many)
+    capped = m.summarize_connectors()
 
     metrics_calls_many = [c for c in many_calls if "metrics/connector" in c]
     check("pagination stops at the cap, not totalPages", len(metrics_calls_many), m.CONNECTOR_RUNS_MAX_PAGES)
@@ -1130,15 +1060,14 @@ def test_connector_runs_pagination(m):
     check("...and named in the message", "exceeds" in capped["summary"]["message"], True)
 
 
-def test_api_guard(m):
+def test_api_guard(m, monkeypatch):
     """/CMDB/v2/connector/profile returns connector credentials despite the docs; only `connectors`
     (which strips them through an in-process allow-list) may read it. That rule used to live only
     in SKILL.md prose, so `api CMDB/v2/connector/profile` printed service accounts raw."""
-    print("[3b] raw api verb refuses the credential endpoint (offline)")
     import contextlib, io
     calls = []
-    real_call = m.call
-    m.call = lambda method, endpoint, body=None, retries=1: calls.append(endpoint) or {}
+    monkeypatch.setattr(m, "call",
+                        lambda method, endpoint, body=None, retries=1: calls.append(endpoint) or {})
 
     def run(endpoint):
         class A:
@@ -1152,73 +1081,70 @@ def test_api_guard(m):
         except SystemExit:
             return buf.getvalue()
 
-    try:
-        out = run("CMDB/v2/connector/profile")
-        check("credential endpoint is refused", bool(out), True)
-        check("...pointing at `connectors`", "connectors" in (out or ""), True)
-        check("...with the leading slash too", bool(run("/CMDB/v2/connector/profile")), True)
-        check("...a query string doesn't slip past", bool(run("/CMDB/v2/connector/profile?size=2000")), True)
-        check("...nor a trailing slash", bool(run("CMDB/v2/connector/profile/")), True)
-        # The bypass that shipped: the guard compared the RAW path, but the API percent-decodes, so
-        # `profil%65` was served while reading as a different endpoint here. Every spelling the
-        # server would honour has to be refused, or the guard only stops the honest caller.
-        check("...nor a percent-encoded character", bool(run("CMDB/v2/connector/profil%65")), True)
-        check("...nor one at the start of the segment", bool(run("CMDB/v2/connector/%70rofile")), True)
-        check("...nor a double-encoded one", bool(run("CMDB/v2/connector/profil%2565")), True)
-        check("...nor an encoded separator", bool(run("CMDB/v2/connector%2Fprofile")), True)
-        check("...nor an empty segment", bool(run("CMDB/v2/connector//profile")), True)
-        check("...nor a dot segment", bool(run("CMDB/v2/connector/./profile")), True)
-        check("...nor a case variant", bool(run("CMDB/v2/Connector/Profile")), True)
-        check("...nor a backslash spelling", bool(run("CMDB\\v2\\connector\\profile")), True)
-        # Found in the 2026-09-25 security review: the runs endpoint embeds each run's whole profile.
-        check("the connector RUNS endpoint is refused too", bool(run("CMDB/v2/system/metrics/connector")), True)
-        check("...in any spelling", bool(run("CMDB/v2/system/metrics/connecto%72?size=2000")), True)
-        check("ingestion job detail (a connector command line) is refused",
-              bool(run("CMDB/v2/system/metrics/data-ingestion/detail/scheduled__2026-09-01")), True)
-        check("...but the ingestion run LIST is not", run("CMDB/v2/system/metrics/data-ingestion"), None)
-        # `..`, `#` and `;` compared as one endpoint here and could reach another on the wire.
-        check("a `..` segment is refused", bool(run("CMDB/v2/connector/x/../profile")), True)
-        check("...encoded too", bool(run("CMDB/v2/connector/x/%2E%2E/profile")), True)
-        check("a `#` is refused", bool(run("CMDB/v2/data/cmdb#/../../connector/profile")), True)
-        check("a `;` is refused", bool(run("CMDB/v2/connector;x/profile")), True)
-        check("a control character is refused", bool(run("CMDB/v2/data/cmdb%0D%0AX: y")), True)
-        calls.clear()
-        check("the connector CATALOG is still reachable", run("CMDB/v2/connector"), None)
-        check("...and went to the wire", calls, ["CMDB/v2/connector"])
+    out = run("CMDB/v2/connector/profile")
+    check("credential endpoint is refused", bool(out), True)
+    check("...pointing at `connectors`", "connectors" in (out or ""), True)
+    check("...with the leading slash too", bool(run("/CMDB/v2/connector/profile")), True)
+    check("...a query string doesn't slip past", bool(run("/CMDB/v2/connector/profile?size=2000")), True)
+    check("...nor a trailing slash", bool(run("CMDB/v2/connector/profile/")), True)
+    # The bypass that shipped: the guard compared the RAW path, but the API percent-decodes, so
+    # `profil%65` was served while reading as a different endpoint here. Every spelling the
+    # server would honour has to be refused, or the guard only stops the honest caller.
+    check("...nor a percent-encoded character", bool(run("CMDB/v2/connector/profil%65")), True)
+    check("...nor one at the start of the segment", bool(run("CMDB/v2/connector/%70rofile")), True)
+    check("...nor a double-encoded one", bool(run("CMDB/v2/connector/profil%2565")), True)
+    check("...nor an encoded separator", bool(run("CMDB/v2/connector%2Fprofile")), True)
+    check("...nor an empty segment", bool(run("CMDB/v2/connector//profile")), True)
+    check("...nor a dot segment", bool(run("CMDB/v2/connector/./profile")), True)
+    check("...nor a case variant", bool(run("CMDB/v2/Connector/Profile")), True)
+    check("...nor a backslash spelling", bool(run("CMDB\\v2\\connector\\profile")), True)
+    # Found in the 2026-09-25 security review: the runs endpoint embeds each run's whole profile.
+    check("the connector RUNS endpoint is refused too", bool(run("CMDB/v2/system/metrics/connector")), True)
+    check("...in any spelling", bool(run("CMDB/v2/system/metrics/connecto%72?size=2000")), True)
+    check("ingestion job detail (a connector command line) is refused",
+          bool(run("CMDB/v2/system/metrics/data-ingestion/detail/scheduled__2026-09-01")), True)
+    check("...but the ingestion run LIST is not", run("CMDB/v2/system/metrics/data-ingestion"), None)
+    # `..`, `#` and `;` compared as one endpoint here and could reach another on the wire.
+    check("a `..` segment is refused", bool(run("CMDB/v2/connector/x/../profile")), True)
+    check("...encoded too", bool(run("CMDB/v2/connector/x/%2E%2E/profile")), True)
+    check("a `#` is refused", bool(run("CMDB/v2/data/cmdb#/../../connector/profile")), True)
+    check("a `;` is refused", bool(run("CMDB/v2/connector;x/profile")), True)
+    check("a control character is refused", bool(run("CMDB/v2/data/cmdb%0D%0AX: y")), True)
+    calls.clear()
+    check("the connector CATALOG is still reachable", run("CMDB/v2/connector"), None)
+    check("...and went to the wire", calls, ["CMDB/v2/connector"])
 
-        # Non-GET gets no automatic retry: `api` reaches arbitrary endpoints (including the
-        # Action-token /data/ldg path), and a mutating POST retried blind after a mid-response
-        # timeout would run the action twice.
-        retries_seen = []
-        m.call = lambda method, endpoint, body=None, retries=1: retries_seen.append(retries) or {}
+    # Non-GET gets no automatic retry: `api` reaches arbitrary endpoints (including the
+    # Action-token /data/ldg path), and a mutating POST retried blind after a mid-response
+    # timeout would run the action twice.
+    retries_seen = []
+    monkeypatch.setattr(m, "call",
+                        lambda method, endpoint, body=None, retries=1: retries_seen.append(retries) or {})
 
-        def run_method(method):
-            class A:
-                body, body_file, endpoint = None, None, "CMDB/v2/data/cmdb"
-            a = A(); a.method = method
-            with contextlib.redirect_stdout(io.StringIO()):
-                m.cmd_api(a)
+    def run_method(method):
+        class A:
+            body, body_file, endpoint = None, None, "CMDB/v2/data/cmdb"
+        a = A(); a.method = method
+        with contextlib.redirect_stdout(io.StringIO()):
+            m.cmd_api(a)
 
-        run_method("GET"); run_method("POST")
-        check("GET keeps its retry; POST gets none", retries_seen, [1, 0])
+    run_method("GET"); run_method("POST")
+    check("GET keeps its retry; POST gets none", retries_seen, [1, 0])
 
-        # A GET that changes the stack: data-ingestion/run starts a full ingestion from every connector.
-        check("the ingestion-trigger GET needs --allow-write",
-              bool(m.api_write_problem("GET", "CMDB/v2/system/data-ingestion/run")), True)
-        check("...in any spelling", bool(m.api_write_problem("GET", "/CMDB/v2/System/data-ingestion/run/")), True)
-        check("...and runs once confirmed",
-              m.api_write_problem("GET", "CMDB/v2/system/data-ingestion/run", allow_write=True), None)
-        check("an ordinary GET is still a read", m.api_write_problem("GET", "CMDB/v2/system/metrics/data-ingestion"), None)
+    # A GET that changes the stack: data-ingestion/run starts a full ingestion from every connector.
+    check("the ingestion-trigger GET needs --allow-write",
+          bool(m.api_write_problem("GET", "CMDB/v2/system/data-ingestion/run")), True)
+    check("...in any spelling", bool(m.api_write_problem("GET", "/CMDB/v2/System/data-ingestion/run/")), True)
+    check("...and runs once confirmed",
+          m.api_write_problem("GET", "CMDB/v2/system/data-ingestion/run", allow_write=True), None)
+    check("an ordinary GET is still a read", m.api_write_problem("GET", "CMDB/v2/system/metrics/data-ingestion"), None)
 
-        skill = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
-        check("SKILL.md names the runs endpoint as credential-bearing too",
-              "`/CMDB/v2/system/metrics/connector` embeds the same profile in each run" in skill, True)
-    finally:
-        m.call = real_call
+    skill = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+    check("SKILL.md names the runs endpoint as credential-bearing too",
+          "`/CMDB/v2/system/metrics/connector` embeds the same profile in each run" in skill, True)
 
 
 def test_insights(m):
-    print("[4] profile insights: no hardcoded governance vendor (offline)")
     demo = ["SailPoint System allows any user to request access on behalf of any other user",
             "SailPoint user does not have an active lifecycle state: current state - NOT_SET"]
     check("names the tool the findings name", m._finding_source(demo), "SailPoint")
@@ -1247,11 +1173,10 @@ def test_insights(m):
           [x for x in recs_for(["User has excessive privileges"], oscillating=True) if "SailPoint" in x], [])
 
 
-def test_profile_shape(m):
+def test_profile_shape(m, monkeypatch):
     """An investigation answer must arrive complete in one call: the recommendations used to exist
     only inside the rendered PDF, so a question like "what are their risks and what should we do"
     paid ~4s of headless Chrome for text the JSON could carry. Guard that they stay in the JSON."""
-    print("[5] profile carries its own findings + recommendations (offline)")
     user = {"Owner_Name": "TESTUSER", "displayName": "Test User", "Risk_Score": 900,
             "Risk_Level": "3-high", "Asset_Name": ["ASSET1"], "Count_No_MFA": 1,
             "Threat_List": ["Leaked Password x3", "[Critical] data movement"],
@@ -1273,16 +1198,12 @@ def test_profile_shape(m):
     class A:
         name, type, ascii, json = "TESTUSER", "user", False, True
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        import contextlib, io
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_profile(A())
-        out = json.loads(buf.getvalue())
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_profile(A())
+    out = json.loads(buf.getvalue())
 
     check("profile JSON has findings", bool(out.get("findings")), True)
     check("profile JSON has recommendations", bool(out.get("recommendations")), True)
@@ -1300,29 +1221,23 @@ def test_profile_shape(m):
     class B:
         name, type, ascii, json = "ASSET1", "asset", False, True
 
-    m.call = fake_call
-    try:
-        import contextlib, io
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_profile(B())
-        aout = json.loads(buf.getvalue())
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_profile(B())
+    aout = json.loads(buf.getvalue())
     check("asset profile has findings", bool(aout.get("findings")), True)
     check("asset profile has recommendations", bool(aout.get("recommendations")), True)
 
     # A human-looking name fires exact + fuzzy together; a key-shaped one doesn't waste a call.
-    m.call = fake_call
-    try:
-        seen.clear()
-        m.resolve("ALLCAPSKEY", "user", "Owner_Name", ["Owner_Name", "displayName"])
-        key_calls = len(seen)
-        seen.clear()
-        m.resolve("Jane Doe", "user", "Owner_Name", ["Owner_Name", "displayName"])
-        human_calls = len(seen)
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    seen.clear()
+    m.resolve("ALLCAPSKEY", "user", "Owner_Name", ["Owner_Name", "displayName"])
+    key_calls = len(seen)
+    seen.clear()
+    m.resolve("Jane Doe", "user", "Owner_Name", ["Owner_Name", "displayName"])
+    human_calls = len(seen)
     check("exact key resolves in one call", key_calls, 1)
     check("human name resolves in one round trip (two concurrent calls)", human_calls, 2)
 
@@ -1342,15 +1257,12 @@ def test_profile_shape(m):
     class C:
         name, type, ascii, json = "Ana & Béa #1", "user", False, True
 
-    m.call = tricky_call
-    try:
-        seen.clear()
-        import contextlib, io
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_profile(C())
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", tricky_call)
+    seen.clear()
+    import contextlib, io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_profile(C())
     ch = [s for s in seen if "/change" in s]
     check("change-log id is percent-encoded",
           bool(ch and ch[0].endswith("id=Ana%20%26%20B%C3%A9a%20%231")), True)
@@ -1405,12 +1317,10 @@ def test_profile_shape(m):
           (True, False))
 
 
-def test_compare(m):
+def test_compare(m, monkeypatch, capsys):
     """`compare` runs both profiles in-process and overlapped. It used to shell out to
     `meridian.py profile` once per name, serially: two interpreter startups, two fresh TLS
     handshakes (the keep-alive pool is per-process), four sequential round-trip waves."""
-    print("[5b] compare runs in-process (offline)")
-    import contextlib, io
     user_a = {"Owner_Name": "USER.A", "displayName": "User A", "Risk_Score": 900, "Risk_Level": "3-high"}
     user_b = {"Owner_Name": "USER.B", "displayName": "User B", "Risk_Score": 100, "Risk_Level": "1-low"}
 
@@ -1424,15 +1334,10 @@ def test_compare(m):
     class A:
         name1, name2, type = "USER.A", "USER.B", "user"
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_compare(A())
-        out = json.loads(buf.getvalue())
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    m.cmd_compare(A())
+    buf = capsys.readouterr().out
+    out = json.loads(buf)
     check("both profiles resolve", (out["profileA"]["identity"]["ownerName"],
                                     out["profileB"]["identity"]["ownerName"]), ("USER.A", "USER.B"))
     check("...each carrying its own findings", ("findings" in out["profileA"], "findings" in out["profileB"]),
@@ -1440,53 +1345,41 @@ def test_compare(m):
     check("...under the compared names", (out["a"], out["b"]), ("USER.A", "USER.B"))
 
 
-def test_tls_posture(m):
+def test_tls_posture(m, monkeypatch, tmp_path):
     """Verification must stay ON unless explicitly disabled. This was CERT_NONE for as long as the
     PowerShell helpers existed, so a regression here is a plausible accident rather than a theory --
     and it would silently ship a client that hands a bearer token to any interposing certificate."""
-    print("[6] TLS posture (offline)")
     import ssl
-    keep = os.environ.pop("MERIDIAN_INSECURE_TLS", None)
-    cfg_keep = m.CFG_PATH
-    m.CFG_PATH = os.path.join(tempfile.gettempdir(), "meridian-tls-test-absent.json")
-    try:
-        m._SSL_CTX.clear()
-        check("insecure_tls() defaults to False", m.insecure_tls(), False)
-        ctx = m._ssl_context()
-        check("default context verifies certificates", ctx.verify_mode, ssl.CERT_REQUIRED)
-        check("default context checks hostname", ctx.check_hostname, True)
+    monkeypatch.delenv("MERIDIAN_INSECURE_TLS", raising=False)
+    monkeypatch.setattr(m, "CFG_PATH", str(tmp_path / "meridian-tls-test-absent.json"))
+    monkeypatch.setattr(m, "_SSL_CTX", dict(m._SSL_CTX))
+    m._SSL_CTX.clear()
+    check("insecure_tls() defaults to False", m.insecure_tls(), False)
+    ctx = m._ssl_context()
+    check("default context verifies certificates", ctx.verify_mode, ssl.CERT_REQUIRED)
+    check("default context checks hostname", ctx.check_hostname, True)
 
-        for val in ("1", "true", "YES", "on"):
-            os.environ["MERIDIAN_INSECURE_TLS"] = val
-            check("env %r opts out" % val, m.insecure_tls(), True)
-        os.environ["MERIDIAN_INSECURE_TLS"] = "0"
-        check("env '0' does NOT opt out", m.insecure_tls(), False)
-        del os.environ["MERIDIAN_INSECURE_TLS"]
+    for val in ("1", "true", "YES", "on"):
+        monkeypatch.setenv("MERIDIAN_INSECURE_TLS", val)
+        check("env %r opts out" % val, m.insecure_tls(), True)
+    monkeypatch.setenv("MERIDIAN_INSECURE_TLS", "0")
+    check("env '0' does NOT opt out", m.insecure_tls(), False)
+    monkeypatch.delenv("MERIDIAN_INSECURE_TLS")
 
-        # An opt-out saved in config must be honoured, and must be reported so it can't go unnoticed.
-        with open(m.CFG_PATH, "w") as f:
-            json.dump({"fqdn": "x.example", "api_token": "abcd1234", "insecure_tls": True}, f)
-        m._SSL_CTX.clear()
-        check("config insecure_tls honoured", m.insecure_tls(), True)
-        ctx = m._ssl_context()
-        check("opted-out context skips verification", ctx.verify_mode, ssl.CERT_NONE)
-        check("contexts are cached, not rebuilt", m._ssl_context() is ctx, True)
-    finally:
-        if os.path.exists(m.CFG_PATH):
-            os.remove(m.CFG_PATH)
-        m.CFG_PATH = cfg_keep
-        os.environ.pop("MERIDIAN_INSECURE_TLS", None)
-        if keep is not None:
-            os.environ["MERIDIAN_INSECURE_TLS"] = keep
-        m._SSL_CTX.clear()
+    # An opt-out saved in config must be honoured, and must be reported so it can't go unnoticed.
+    with open(m.CFG_PATH, "w") as f:
+        json.dump({"fqdn": "x.example", "api_token": "abcd1234", "insecure_tls": True}, f)
+    m._SSL_CTX.clear()
+    check("config insecure_tls honoured", m.insecure_tls(), True)
+    ctx = m._ssl_context()
+    check("opted-out context skips verification", ctx.verify_mode, ssl.CERT_NONE)
+    check("contexts are cached, not rebuilt", m._ssl_context() is ctx, True)
 
 
-def test_summary_completeness(m):
+def test_summary_completeness(m, monkeypatch, capsys, tmp_path):
     """`summary --by` discovers which values exist by sampling, then counts each exactly. A category
     too rare to appear in the sample used to vanish from the breakdown with nothing said -- a posture
     answer that looked complete and wasn't. Guard the arithmetic that now detects it."""
-    print("[7] summary breakdown reports its own completeness (offline)")
-    import contextlib, io
 
     def run(by, dtype, records, counts, total, covered=None):
         """Drive cmd_summary against a fixture. `counts` maps value -> exact count; `covered` is what
@@ -1497,7 +1390,7 @@ def test_summary_completeness(m):
             q = json.dumps(groups)
             if paging.get("recordsPerPage") == 1:
                 # The `where`-alone count (no clause on `by`) -- every record here has the field, so
-                # it matches the gated total. test_summary_without_field [55] covers the gap.
+                # it matches the gated total. test_summary_without_field covers the gap.
                 if not any(c.get("searchFieldName") == by for g in groups for c in g):
                     return {"totalRecords": total, "data": []}
                 # The coverage probe ORs every value into ONE inner array; a per-value count has one.
@@ -1517,19 +1410,15 @@ def test_summary_completeness(m):
         # load_config is patched too: check_fields reaches it through load_field_map/_fields_path,
         # and on a machine with no ~/.meridian (CI) that die()s out of the whole suite. Every dev
         # machine had credentials, so the dependency stayed invisible until the first CI run.
-        real_call, real_ft, real_lc, real_cfg = m.call, m.field_type, m.load_config, m.CFG_DIR
-        m.call, m.field_type = fake_call, lambda t, f: dtype
-        m.load_config, m.CFG_DIR = lambda: ("s.example", "tok", None), tempfile.mkdtemp()
+        monkeypatch.setattr(m, "call", fake_call)
+        monkeypatch.setattr(m, "field_type", lambda t, f: dtype)
+        monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+        monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(dir=tmp_path))
+        monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))
         m._FIELD_MAP.clear()
-        try:
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                m.cmd_summary(A())
-            return json.loads(buf.getvalue())
-        finally:
-            m.call, m.field_type = real_call, real_ft
-            m.load_config, m.CFG_DIR = real_lc, real_cfg
-            m._FIELD_MAP.clear()
+        m.cmd_summary(A())
+        buf = capsys.readouterr().out
+        return json.loads(buf)
 
     # Every value present in the sample, and the counts partition the records -> complete.
     recs = [{"Risk_Level": "1-low"}] * 60 + [{"Risk_Level": "3-high"}] * 40
@@ -1610,15 +1499,13 @@ def test_summary_completeness(m):
           set(g["value"] for g in out["groups"]), {"Linux", "Windows"})
 
 
-def test_summary_without_field(m):
+def test_summary_without_field(m, monkeypatch, tmp_path):
     """`summary --by` gates its query on `exists` for the grouping field, so `total`, the percentages
     and `complete` describe only records that HAVE a value. A record matching --where with the field
     empty sat in no group and no count, and nothing said so: a breakdown over a filtered population
     read `complete: true` with about a fifth of that population absent. One count of `where` alone
     states the gap -- and `complete` keeps its meaning, since snapshots, trends and the digest read it."""
-    print("[55] summary breakdown states records with no value for the field (offline)")
     import tempfile
-    real = (m.call, m.field_type, m.load_config, m.CFG_DIR, m.check_fields)
     state = {"where_total": None, "calls": []}
 
     def fake_call(method, endpoint, body=None, retries=1):
@@ -1643,170 +1530,161 @@ def test_summary_without_field(m):
     def run(by, records, counts, total, where_total, where=None, dtype="String", rebuilt=None):
         state.update(by=by, records=records, counts=counts, total=total, where_total=where_total)
         state["calls"] = []
-        m.field_type = lambda t, f: dtype
+        monkeypatch.setattr(m, "field_type", lambda t, f: dtype)
         return m.summarize_by("asset", by, where, rebuilt=rebuilt)
 
     def where_only_calls(by):
         return [b for b in state["calls"] if (b.get("paging") or {}).get("recordsPerPage") == 1
                 and not any(c.get("searchFieldName") == by for g in (b.get("query") or []) for c in g)]
 
-    m.call, m.check_fields = fake_call, (lambda *a, **k: None)
-    m.load_config, m.CFG_DIR = (lambda: ("s.example", "tok", None)), tempfile.mkdtemp(prefix="wgap-")
+    monkeypatch.setattr(m, "call", fake_call)
+    monkeypatch.setattr(m, "check_fields", lambda *a, **k: None)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(prefix="wgap-", dir=tmp_path))
     recs = [{"Provider": "aws"}] * 60 + [{"Provider": "azure"}] * 40
     where = ["Asset_Type == String Server"]
-    try:
-        # --- some matching records have no value: the gap is counted and named ----------------------
-        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where)
-        check("the where-only population is reported", out.get("whereTotal"), 125)
-        check("records with no value are counted", out.get("recordsWithoutField"), 25)
-        check("...and the note names the count", "25 of 125 records matching --where" in (out.get("note") or ""), True)
-        check("...says they have no value and sit in no group",
-              "no value for 'Provider' and are in no group" in (out.get("note") or ""), True)
-        check("complete keeps its meaning: every record WITH the field is grouped", out.get("complete"), True)
-        check("total stays the gated denominator", out.get("total"), 100)
-        wq = where_only_calls("Provider")
-        check("exactly one where-only count is made", len(wq), 1)
-        check("...querying --where alone, no exists gate", wq[0].get("query") if wq else None,
-              m.and_query(where))
+    # --- some matching records have no value: the gap is counted and named ----------------------
+    out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where)
+    check("the where-only population is reported", out.get("whereTotal"), 125)
+    check("records with no value are counted", out.get("recordsWithoutField"), 25)
+    check("...and the note names the count", "25 of 125 records matching --where" in (out.get("note") or ""), True)
+    check("...says they have no value and sit in no group",
+          "no value for 'Provider' and are in no group" in (out.get("note") or ""), True)
+    check("complete keeps its meaning: every record WITH the field is grouped", out.get("complete"), True)
+    check("total stays the gated denominator", out.get("total"), 100)
+    wq = where_only_calls("Provider")
+    check("exactly one where-only count is made", len(wq), 1)
+    check("...querying --where alone, no exists gate", wq[0].get("query") if wq else None,
+          m.and_query(where))
 
-        # --- no --where: the note says "records", not "matching --where" ----------------------------
-        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125)
-        check("without --where the gap is still stated", "25 of 125 records (" in (out.get("note") or ""), True)
+    # --- no --where: the note says "records", not "matching --where" ----------------------------
+    out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125)
+    check("without --where the gap is still stated", "25 of 125 records (" in (out.get("note") or ""), True)
 
-        # --- every record has the field: zero gap, stated as zero, no note -----------------------
-        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 100, where=where)
-        check("no gap -> recordsWithoutField is 0", out.get("recordsWithoutField"), 0)
-        check("...with the population alongside", out.get("whereTotal"), 100)
-        check("...and no note", "note" in out, False)
+    # --- every record has the field: zero gap, stated as zero, no note -----------------------
+    out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 100, where=where)
+    check("no gap -> recordsWithoutField is 0", out.get("recordsWithoutField"), 0)
+    check("...with the population alongside", out.get("whereTotal"), 100)
+    check("...and no note", "note" in out, False)
 
-        # --- NO record has the field: an empty breakdown must not read as a zero population ---------
-        out = run("Provider", [], {}, 0, 40, where=where)
-        check("an all-empty field reports every match as without it", out.get("recordsWithoutField"), 40)
-        check("...and names them", "40 of 40 records matching --where" in (out.get("note") or ""), True)
+    # --- NO record has the field: an empty breakdown must not read as a zero population ---------
+    out = run("Provider", [], {}, 0, 40, where=where)
+    check("an all-empty field reports every match as without it", out.get("recordsWithoutField"), 40)
+    check("...and names them", "40 of 40 records matching --where" in (out.get("note") or ""), True)
 
-        # --- the count failed: unknown, never 0, and never cached -----------------------------------
-        os.environ.pop("MERIDIAN_NO_CACHE", None)
-        stamp = "2026-09-24T10:12:12Z"
-        try:
-            out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, RuntimeError("HTTP 500: x"),
-                      where=where, rebuilt=stamp)
-            check("a failed count is flagged", out.get("whereTotalUnavailable"), True)
-            check("...and reports no gap figure at all", ("recordsWithoutField" in out, "whereTotal" in out),
-                  (False, False))
-            check("...and says so", "could not be counted" in (out.get("note") or ""), True)
-            check("...and is not cached", m.rescache_get("summary_by", m.RESCACHE_TTL, table="asset",
-                  by="Provider", where=sorted(where), rebuilt=stamp)[0], None)
+    # --- the count failed: unknown, never 0, and never cached -----------------------------------
+    monkeypatch.delenv("MERIDIAN_NO_CACHE", raising=False)
+    stamp = "2026-09-24T10:12:12Z"
+    out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, RuntimeError("HTTP 500: x"),
+              where=where, rebuilt=stamp)
+    check("a failed count is flagged", out.get("whereTotalUnavailable"), True)
+    check("...and reports no gap figure at all", ("recordsWithoutField" in out, "whereTotal" in out),
+          (False, False))
+    check("...and says so", "could not be counted" in (out.get("note") or ""), True)
+    check("...and is not cached", m.rescache_get("summary_by", m.RESCACHE_TTL, table="asset",
+          by="Provider", where=sorted(where), rebuilt=stamp)[0], None)
 
-            # A count below the gated total is two reads that disagree -- unknown, not negative.
-            out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 90, where=where)
-            check("an inconsistent count is unknown, not negative",
-                  (out.get("whereTotalUnavailable"), "recordsWithoutField" in out), (True, False))
+    # A count below the gated total is two reads that disagree -- unknown, not negative.
+    out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 90, where=where)
+    check("an inconsistent count is unknown, not negative",
+          (out.get("whereTotalUnavailable"), "recordsWithoutField" in out), (True, False))
 
-            # --- the cached path carries the new keys -----------------------------------------------
-            m.drop_rescache()
-            fresh = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
-            served = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
-            check("a repeat is served from cache", (served.get("fromCache"), len(state["calls"])), (True, 0))
-            check("...carrying recordsWithoutField", served.get("recordsWithoutField"), 25)
-            check("...and whereTotal", served.get("whereTotal"), fresh.get("whereTotal"))
-            check("...and the note", served.get("note"), fresh.get("note"))
+    # --- the cached path carries the new keys -----------------------------------------------
+    m.drop_rescache()
+    fresh = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
+    served = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
+    check("a repeat is served from cache", (served.get("fromCache"), len(state["calls"])), (True, 0))
+    check("...carrying recordsWithoutField", served.get("recordsWithoutField"), 25)
+    check("...and whereTotal", served.get("whereTotal"), fresh.get("whereTotal"))
+    check("...and the note", served.get("note"), fresh.get("note"))
 
-            # An entry cached before the where-only count existed has none of its keys. Served, the
-            # gap would be silently absent -- so it is a miss and the count is made.
-            m.drop_rescache()
-            legacy = {k: v for k, v in fresh.items()
-                      if k not in ("whereTotal", "recordsWithoutField", "fromCache", "cacheAgeSeconds")}
-            m.rescache_put("summary_by", legacy, table="asset", by="Provider", where=sorted(where),
-                           rebuilt=stamp)
-            again = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
-            check("a pre-gap cache entry is a miss, not a silent answer",
-                  (again.get("fromCache"), again.get("recordsWithoutField")), (None, 25))
-        finally:
-            m.drop_rescache()
-            os.environ["MERIDIAN_NO_CACHE"] = "1"
+    # An entry cached before the where-only count existed has none of its keys. Served, the
+    # gap would be silently absent -- so it is a miss and the count is made.
+    m.drop_rescache()
+    legacy = {k: v for k, v in fresh.items()
+              if k not in ("whereTotal", "recordsWithoutField", "fromCache", "cacheAgeSeconds")}
+    m.rescache_put("summary_by", legacy, table="asset", by="Provider", where=sorted(where),
+                   rebuilt=stamp)
+    again = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, rebuilt=stamp)
+    check("a pre-gap cache entry is a miss, not a silent answer",
+          (again.get("fromCache"), again.get("recordsWithoutField")), (None, 25))
+    m.drop_rescache()
 
-        # --- it survives into a snapshot and onto the digest ----------------------------------------
-        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where)
-        snap = m._snapshot_breakdown(out)
-        check("a snapshot breakdown keeps recordsWithoutField", snap.get("recordsWithoutField"), 25)
-        check("...and whereTotal", snap.get("whereTotal"), 125)
-        _, _, body = m._digest_html({"breakdown": out})
-        check("the digest labels the gap", "25 records have no value and are not shown" in body, True)
-        _, _, body = m._digest_html({"breakdown": run("Provider", recs, {"aws": 60, "azure": 40},
-                                                      100, 100, where=where)})
-        check("...and says nothing when there is none", "have no value" in body, False)
-        _, _, body = m._digest_html({"breakdown": run("Provider", recs, {"aws": 60, "azure": 40},
-                                                      100, RuntimeError("HTTP 500: x"), where=where)})
-        check("...and says so when the count failed", "could not be counted" in body, True)
+    # --- it survives into a snapshot and onto the digest ----------------------------------------
+    out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where)
+    snap = m._snapshot_breakdown(out)
+    check("a snapshot breakdown keeps recordsWithoutField", snap.get("recordsWithoutField"), 25)
+    check("...and whereTotal", snap.get("whereTotal"), 125)
+    _, _, body = m._digest_html({"breakdown": out})
+    check("the digest labels the gap", "25 records have no value and are not shown" in body, True)
+    _, _, body = m._digest_html({"breakdown": run("Provider", recs, {"aws": 60, "azure": 40},
+                                                  100, 100, where=where)})
+    check("...and says nothing when there is none", "have no value" in body, False)
+    _, _, body = m._digest_html({"breakdown": run("Provider", recs, {"aws": 60, "azure": 40},
+                                                  100, RuntimeError("HTTP 500: x"), where=where)})
+    check("...and says so when the count failed", "could not be counted" in body, True)
 
-        # --- a List field with full coverage: the coverage note must not claim "every record" ------
-        out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, dtype="List")
-        note = out.get("note") or ""
-        check("List + gap: the note states the gap", "25 of 125 records matching --where" in note, True)
-        check("...and does not contradict it with 'every record'", "Every record falls" in note, False)
-        check("...scoping coverage to records with a value",
-              "Every record with a value for 'Provider' falls in at least one group" in note, True)
+    # --- a List field with full coverage: the coverage note must not claim "every record" ------
+    out = run("Provider", recs, {"aws": 60, "azure": 40}, 100, 125, where=where, dtype="List")
+    note = out.get("note") or ""
+    check("List + gap: the note states the gap", "25 of 125 records matching --where" in note, True)
+    check("...and does not contradict it with 'every record'", "Every record falls" in note, False)
+    check("...scoping coverage to records with a value",
+          "Every record with a value for 'Provider' falls in at least one group" in note, True)
 
-        # --- the nested path has no gate, so it is unchanged: no extra call, no new keys -------------
-        nrecs = [{"Details": [{"OS": "Linux"}]}] * 60 + [{"Details": [{"OS": "Windows"}]}] * 40
-        out = run("Details.OS", nrecs, {"Linux": 600, "Windows": 400}, 1000, 1500, where=where)
-        check("nested: no where-only count is made", len(where_only_calls("Details.OS")), 0)
-        check("nested: no gap keys", [k for k in ("whereTotal", "recordsWithoutField",
-                                                  "whereTotalUnavailable") if k in out], [])
-        check("nested: completeness unchanged", (out.get("coveredRecords"), out.get("complete")), (1000, True))
-    finally:
-        m.call, m.field_type, m.load_config, m.CFG_DIR, m.check_fields = real
+    # --- the nested path has no gate, so it is unchanged: no extra call, no new keys -------------
+    nrecs = [{"Details": [{"OS": "Linux"}]}] * 60 + [{"Details": [{"OS": "Windows"}]}] * 40
+    out = run("Details.OS", nrecs, {"Linux": 600, "Windows": 400}, 1000, 1500, where=where)
+    check("nested: no where-only count is made", len(where_only_calls("Details.OS")), 0)
+    check("nested: no gap keys", [k for k in ("whereTotal", "recordsWithoutField",
+                                              "whereTotalUnavailable") if k in out], [])
+    check("nested: completeness unchanged", (out.get("coveredRecords"), out.get("complete")), (1000, True))
 
 
-def test_transport(m):
+def test_transport(m, monkeypatch):
     """call() speaks http.client over a pooled connection now. Two properties are worth pinning: a
     redirect must never carry the Authorization header to another host, and the pool must never hand
     back a socket opened for a different stack or a different TLS posture."""
-    print("[8] transport: redirect safety and pool keying (offline)")
-    real = (m.load_config, m.pace, m._ssl_context, m._round_trip)
-    m.load_config = lambda: ("stack.example", "tok", None)
-    m.pace = lambda: None
-    m._ssl_context = lambda: None
+    monkeypatch.setattr(m, "load_config", lambda: ("stack.example", "tok", None))
+    monkeypatch.setattr(m, "pace", lambda: None)
+    monkeypatch.setattr(m, "_ssl_context", lambda: None)
+    # Off-host redirect: must be refused, and the second request must never be issued.
+    seen = []
+
+    def off_host(fqdn, key, ctx, method, endpoint, data, headers):
+        seen.append(endpoint)
+        return 302, "", "https://evil.example/steal"
+
+    monkeypatch.setattr(m, "_round_trip", off_host)
     try:
-        # Off-host redirect: must be refused, and the second request must never be issued.
-        seen = []
+        m.call("GET", "/CMDB/v2/x", retries=0)
+        check("off-host redirect raises", False, True)
+    except RuntimeError as e:
+        check("off-host redirect refused", "another host" in str(e), True)
+        check("...and names the host", "evil.example" in str(e), True)
+    check("token never replayed off-host", [p for p in seen if "steal" in p], [])
 
-        def off_host(fqdn, key, ctx, method, endpoint, data, headers):
-            seen.append(endpoint)
-            return 302, "", "https://evil.example/steal"
+    # Same-host redirect: followed, because urlopen used to do it transparently.
+    hops = []
 
-        m._round_trip = off_host
-        try:
-            m.call("GET", "/CMDB/v2/x", retries=0)
-            check("off-host redirect raises", False, True)
-        except RuntimeError as e:
-            check("off-host redirect refused", "another host" in str(e), True)
-            check("...and names the host", "evil.example" in str(e), True)
-        check("token never replayed off-host", [p for p in seen if "steal" in p], [])
+    def same_host(fqdn, key, ctx, method, endpoint, data, headers):
+        hops.append(endpoint)
+        if endpoint == "/CMDB/v2/x":
+            return 301, "", "/CMDB/v2/y"
+        return 200, '{"ok": true}', None
 
-        # Same-host redirect: followed, because urlopen used to do it transparently.
-        hops = []
+    monkeypatch.setattr(m, "_round_trip", same_host)
+    check("same-host redirect followed", m.call("GET", "/CMDB/v2/x", retries=0), {"ok": True})
+    check("...to the redirected path", hops, ["/CMDB/v2/x", "/CMDB/v2/y"])
 
-        def same_host(fqdn, key, ctx, method, endpoint, data, headers):
-            hops.append(endpoint)
-            if endpoint == "/CMDB/v2/x":
-                return 301, "", "/CMDB/v2/y"
-            return 200, '{"ok": true}', None
-
-        m._round_trip = same_host
-        check("same-host redirect followed", m.call("GET", "/CMDB/v2/x", retries=0), {"ok": True})
-        check("...to the redirected path", hops, ["/CMDB/v2/x", "/CMDB/v2/y"])
-
-        # A non-2xx keeps the string shape classify_connect_error() parses.
-        m._round_trip = lambda *a, **k: (403, '{"code":403001}', None)
-        try:
-            m.call("GET", "/CMDB/v2/x", retries=0)
-            check("403 raises", False, True)
-        except RuntimeError as e:
-            check("403 error text still parses as HTTP 403", m.classify_connect_error(str(e)),
-                  ("forbidden", 403))
-    finally:
-        m.load_config, m.pace, m._ssl_context, m._round_trip = real
+    # A non-2xx keeps the string shape classify_connect_error() parses.
+    monkeypatch.setattr(m, "_round_trip", lambda *a, **k: (403, '{"code":403001}', None))
+    try:
+        m.call("GET", "/CMDB/v2/x", retries=0)
+        check("403 raises", False, True)
+    except RuntimeError as e:
+        check("403 error text still parses as HTTP 403", m.classify_connect_error(str(e)),
+              ("forbidden", 403))
 
     # Pool must key on (fqdn, posture), not hand back any idle socket it happens to hold.
     m._POOL.clear()
@@ -1834,86 +1712,75 @@ def test_transport(m):
     m._POOL.clear()
 
 
-def test_pace(m):
+def test_pace(m, monkeypatch, tmp_path):
     """The 60/min budget is enforced across PROCESSES, not just threads. Two concurrent callers
     used to read the same stamps and each append only its own -- the second write clobbered the
     first, double-spending the hard budget -- and a reader catching a half-written file hit the
     ValueError fallback and reset the stamps entirely."""
-    print("[8b] rate pacer: cross-process locking (offline)")
     import threading
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.RL_PATH)
-    m.CFG_DIR = tmp
-    m.RL_PATH = os.path.join(tmp, ".ratelimit")
-    try:
-        # Mutual exclusion with SEPARATE lock objects on the same path -- what two processes hold.
-        counter = os.path.join(tmp, "counter")
-        with open(counter, "w") as f:
-            f.write("0")
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "RL_PATH", os.path.join(tmp, ".ratelimit"))
+    # Mutual exclusion with SEPARATE lock objects on the same path -- what two processes hold.
+    counter = os.path.join(tmp, "counter")
+    with open(counter, "w") as f:
+        f.write("0")
 
-        def bump(n):
-            for _ in range(n):
-                with m._FileLock(m.RL_PATH + ".lock"):
-                    with open(counter) as f:
-                        v = int(f.read())
-                    with open(counter, "w") as f:
-                        f.write(str(v + 1))
+    def bump(n):
+        for _ in range(n):
+            with m._FileLock(m.RL_PATH + ".lock"):
+                with open(counter) as f:
+                    v = int(f.read())
+                with open(counter, "w") as f:
+                    f.write(str(v + 1))
 
-        ts = [threading.Thread(target=bump, args=(25,)) for _ in range(4)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join()
-        with open(counter) as f:
-            check("separate lock handles exclude each other", f.read(), "100")
+    ts = [threading.Thread(target=bump, args=(25,)) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    with open(counter) as f:
+        check("separate lock handles exclude each other", f.read(), "100")
 
-        # pace() end to end: every call leaves exactly one live stamp, no resets, no clobbers.
-        for _ in range(5):
-            m.pace()
-        with open(m.RL_PATH) as f:
-            stamps = [s for s in f.read().split() if s.strip()]
-        check("every paced call left its stamp", len(stamps), 5)
-
-        # A clock that ran ahead and was corrected (NTP step, resumed VM, dual boot) leaves stamps
-        # the sliding window can never expire. The retry loop then computed a wait, slept, and found
-        # the same stamps -- forever, with nothing printed. Every verb simply hung.
-        future = int(time.time() * 1000) + 3600 * 1000
-        with open(m.RL_PATH, "w") as f:
-            f.write("\n".join(str(future + i) for i in range(m.RL_LIMIT + 5)))
-        t0 = time.time()
+    # pace() end to end: every call leaves exactly one live stamp, no resets, no clobbers.
+    for _ in range(5):
         m.pace()
-        check("a future-dated budget doesn't hang the CLI", time.time() - t0 < 2.0, True)
-        with open(m.RL_PATH) as f:
-            left = [int(x) for x in f.read().split() if x.strip()]
-        check("...the future stamps are dropped, not counted", len(left), 1)
-        check("...and the slot taken is now, not the future", left[0] <= int(time.time() * 1000), True)
+    with open(m.RL_PATH) as f:
+        stamps = [s for s in f.read().split() if s.strip()]
+    check("every paced call left its stamp", len(stamps), 5)
 
-        # The lock must degrade rather than spin when it can't be taken. Bounded by LOCK_MAX_WAIT.
-        real_wait = m.LOCK_MAX_WAIT
-        m.LOCK_MAX_WAIT = 0.05
-        try:
-            outer = m._FileLock(m.RL_PATH + ".lock")
-            with outer:
-                t0 = time.time()
-                with m._FileLock(m.RL_PATH + ".lock") as inner:
-                    pass
-                check("an untakeable lock gives up instead of spinning", time.time() - t0 < 3.0, True)
-                # Both platforms: a blocking POSIX flock had no ceiling at all (one wedged process
-                # hangs every verb), and nesting two locks on one path deadlocked the thread outright
-                # -- which is how CI caught this, since only Windows was non-blocking before.
-                check("...and reports it didn't hold the lock", inner.held, False)
-        finally:
-            m.LOCK_MAX_WAIT = real_wait
-    finally:
-        m.CFG_DIR, m.RL_PATH = real
+    # A clock that ran ahead and was corrected (NTP step, resumed VM, dual boot) leaves stamps
+    # the sliding window can never expire. The retry loop then computed a wait, slept, and found
+    # the same stamps -- forever, with nothing printed. Every verb simply hung.
+    future = int(time.time() * 1000) + 3600 * 1000
+    with open(m.RL_PATH, "w") as f:
+        f.write("\n".join(str(future + i) for i in range(m.RL_LIMIT + 5)))
+    t0 = time.time()
+    m.pace()
+    check("a future-dated budget doesn't hang the CLI", time.time() - t0 < 2.0, True)
+    with open(m.RL_PATH) as f:
+        left = [int(x) for x in f.read().split() if x.strip()]
+    check("...the future stamps are dropped, not counted", len(left), 1)
+    check("...and the slot taken is now, not the future", left[0] <= int(time.time() * 1000), True)
+
+    # The lock must degrade rather than spin when it can't be taken. Bounded by LOCK_MAX_WAIT.
+    monkeypatch.setattr(m, "LOCK_MAX_WAIT", 0.05)
+    outer = m._FileLock(m.RL_PATH + ".lock")
+    with outer:
+        t0 = time.time()
+        with m._FileLock(m.RL_PATH + ".lock") as inner:
+            pass
+        check("an untakeable lock gives up instead of spinning", time.time() - t0 < 3.0, True)
+        # Both platforms: a blocking POSIX flock had no ceiling at all (one wedged process
+        # hangs every verb), and nesting two locks on one path deadlocked the thread outright
+        # -- which is how CI caught this, since only Windows was non-blocking before.
+        check("...and reports it didn't hold the lock", inner.held, False)
 
 
-def test_check_classification(m):
+def test_check_classification(m, monkeypatch, capsys):
     """`check` classifies a probe's failure from the status line via classify_connect_error. The
     old substring scan over the WHOLE error string turned a 500 whose JSON body carried an error
     sub-code like "code":403001 into FORBIDDEN -- blaming the token for a server fault."""
-    print("[8c] check: probe failures classified by status line (offline)")
-    import contextlib, io
     errors = {
         "/system/metrics/data": RuntimeError('HTTP 500: {"code":403001,"message":"boom"}'),
         "/metadata/asset": RuntimeError("HTTP 403: Forbidden"),
@@ -1927,15 +1794,11 @@ def test_check_classification(m):
                 raise e
         raise AssertionError("unexpected probe: %s" % endpoint)
 
-    real = (m.call, m.load_config)
-    m.call, m.load_config = fake_call, lambda: ("s.example", "tok", None)
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_check(type("A", (), {})())
-        out = json.loads(buf.getvalue())
-    finally:
-        m.call, m.load_config = real
+    monkeypatch.setattr(m, "call", fake_call)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    m.cmd_check(type("A", (), {})())
+    buf = capsys.readouterr().out
+    out = json.loads(buf)
     st = {c["area"]: c["status"] for c in out["capabilities"]}
     check("a 500 with a 403-ish body is HTTP_ERROR, not FORBIDDEN", st["System metrics"], "HTTP_ERROR")
     check("a real 403 is FORBIDDEN", st["Field metadata"], "FORBIDDEN")
@@ -1945,18 +1808,16 @@ def test_check_classification(m):
           [c.get("httpStatus") for c in out["capabilities"]], [500, 403, 401, None])
 
 
-def test_field_metadata(m):
+def test_field_metadata(m, monkeypatch, tmp_path):
     """Field metadata is what tells a typo apart from a real zero, and a List field apart from a
     String one. It used to be populated only by an explicit `refresh-fields`, defaulting every field
     to "String" when absent -- which made `summary --by` query a multi-valued field with `==`."""
-    print("[9] field metadata: typing and name validation (offline)")
     import contextlib, io
     META = {"metadata": [{"fieldName": "Risk_Score", "dataType": "Float"},
                          {"fieldName": "sourcetype", "dataType": "List"},
                          {"fieldName": "Count_KEV", "dataType": "Integer"},
                          {"fieldName": "Risk_Level", "dataType": "String"}]}
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.call, m.load_config)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
     fetches = []
 
     def fake_call(method, endpoint, body=None, retries=1):
@@ -1965,80 +1826,77 @@ def test_field_metadata(m):
             return META
         raise AssertionError("unexpected call to %s" % endpoint)
 
-    m.CFG_DIR, m.call, m.load_config = tmp, fake_call, lambda: ("s.example", "tok", None)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "call", fake_call)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))
     m._FIELD_MAP.clear()
-    try:
-        # No cache on disk: types must come from a fetch, not from a "String" default.
-        check("cold cache still types a List field", m.field_type("asset", "sourcetype"), "List")
-        check("...and a Float field", m.field_type("asset", "Risk_Score"), "Float")
-        check("...and an Integer field", m.field_type("asset", "Count_KEV"), "Integer")
-        check("metadata fetched exactly once", len(fetches), 1)
-        check("...and written to the cache",
-              any(f.startswith("fields.") for f in os.listdir(tmp)), True)
-        m._FIELD_MAP.clear()
-        check("second process reads the cache, no refetch",
-              (m.field_type("asset", "sourcetype"), len(fetches)), ("List", 1))
+    # No cache on disk: types must come from a fetch, not from a "String" default.
+    check("cold cache still types a List field", m.field_type("asset", "sourcetype"), "List")
+    check("...and a Float field", m.field_type("asset", "Risk_Score"), "Float")
+    check("...and an Integer field", m.field_type("asset", "Count_KEV"), "Integer")
+    check("metadata fetched exactly once", len(fetches), 1)
+    check("...and written to the cache",
+          any(f.startswith("fields.") for f in os.listdir(tmp)), True)
+    m._FIELD_MAP.clear()
+    check("second process reads the cache, no refetch",
+          (m.field_type("asset", "sourcetype"), len(fetches)), ("List", 1))
 
-        # A cold fill under a fan-out happens once. build_digest runs summarize_by and top_n
-        # concurrently; unlocked, both missed the memo and both fetched the same ~1MB metadata,
-        # each burning a slot of the 60/min budget on exactly the clean-install path.
-        import time as _time
-        m._FIELD_MAP.clear()
-        m.CFG_DIR = tempfile.mkdtemp()   # no disk cache either, so every thread starts truly cold
-        fetches.clear()
+    # A cold fill under a fan-out happens once. build_digest runs summarize_by and top_n
+    # concurrently; unlocked, both missed the memo and both fetched the same ~1MB metadata,
+    # each burning a slot of the 60/min budget on exactly the clean-install path.
+    import time as _time
+    m._FIELD_MAP.clear()
+    monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(dir=tmp_path))
+    fetches.clear()
 
-        def slow_call(method, endpoint, body=None, retries=1):
-            _time.sleep(0.05)   # widen the race window the lock must close
-            return fake_call(method, endpoint, body, retries)
+    def slow_call(method, endpoint, body=None, retries=1):
+        _time.sleep(0.05)   # widen the race window the lock must close
+        return fake_call(method, endpoint, body, retries)
 
-        m.call = slow_call
-        rs = m.parallel([(lambda: m.field_type("asset", "sourcetype")) for _ in range(4)])
-        check("concurrent cold loads fetch metadata once", (set(rs), len(fetches)), ({"List"}, 1))
-        m.call = fake_call
+    monkeypatch.setattr(m, "call", slow_call)
+    rs = m.parallel([(lambda: m.field_type("asset", "sourcetype")) for _ in range(4)])
+    check("concurrent cold loads fetch metadata once", (set(rs), len(fetches)), ({"List"}, 1))
+    monkeypatch.setattr(m, "call", fake_call)
 
-        # Name validation: a typo must raise, not sail through into a query returning 0.
-        def err(fn, *a):
-            try:
-                fn(*a)
-                return None
-            except SystemExit:
-                return "exited"
+    # Name validation: a typo must raise, not sail through into a query returning 0.
+    def err(fn, *a):
+        try:
+            fn(*a)
+            return None
+        except SystemExit:
+            return "exited"
 
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            check("unknown field is rejected", err(m.check_fields, "asset", "Rsk_Score"), "exited")
-        check("...naming the closest match", "Risk_Score" in buf.getvalue(), True)
-        buf = io.StringIO()
-        with contextlib.redirect_stderr(buf):
-            check("case-only miss is rejected", err(m.check_fields, "asset", "risk_score"), "exited")
-        check("...and says case-sensitive", "case-sensitive" in buf.getvalue(), True)
-        check("a valid field passes", m.check_fields("asset", "Risk_Score", "sourcetype"), None)
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        check("unknown field is rejected", err(m.check_fields, "asset", "Rsk_Score"), "exited")
+    check("...naming the closest match", "Risk_Score" in buf.getvalue(), True)
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        check("case-only miss is rejected", err(m.check_fields, "asset", "risk_score"), "exited")
+    check("...and says case-sensitive", "case-sensitive" in buf.getvalue(), True)
+    check("a valid field passes", m.check_fields("asset", "Risk_Score", "sourcetype"), None)
 
-        # Metadata unreachable (scoped token): degrade, never invent a validation failure.
-        m._FIELD_MAP.clear()
-        m.CFG_DIR = os.path.join(tmp, "empty")
+    # Metadata unreachable (scoped token): degrade, never invent a validation failure.
+    m._FIELD_MAP.clear()
+    monkeypatch.setattr(m, "CFG_DIR", os.path.join(tmp, "empty"))
 
-        def deny(method, endpoint, body=None, retries=1):
-            raise RuntimeError("HTTP 403: Forbidden")
+    def deny(method, endpoint, body=None, retries=1):
+        raise RuntimeError("HTTP 403: Forbidden")
 
-        m.call = deny
-        check("no metadata -> no false rejection", m.check_fields("asset", "Whatever"), None)
-        check("no metadata -> type falls back to String", m.field_type("asset", "Whatever"), "String")
-    finally:
-        m.CFG_DIR, m.call, m.load_config = real
-        m._FIELD_MAP.clear()
+    monkeypatch.setattr(m, "call", deny)
+    check("no metadata -> no false rejection", m.check_fields("asset", "Whatever"), None)
+    check("no metadata -> type falls back to String", m.field_type("asset", "Whatever"), "String")
 
 
-def test_top_ladder(m):
+def test_top_ladder(m, monkeypatch, tmp_path):
     """`top` on an unbounded field (epoch timestamps, byte counts) used to die with a TypeError:
     every ladder rung filled -- including the top one -- so nothing bracketed the threshold from
     above and the refinement computed float(None). The fix climbs x10 until a probe under-fills,
     and past even that it answers with the best filling threshold instead of crashing."""
-    print("[9b] top threshold ladder: unbounded fields (offline)")
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.call, m.load_config)
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("s.example", "tok", None)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
     META = {"metadata": [{"fieldName": "Last_Seen", "dataType": "Float"},
                          {"fieldName": "Ingest_Bytes", "dataType": "Float"}]}
 
@@ -2056,248 +1914,237 @@ def test_top_ladder(m):
                              for i in range(100)]}
         return fake_call
 
+    monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))
+    m._FIELD_MAP.clear()
+    # 600 records all valued ~1.6e9: every ladder rung fills, so no rung brackets from above.
+    monkeypatch.setattr(m, "call", make_call(lambda t: 600 if t <= 1.6e9 else 0))
+    out = m.top_n("asset", "Last_Seen", 10)
+    check("unbounded field returns a ranking instead of crashing", len(out["top"]), 10)
+    check("...with a climbed, bracketed threshold", out["matchedAtThreshold"] >= 1e9, True)
+    check("...and the exact tail count", out["totalInTail"], 600)
+    check("...untruncated", out.get("truncated"), None)
+
+    # Values outrunning even the x10 climb: refinement is skipped, the verb still answers.
+    monkeypatch.setattr(m, "call", make_call(lambda t: 600))
+    out = m.top_n("asset", "Ingest_Bytes", 10)
+    check("a field beyond the climb's reach still answers", len(out["top"]), 10)
+    check("...with the full tail intact", out["totalInTail"], 600)
+
+    # --- a warm cache can tighten (2026-09-25 performance review) -------------------------------
+    # The measured shape, with made-up counts: the cached 1000 rung matched about three times what
+    # 3000 did, on a stack with huge records. A warm hit used to stop at its first probe forever.
+    probes = []
+
+    def counting(count_at):
+        inner = make_call(count_at)
+
+        def f(method, endpoint, body=None, retries=1):
+            if body and (body.get("paging") or {}).get("recordsPerPage") == 1:
+                probes.append(body["query"][0][0]["value"])
+            return inner(method, endpoint, body, retries)
+        return f
+    check("the ladder has the half-decade rungs", (3000 in m.TOP_LADDER, 30000 in m.TOP_LADDER), (True, True))
+    m._top_rung_save("asset", "Last_Seen", 1000)
+    monkeypatch.setattr(m, "call", counting(lambda t: 90 if t <= 1000 else 25 if t <= 3000 else 0))
+    out = m.top_n("asset", "Last_Seen", 10)
+    check("a loose warm hit climbs to the tighter rung", (out["matchedAtThreshold"], out["totalInTail"]), (3000.0, 25))
+    check("...in two extra probes, stopping at the first that under-fills", probes, [1000.0, 3000.0, 10000.0])
+    check("...and remembers it", m.TOP_LADDER[m._top_rung_start("asset", "Last_Seen")], 3000)
+    check("...still returning the full top N", len(out["top"]), 10)
+    probes.clear()
+    m._top_rung_save("asset", "Last_Seen", 1000)
+    monkeypatch.setattr(m, "call", counting(lambda t: 12 if t <= 1000 else 0))
+    out = m.top_n("asset", "Last_Seen", 10)
+    check("a tight warm hit stays one probe", probes, [1000.0])
+    check("...at the cached rung", out["matchedAtThreshold"], 1000.0)
+
+    # --- count_records: no record downloaded, and a fallback if the trick ever stops working --
+    sent = []
+
+    def fake(resp):
+        def f(method, endpoint, body=None, retries=1):
+            sent.append(body["paging"])
+            r = resp(body["paging"]["page"])
+            if isinstance(r, Exception):
+                raise r
+            return r
+        return f
+    monkeypatch.setattr(m, "call", fake(lambda page: {"totalRecords": 42, "data": []}))
+    check("a count asks for the page past the end", (m.count_records("asset", []), sent),
+          (42, [{"page": m.COUNT_PAGE, "recordsPerPage": 1}]))
+    sent.clear()
+    monkeypatch.setattr(m, "call",
+                        fake(lambda page: {"data": []} if page else {"totalRecords": 7, "data": [{}]}))
+    check("no totalRecords there falls back to page 0", (m.count_records("asset", []), len(sent)), (7, 2))
+    sent.clear()
+    monkeypatch.setattr(m, "call",
+                        fake(lambda page: RuntimeError("HTTP 400: page out of range") if page else {"totalRecords": 5}))
+    check("...so does a 400", m.count_records("asset", []), 5)
+    monkeypatch.setattr(m, "call", fake(lambda page: RuntimeError("HTTP 500: boom")))
     try:
-        m._FIELD_MAP.clear()
-        # 600 records all valued ~1.6e9: every ladder rung fills, so no rung brackets from above.
-        m.call = make_call(lambda t: 600 if t <= 1.6e9 else 0)
-        out = m.top_n("asset", "Last_Seen", 10)
-        check("unbounded field returns a ranking instead of crashing", len(out["top"]), 10)
-        check("...with a climbed, bracketed threshold", out["matchedAtThreshold"] >= 1e9, True)
-        check("...and the exact tail count", out["totalInTail"], 600)
-        check("...untruncated", out.get("truncated"), None)
-
-        # Values outrunning even the x10 climb: refinement is skipped, the verb still answers.
-        m.call = make_call(lambda t: 600)
-        out = m.top_n("asset", "Ingest_Bytes", 10)
-        check("a field beyond the climb's reach still answers", len(out["top"]), 10)
-        check("...with the full tail intact", out["totalInTail"], 600)
-
-        # --- a warm cache can tighten (2026-09-25 performance review) -------------------------------
-        # The measured shape, with made-up counts: the cached 1000 rung matched about three times what
-        # 3000 did, on a stack with huge records. A warm hit used to stop at its first probe forever.
-        probes = []
-
-        def counting(count_at):
-            inner = make_call(count_at)
-
-            def f(method, endpoint, body=None, retries=1):
-                if body and (body.get("paging") or {}).get("recordsPerPage") == 1:
-                    probes.append(body["query"][0][0]["value"])
-                return inner(method, endpoint, body, retries)
-            return f
-        check("the ladder has the half-decade rungs", (3000 in m.TOP_LADDER, 30000 in m.TOP_LADDER), (True, True))
-        m._top_rung_save("asset", "Last_Seen", 1000)
-        m.call = counting(lambda t: 90 if t <= 1000 else 25 if t <= 3000 else 0)
-        out = m.top_n("asset", "Last_Seen", 10)
-        check("a loose warm hit climbs to the tighter rung", (out["matchedAtThreshold"], out["totalInTail"]), (3000.0, 25))
-        check("...in two extra probes, stopping at the first that under-fills", probes, [1000.0, 3000.0, 10000.0])
-        check("...and remembers it", m.TOP_LADDER[m._top_rung_start("asset", "Last_Seen")], 3000)
-        check("...still returning the full top N", len(out["top"]), 10)
-        probes.clear()
-        m._top_rung_save("asset", "Last_Seen", 1000)
-        m.call = counting(lambda t: 12 if t <= 1000 else 0)
-        out = m.top_n("asset", "Last_Seen", 10)
-        check("a tight warm hit stays one probe", probes, [1000.0])
-        check("...at the cached rung", out["matchedAtThreshold"], 1000.0)
-
-        # --- count_records: no record downloaded, and a fallback if the trick ever stops working --
-        sent = []
-
-        def fake(resp):
-            def f(method, endpoint, body=None, retries=1):
-                sent.append(body["paging"])
-                r = resp(body["paging"]["page"])
-                if isinstance(r, Exception):
-                    raise r
-                return r
-            return f
-        m.call = fake(lambda page: {"totalRecords": 42, "data": []})
-        check("a count asks for the page past the end", (m.count_records("asset", []), sent),
-              (42, [{"page": m.COUNT_PAGE, "recordsPerPage": 1}]))
-        sent.clear()
-        m.call = fake(lambda page: {"data": []} if page else {"totalRecords": 7, "data": [{}]})
-        check("no totalRecords there falls back to page 0", (m.count_records("asset", []), len(sent)), (7, 2))
-        sent.clear()
-        m.call = fake(lambda page: RuntimeError("HTTP 400: page out of range") if page else {"totalRecords": 5})
-        check("...so does a 400", m.count_records("asset", []), 5)
-        m.call = fake(lambda page: RuntimeError("HTTP 500: boom"))
-        try:
-            m.count_records("asset", [])
-            raised = False
-        except RuntimeError:
-            raised = True
-        check("a server error is not swallowed into a fallback", raised, True)
-    finally:
-        m.CFG_DIR, m.call, m.load_config = real
-        m._FIELD_MAP.clear()
+        m.count_records("asset", [])
+        raised = False
+    except RuntimeError:
+        raised = True
+    check("a server error is not swallowed into a fallback", raised, True)
 
 
-def test_stacks_registry(m):
+def test_stacks_registry(m, monkeypatch, capsys, tmp_path):
     """`stacks add` on an existing name is the token-rotation path, and it used to replace the
     registry entry wholesale -- dropping entity_salt, whose loss is unrecoverable: the next entity
     snapshot regenerates one and every earlier record reads as appeared-and-disappeared."""
-    print("[9c] stacks registry: update preserves entity_salt (offline)")
-    import contextlib, io
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE)
-    m.CFG_DIR = tmp
-    m.CFG_PATH = os.path.join(tmp, "config.json")
-    m.STACKS_PATH = os.path.join(tmp, "stacks.json")
+    import io
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp, "stacks.json"))
 
     def run(args):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_stacks_add(args)
-        return json.loads(buf.getvalue())
+        m.cmd_stacks_add(args)
+        buf = capsys.readouterr().out
+        return json.loads(buf)
 
     class A:
         name, fqdn, token, action_token = "demo", "demo.example.com", "tok-original", None
 
-    try:
-        out = run(A())
-        check("first stack activates", out["activatedNow"], True)
-        # Simulate what accumulates on a working install: the salt an entity snapshot minted,
-        # plus a saved action token.
-        reg = m.load_stacks()
-        reg["stacks"]["demo"]["entity_salt"] = "abc123"
-        reg["stacks"]["demo"]["action_token"] = "act-1"
-        m.save_stacks(reg)
-        m.mirror_active_to_config(reg)
+    out = run(A())
+    check("first stack activates", out["activatedNow"], True)
+    # Simulate what accumulates on a working install: the salt an entity snapshot minted,
+    # plus a saved action token.
+    reg = m.load_stacks()
+    reg["stacks"]["demo"]["entity_salt"] = "abc123"
+    reg["stacks"]["demo"]["action_token"] = "act-1"
+    m.save_stacks(reg)
+    m.mirror_active_to_config(reg)
 
-        class B:
-            name, fqdn, token, action_token = "demo", "demo.example.com", "tok-rotated", None
+    class B:
+        name, fqdn, token, action_token = "demo", "demo.example.com", "tok-rotated", None
 
-        out = run(B())
-        reg = m.load_stacks()
-        check("token rotation lands", reg["stacks"]["demo"]["api_token"], "tok-rotated")
-        check("...preserving entity_salt", reg["stacks"]["demo"].get("entity_salt"), "abc123")
-        check("...and the saved action token", reg["stacks"]["demo"].get("action_token"), "act-1")
-        with open(m.CFG_PATH, encoding="utf-8-sig") as f:
-            cfg = json.load(f)
-        check("updating the active stack refreshes config.json", cfg.get("api_token"), "tok-rotated")
-        check("...carrying the salt through the mirror", cfg.get("entity_salt"), "abc123")
-        check("...and the note says so", "config.json refreshed" in out["note"], True)
+    out = run(B())
+    reg = m.load_stacks()
+    check("token rotation lands", reg["stacks"]["demo"]["api_token"], "tok-rotated")
+    check("...preserving entity_salt", reg["stacks"]["demo"].get("entity_salt"), "abc123")
+    check("...and the saved action token", reg["stacks"]["demo"].get("action_token"), "act-1")
+    with open(m.CFG_PATH, encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    check("updating the active stack refreshes config.json", cfg.get("api_token"), "tok-rotated")
+    check("...carrying the salt through the mirror", cfg.get("entity_salt"), "abc123")
+    check("...and the note says so", "config.json refreshed" in out["note"], True)
 
-        # Token files are written atomically (a truncated stacks.json loses EVERY stack's
-        # credentials) and owner-only on POSIX (the default umask made them world-readable).
-        check("no temp file survives a registry write",
-              [f for f in os.listdir(tmp) if f.endswith(".tmp")], [])
-        if os.name == "posix":
-            import stat
-            for fname in ("stacks.json", "config.json"):
-                mode = stat.S_IMODE(os.stat(os.path.join(tmp, fname)).st_mode)
-                check("%s is owner-only (0600)" % fname, oct(mode), oct(0o600))
+    # Token files are written atomically (a truncated stacks.json loses EVERY stack's
+    # credentials) and owner-only on POSIX (the default umask made them world-readable).
+    check("no temp file survives a registry write",
+          [f for f in os.listdir(tmp) if f.endswith(".tmp")], [])
+    if os.name == "posix":
+        import stat
+        for fname in ("stacks.json", "config.json"):
+            mode = stat.S_IMODE(os.stat(os.path.join(tmp, fname)).st_mode)
+            check("%s is owner-only (0600)" % fname, oct(mode), oct(0o600))
 
-        # Token channels that stay out of shell history and process listings.
-        class C:
-            name, fqdn, token, action_token = "demo", "demo.example.com", "-", None
-        real_stdin = sys.stdin
-        sys.stdin = io.StringIO("tok-stdin\n")
+    # Token channels that stay out of shell history and process listings.
+    class C:
+        name, fqdn, token, action_token = "demo", "demo.example.com", "-", None
+    monkeypatch.setattr(sys, "stdin", io.StringIO("tok-stdin\n"))
+    run(C())
+    check("--token - reads from stdin", m.load_stacks()["stacks"]["demo"]["api_token"], "tok-stdin")
+
+    class D:
+        name, fqdn, token, action_token = "demo", "demo.example.com", None, None
+    monkeypatch.setenv("MERIDIAN_API_TOKEN", "tok-env")
+    run(D())
+    check("omitted --token falls back to the env var",
+          m.load_stacks()["stacks"]["demo"]["api_token"], "tok-env")
+
+    # TLS posture is per stack and survives the mirror; it used to evaporate on any switch.
+    class E:
+        name, fqdn, token, action_token, insecure_tls = "lab", "lab.example.com", "tok-lab", None, True
+    run(E())
+    reg = m.load_stacks()
+    check("--insecure-tls is stored on the stack", reg["stacks"]["lab"].get("insecure_tls"), True)
+    reg["active"] = "lab"
+    m.save_stacks(reg); m.mirror_active_to_config(reg)
+    with open(m.CFG_PATH, encoding="utf-8-sig") as f:
+        check("...and carried into config.json by the mirror", json.load(f).get("insecure_tls"), True)
+    reg["active"] = "demo"
+    m.save_stacks(reg); m.mirror_active_to_config(reg)
+    with open(m.CFG_PATH, encoding="utf-8-sig") as f:
+        check("...but never onto a verified stack", "insecure_tls" in json.load(f), False)
+
+    # An upgraded install (config.json, no stacks.json) migrates salt and TLS posture into the
+    # registry -- the migration must carry everything the mirror carries, or the first
+    # `stacks add` strips them and the salt loss is unrecoverable.
+    tmp2 = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp2)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp2, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp2, "stacks.json"))
+    m._private_write(m.CFG_PATH, {"fqdn": "old.example.com", "api_token": "tok-old",
+                                  "entity_salt": "salt-old", "insecure_tls": True})
+    reg = m.load_stacks()
+    entry = reg["stacks"][next(iter(reg["stacks"]))]
+    check("migration carries entity_salt", entry.get("entity_salt"), "salt-old")
+    check("...and the TLS posture", entry.get("insecure_tls"), True)
+
+    # config.json is documented as hand-editable (call()'s own TLS error says to set
+    # insecure_tls there), but the mirror rewrote it from scratch -- so rotating a token with
+    # `stacks add`, which now re-mirrors, silently dropped a hand-set posture and the next call
+    # failed cert verification with no clue why.
+    tmp3 = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp3)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp3, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp3, "stacks.json"))
+
+    class F:
+        name, fqdn, token, action_token = "prod", "prod.example.com", "tok-1", None
+    run(F())
+    m._private_write(m.CFG_PATH, {"fqdn": "prod.example.com", "api_token": "tok-1",
+                                  "insecure_tls": True, "custom_key": "kept"})
+
+    class G:
+        name, fqdn, token, action_token = "prod", "prod.example.com", "tok-2", None
+    run(G())
+    with open(m.CFG_PATH, encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    check("a token rotation keeps a hand-set insecure_tls", cfg.get("insecure_tls"), True)
+    check("...and any other hand-added key", cfg.get("custom_key"), "kept")
+    check("...while the new token lands", cfg.get("api_token"), "tok-2")
+    check("...and the posture is promoted into the registry",
+          m.load_stacks()["stacks"]["prod"].get("insecure_tls"), True)
+
+    # ...but a switch to a DIFFERENT stack must not inherit the previous one's settings.
+    class H:
+        name, fqdn, token, action_token = "other", "other.example.com", "tok-3", None
+    run(H())
+    reg = m.load_stacks(); reg["active"] = "other"
+    m.save_stacks(reg); m.mirror_active_to_config(reg)
+    with open(m.CFG_PATH, encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    check("switching stacks does NOT inherit the other's TLS opt-out", "insecure_tls" in cfg, False)
+    check("...nor its unrelated keys", "custom_key" in cfg, False)
+
+    # Concurrent writers must not collide on one temp path (a scheduled snapshot's entity_salt
+    # rewrite racing an interactive stacks switch produced invalid JSON, read as "not configured").
+    import threading as _th
+    errs = []
+    def writer(tag):
         try:
-            run(C())
-        finally:
-            sys.stdin = real_stdin
-        check("--token - reads from stdin", m.load_stacks()["stacks"]["demo"]["api_token"], "tok-stdin")
-
-        class D:
-            name, fqdn, token, action_token = "demo", "demo.example.com", None, None
-        os.environ["MERIDIAN_API_TOKEN"] = "tok-env"
-        try:
-            run(D())
-        finally:
-            del os.environ["MERIDIAN_API_TOKEN"]
-        check("omitted --token falls back to the env var",
-              m.load_stacks()["stacks"]["demo"]["api_token"], "tok-env")
-
-        # TLS posture is per stack and survives the mirror; it used to evaporate on any switch.
-        class E:
-            name, fqdn, token, action_token, insecure_tls = "lab", "lab.example.com", "tok-lab", None, True
-        run(E())
-        reg = m.load_stacks()
-        check("--insecure-tls is stored on the stack", reg["stacks"]["lab"].get("insecure_tls"), True)
-        reg["active"] = "lab"
-        m.save_stacks(reg); m.mirror_active_to_config(reg)
-        with open(m.CFG_PATH, encoding="utf-8-sig") as f:
-            check("...and carried into config.json by the mirror", json.load(f).get("insecure_tls"), True)
-        reg["active"] = "demo"
-        m.save_stacks(reg); m.mirror_active_to_config(reg)
-        with open(m.CFG_PATH, encoding="utf-8-sig") as f:
-            check("...but never onto a verified stack", "insecure_tls" in json.load(f), False)
-
-        # An upgraded install (config.json, no stacks.json) migrates salt and TLS posture into the
-        # registry -- the migration must carry everything the mirror carries, or the first
-        # `stacks add` strips them and the salt loss is unrecoverable.
-        tmp2 = tempfile.mkdtemp()
-        m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH = tmp2, os.path.join(tmp2, "config.json"), os.path.join(tmp2, "stacks.json")
-        m._private_write(m.CFG_PATH, {"fqdn": "old.example.com", "api_token": "tok-old",
-                                      "entity_salt": "salt-old", "insecure_tls": True})
-        reg = m.load_stacks()
-        entry = reg["stacks"][next(iter(reg["stacks"]))]
-        check("migration carries entity_salt", entry.get("entity_salt"), "salt-old")
-        check("...and the TLS posture", entry.get("insecure_tls"), True)
-
-        # config.json is documented as hand-editable (call()'s own TLS error says to set
-        # insecure_tls there), but the mirror rewrote it from scratch -- so rotating a token with
-        # `stacks add`, which now re-mirrors, silently dropped a hand-set posture and the next call
-        # failed cert verification with no clue why.
-        tmp3 = tempfile.mkdtemp()
-        m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH = tmp3, os.path.join(tmp3, "config.json"), os.path.join(tmp3, "stacks.json")
-
-        class F:
-            name, fqdn, token, action_token = "prod", "prod.example.com", "tok-1", None
-        run(F())
-        m._private_write(m.CFG_PATH, {"fqdn": "prod.example.com", "api_token": "tok-1",
-                                      "insecure_tls": True, "custom_key": "kept"})
-
-        class G:
-            name, fqdn, token, action_token = "prod", "prod.example.com", "tok-2", None
-        run(G())
-        with open(m.CFG_PATH, encoding="utf-8-sig") as f:
-            cfg = json.load(f)
-        check("a token rotation keeps a hand-set insecure_tls", cfg.get("insecure_tls"), True)
-        check("...and any other hand-added key", cfg.get("custom_key"), "kept")
-        check("...while the new token lands", cfg.get("api_token"), "tok-2")
-        check("...and the posture is promoted into the registry",
-              m.load_stacks()["stacks"]["prod"].get("insecure_tls"), True)
-
-        # ...but a switch to a DIFFERENT stack must not inherit the previous one's settings.
-        class H:
-            name, fqdn, token, action_token = "other", "other.example.com", "tok-3", None
-        run(H())
-        reg = m.load_stacks(); reg["active"] = "other"
-        m.save_stacks(reg); m.mirror_active_to_config(reg)
-        with open(m.CFG_PATH, encoding="utf-8-sig") as f:
-            cfg = json.load(f)
-        check("switching stacks does NOT inherit the other's TLS opt-out", "insecure_tls" in cfg, False)
-        check("...nor its unrelated keys", "custom_key" in cfg, False)
-
-        # Concurrent writers must not collide on one temp path (a scheduled snapshot's entity_salt
-        # rewrite racing an interactive stacks switch produced invalid JSON, read as "not configured").
-        import threading as _th
-        errs = []
-        def writer(tag):
-            try:
-                for _ in range(15):
-                    m._private_write(m.CFG_PATH, {"fqdn": "x.example", "api_token": tag, "pad": tag * 40})
-            except Exception as e:
-                errs.append(e)
-        ts = [_th.Thread(target=writer, args=("a",)), _th.Thread(target=writer, args=("b",))]
-        for t in ts: t.start()
-        for t in ts: t.join()
-        with open(m.CFG_PATH, encoding="utf-8-sig") as f:
-            survived = json.load(f)        # must parse: never a half-written blend of both writers
-        check("concurrent credential writes never corrupt the file", survived.get("api_token") in ("a", "b"), True)
-        check("...and leave no temp files behind", [f for f in os.listdir(tmp3) if f.endswith(".tmp")], [])
-        check("...with no write errors", errs, [])
-    finally:
-        (m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE) = real
+            for _ in range(15):
+                m._private_write(m.CFG_PATH, {"fqdn": "x.example", "api_token": tag, "pad": tag * 40})
+        except Exception as e:
+            errs.append(e)
+    ts = [_th.Thread(target=writer, args=("a",)), _th.Thread(target=writer, args=("b",))]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    with open(m.CFG_PATH, encoding="utf-8-sig") as f:
+        survived = json.load(f)        # must parse: never a half-written blend of both writers
+    check("concurrent credential writes never corrupt the file", survived.get("api_token") in ("a", "b"), True)
+    check("...and leave no temp files behind", [f for f in os.listdir(tmp3) if f.endswith(".tmp")], [])
+    check("...with no write errors", errs, [])
 
 
 def test_clause_parsing(m):
     """`--where` shape is checked locally. Omitting the type used to put the value in the type slot,
     which the API rejected with `Invalid operator: >=` -- blaming the operator, which was fine -- after
     spending a round trip to say so."""
-    print("[10] --where clause validation (offline)")
     import contextlib, io
 
     def fails(clause):
@@ -2431,11 +2278,10 @@ def test_clause_parsing(m):
            [{"searchFieldName": "Risk_Score", "operator": ">=", "type": "Float", "value": 500.0}]])
 
 
-def test_smartlabels(m):
+def test_smartlabels(m, monkeypatch, tmp_path):
     """SmartLabels are the customer's own vocabulary, and Meridian ships an llmBusinessValue with each.
     Two things must hold: the declared type is translated to a DSL type, and the table is resolved from
     field metadata rather than from `field_collection`, whose values are stack-specific names."""
-    print("[11] SmartLabels (offline)")
     import contextlib, io
     RAW = [
         {"friendly_name": "Crown Jewels", "field_name": "Crown_Jewels", "field_type": "Boolean",
@@ -2447,145 +2293,143 @@ def test_smartlabels(m):
         {"friendly_name": "Orphaned", "field_name": "Not_A_Real_Field", "field_type": "Str",
          "field_collection": "x", "llmBusinessValue": "Label whose field no longer exists."},
     ]
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.call, m.load_config, m._LABELS, dict(m._FIELD_MAP))
-    m.CFG_DIR, m.load_config = tmp, lambda: ("s.example", "tok", None)
-    m._LABELS = None
+    tmp = str(tmp_path)
+    monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "_LABELS", None)
     m._FIELD_MAP.clear()
     # Crown_Jewels/PCI_Scope on asset, Joiner_Risk on user -- collection names deliberately unhelpful.
     m._FIELD_MAP["asset"] = {"Crown_Jewels": "Binary", "PCI_Scope": "String"}
     m._FIELD_MAP["user"] = {"Joiner_Risk": "Integer"}
-    m.call = lambda method, ep, body=None, retries=1: RAW if "smartlabel" in ep else {}
-    try:
-        labels = m.load_labels()
-        by = {l["name"]: l for l in labels}
-        check("declared Boolean maps to the DSL's Binary", by["Crown Jewels"]["type"], "Binary")
-        check("declared Str maps to the DSL's String", by["PCI Scope"]["type"], "String")
-        check("Integer passes through", by["Joiner Risk"]["type"], "Integer")
-        check("asset label resolved to the asset table", by["Crown Jewels"]["table"], "asset")
-        check("user label resolved to the user table", by["Joiner Risk"]["table"], "user")
-        check("business-value text is carried", by["Crown Jewels"]["purpose"],
-              "Assets the business cannot lose.")
-        check("label with no matching field is not queryable", by["Orphaned"]["queryable"], False)
-        check("...and its table is unknown, not guessed", by["Orphaned"]["table"], None)
-        check("cache written for the next process",
-              any(f.startswith("labels.") for f in os.listdir(tmp)), True)
+    monkeypatch.setattr(m, "call", lambda method, ep, body=None, retries=1: RAW if "smartlabel" in ep else {})
+    labels = m.load_labels()
+    by = {l["name"]: l for l in labels}
+    check("declared Boolean maps to the DSL's Binary", by["Crown Jewels"]["type"], "Binary")
+    check("declared Str maps to the DSL's String", by["PCI Scope"]["type"], "String")
+    check("Integer passes through", by["Joiner Risk"]["type"], "Integer")
+    check("asset label resolved to the asset table", by["Crown Jewels"]["table"], "asset")
+    check("user label resolved to the user table", by["Joiner Risk"]["table"], "user")
+    check("business-value text is carried", by["Crown Jewels"]["purpose"],
+          "Assets the business cannot lose.")
+    check("label with no matching field is not queryable", by["Orphaned"]["queryable"], False)
+    check("...and its table is unknown, not guessed", by["Orphaned"]["table"], None)
+    check("cache written for the next process",
+          any(f.startswith("labels.") for f in os.listdir(tmp)), True)
 
-        check("exact business term resolves", [l["field"] for l in m.find_label("Crown Jewels")], ["Crown_Jewels"])
-        check("substring resolves", [l["field"] for l in m.find_label("jewel")], ["Crown_Jewels"])
-        check("near miss still resolves", [l["field"] for l in m.find_label("Crown Jewls")], ["Crown_Jewels"])
-        check("unqueryable label never offered", [l["field"] for l in m.find_label("Orphaned")], [])
-        check("nonsense term resolves to nothing", m.find_label("zzzz nothing"), [])
+    check("exact business term resolves", [l["field"] for l in m.find_label("Crown Jewels")], ["Crown_Jewels"])
+    check("substring resolves", [l["field"] for l in m.find_label("jewel")], ["Crown_Jewels"])
+    check("near miss still resolves", [l["field"] for l in m.find_label("Crown Jewls")], ["Crown_Jewels"])
+    check("unqueryable label never offered", [l["field"] for l in m.find_label("Orphaned")], [])
+    check("nonsense term resolves to nothing", m.find_label("zzzz nothing"), [])
 
-        # --refresh drops the cache so a label defined after the first run becomes visible. Nothing used
-        # to invalidate this file, so it never did.
-        RAW.append({"friendly_name": "New Label", "field_name": "PCI_Scope", "field_type": "Str",
-                    "field_collection": "x", "llmBusinessValue": "Defined after the cache was written."})
+    # --refresh drops the cache so a label defined after the first run becomes visible. Nothing used
+    # to invalidate this file, so it never did.
+    RAW.append({"friendly_name": "New Label", "field_name": "PCI_Scope", "field_type": "Str",
+                "field_collection": "x", "llmBusinessValue": "Defined after the cache was written."})
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        class A: search, table, refresh = None, None, None
+        m.cmd_labels(A())
+    check("a label defined after the cache is NOT seen without --refresh",
+          json.loads(buf.getvalue())["labelsDefined"], 4)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        class A: search, table, refresh = None, None, True
+        m.cmd_labels(A())
+    check("--refresh picks it up", json.loads(buf.getvalue())["labelsDefined"], 5)
+    check("refresh-fields clears the labels cache too", m.drop_labels_cache(), True)
+    check("...and is honest when there was nothing to clear", m.drop_labels_cache(), False)
+
+    # Field metadata unreachable: every label resolves to no table, which is indistinguishable from
+    # "they never defined that label". Persisting it would make one 403 hide every SmartLabel forever.
+    monkeypatch.setattr(m, "_LABELS", None)
+    m._FIELD_MAP.clear()
+    monkeypatch.setattr(m, "CFG_DIR", os.path.join(tmp, "nometa"))
+    monkeypatch.setattr(m, "call",
+                        lambda method, ep, body=None, retries=1: (
+                   RAW if "smartlabel" in ep else (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden"))))
+    labels = m.load_labels()
+    check("labels still returned when metadata is unreachable", len(labels), 5)
+    check("...marked provisional", m._LABELS_PROVISIONAL, True)
+    check("...and NOT written to disk",
+          os.path.isdir(m.CFG_DIR) and any(f.startswith("labels.") for f in os.listdir(m.CFG_DIR)), False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        class A: search, table, refresh = "Crown Jewels", None, None
+        m.cmd_labels(A())
+    out = json.loads(buf.getvalue())
+    check("an unresolvable lookup is reported, not answered 'no match'",
+          out.get("fieldMetadataUnavailable"), True)
+    check("...and never claims the term isn't one of their labels",
+          "simply not be one of them" in (out.get("note") or ""), False)
+
+    # --- purpose text: full on a search, absent on a bare listing ---------------------------
+    # The purpose blurbs run 180-300 characters each. Truncating them to 110 rather than dropping
+    # them barely helped: measured on the demo stack, 151 truncated blurbs were 16,947 of the
+    # payload's 42,895 characters -- 40%, ~4,200 tokens -- on a call whose question is "what
+    # vocabulary exists here", which the name and field already answer.
+    monkeypatch.setattr(m, "_LABELS", None)
+    monkeypatch.setattr(m, "_LABELS_PROVISIONAL", False)
+    monkeypatch.setattr(m, "CFG_DIR", os.path.join(tmp, "purpose"))
+    monkeypatch.setattr(m, "call", lambda method, ep, body=None, retries=1: RAW if "smartlabel" in ep else {})
+    m._FIELD_MAP["asset"] = {"Crown_Jewels": "Binary", "PCI_Scope": "String"}
+    m._FIELD_MAP["user"] = {"Joiner_Risk": "Integer"}
+
+    def labels_out(search=None, table=None):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            class A: search, table, refresh = None, None, None
-            m.cmd_labels(A())
-        check("a label defined after the cache is NOT seen without --refresh",
-              json.loads(buf.getvalue())["labelsDefined"], 4)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            class A: search, table, refresh = None, None, True
-            m.cmd_labels(A())
-        check("--refresh picks it up", json.loads(buf.getvalue())["labelsDefined"], 5)
-        check("refresh-fields clears the labels cache too", m.drop_labels_cache(), True)
-        check("...and is honest when there was nothing to clear", m.drop_labels_cache(), False)
+            class A: pass
+            a = A(); a.search, a.table, a.refresh = search, table, None
+            m.cmd_labels(a)
+        return json.loads(buf.getvalue())
 
-        # Field metadata unreachable: every label resolves to no table, which is indistinguishable from
-        # "they never defined that label". Persisting it would make one 403 hide every SmartLabel forever.
-        m._LABELS = None
-        m._FIELD_MAP.clear()
-        m.CFG_DIR = os.path.join(tmp, "nometa")
-        m.call = lambda method, ep, body=None, retries=1: (
-            RAW if "smartlabel" in ep else (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden")))
-        labels = m.load_labels()
-        check("labels still returned when metadata is unreachable", len(labels), 5)
-        check("...marked provisional", m._LABELS_PROVISIONAL, True)
-        check("...and NOT written to disk",
-              os.path.isdir(m.CFG_DIR) and any(f.startswith("labels.") for f in os.listdir(m.CFG_DIR)), False)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            class A: search, table, refresh = "Crown Jewels", None, None
-            m.cmd_labels(A())
-        out = json.loads(buf.getvalue())
-        check("an unresolvable lookup is reported, not answered 'no match'",
-              out.get("fieldMetadataUnavailable"), True)
-        check("...and never claims the term isn't one of their labels",
-              "simply not be one of them" in (out.get("note") or ""), False)
+    found = labels_out(search="Crown Jewels")
+    check("a search keeps the purpose text in full", found["labels"][0].get("purpose"),
+          "Assets the business cannot lose.")
+    check("...and does not announce an omission", "purposeOmitted" in found, False)
 
-        # --- purpose text: full on a search, absent on a bare listing ---------------------------
-        # The purpose blurbs run 180-300 characters each. Truncating them to 110 rather than dropping
-        # them barely helped: measured on the demo stack, 151 truncated blurbs were 16,947 of the
-        # payload's 42,895 characters -- 40%, ~4,200 tokens -- on a call whose question is "what
-        # vocabulary exists here", which the name and field already answer.
-        m._LABELS, m._LABELS_PROVISIONAL = None, False
-        m.CFG_DIR = os.path.join(tmp, "purpose")
-        m.call = lambda method, ep, body=None, retries=1: RAW if "smartlabel" in ep else {}
-        m._FIELD_MAP["asset"] = {"Crown_Jewels": "Binary", "PCI_Scope": "String"}
-        m._FIELD_MAP["user"] = {"Joiner_Risk": "Integer"}
+    # A small listing is still detailed -- the threshold is about swamping an answer, not secrecy.
+    few = labels_out()
+    check("a listing under the detail threshold keeps purpose",
+          any("purpose" in r for r in few["labels"]), True)
 
-        def labels_out(search=None, table=None):
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                class A: pass
-                a = A(); a.search, a.table, a.refresh = search, table, None
-                m.cmd_labels(a)
-            return json.loads(buf.getvalue())
+    # Past the threshold the prose goes, and its absence is stated rather than implied.
+    RAW.extend([{"friendly_name": "Bulk %d" % i, "field_name": "PCI_Scope", "field_type": "Str",
+                 "llmBusinessValue": "x" * 250} for i in range(20)])
+    monkeypatch.setattr(m, "_LABELS", None)
+    monkeypatch.setattr(m, "CFG_DIR", os.path.join(tmp, "purpose2"))
+    many = labels_out()
+    check("a large listing drops purpose entirely, not to a truncated stub",
+          any("purpose" in r for r in many["labels"]), False)
+    check("...and says the text exists so its absence isn't read as 'no description'",
+          "--search" in (many.get("purposeOmitted") or ""), True)
+    check("...while name/field/table/type -- the queryable part -- all survive",
+          sorted(many["labels"][0].keys()), ["field", "name", "table", "type"])
+    # Narrowing by table is a search-shaped act but not a search: still a listing.
+    check("a table filter past the threshold also drops purpose",
+          any("purpose" in r for r in labels_out(table="asset")["labels"]), False)
 
-        found = labels_out(search="Crown Jewels")
-        check("a search keeps the purpose text in full", found["labels"][0].get("purpose"),
-              "Assets the business cannot lose.")
-        check("...and does not announce an omission", "purposeOmitted" in found, False)
-
-        # A small listing is still detailed -- the threshold is about swamping an answer, not secrecy.
-        few = labels_out()
-        check("a listing under the detail threshold keeps purpose",
-              any("purpose" in r for r in few["labels"]), True)
-
-        # Past the threshold the prose goes, and its absence is stated rather than implied.
-        RAW.extend([{"friendly_name": "Bulk %d" % i, "field_name": "PCI_Scope", "field_type": "Str",
-                     "llmBusinessValue": "x" * 250} for i in range(20)])
-        m._LABELS = None
-        m.CFG_DIR = os.path.join(tmp, "purpose2")
-        many = labels_out()
-        check("a large listing drops purpose entirely, not to a truncated stub",
-              any("purpose" in r for r in many["labels"]), False)
-        check("...and says the text exists so its absence isn't read as 'no description'",
-              "--search" in (many.get("purposeOmitted") or ""), True)
-        check("...while name/field/table/type -- the queryable part -- all survive",
-              sorted(many["labels"][0].keys()), ["field", "name", "table", "type"])
-        # Narrowing by table is a search-shaped act but not a search: still a listing.
-        check("a table filter past the threshold also drops purpose",
-              any("purpose" in r for r in labels_out(table="asset")["labels"]), False)
-
-        # A scoped token can't read SmartLabels at all: degrade, don't fail the session. Needs a directory
-        # with no cache in it -- the assertions above wrote one, and reading that back is correct.
-        m._LABELS, m._LABELS_PROVISIONAL = None, False
-        m.CFG_DIR = os.path.join(tmp, "nocache")
-        m.call = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden"))
-        check("403 on the endpoint degrades to empty", m.load_labels(), [])
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            class A: search, table, refresh = None, None, None
-            m.cmd_labels(A())
-        out = json.loads(buf.getvalue())
-        check("...and says why rather than looking empty", "full User Generated token" in (out.get("note") or ""), True)
-    finally:
-        m._LABELS_PROVISIONAL = False
-        m.CFG_DIR, m.call, m.load_config, m._LABELS, fm = real
-        m._FIELD_MAP.clear(); m._FIELD_MAP.update(fm)
+    # A scoped token can't read SmartLabels at all: degrade, don't fail the session. Needs a directory
+    # with no cache in it -- the assertions above wrote one, and reading that back is correct.
+    monkeypatch.setattr(m, "_LABELS", None)
+    monkeypatch.setattr(m, "_LABELS_PROVISIONAL", False)
+    monkeypatch.setattr(m, "CFG_DIR", os.path.join(tmp, "nocache"))
+    monkeypatch.setattr(m, "call", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden")))
+    check("403 on the endpoint degrades to empty", m.load_labels(), [])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        class A: search, table, refresh = None, None, None
+        m.cmd_labels(A())
+    out = json.loads(buf.getvalue())
+    check("...and says why rather than looking empty", "full User Generated token" in (out.get("note") or ""), True)
 
 
-def test_csv_export(m):
+def test_csv_export(m, tmp_path):
     """CSV carries the rows; the envelope must still carry the caveats. A spreadsheet cannot hold
     "37% of records are unaccounted for", and dropping it silently would undo the point of measuring."""
-    print("[12] CSV export (offline)")
     import contextlib, io
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=tmp_path)
     path = os.path.join(tmp, "out.csv")
     payload = {"table": "asset", "totalRecords": 1201, "shown": 2, "truncated": True,
                "note": "Showing 2 of 1201 matching records.",
@@ -2625,25 +2469,22 @@ def test_csv_export(m):
 
     # The header row too: column names come from the API, and a customer-named SmartLabel is data.
     import contextlib, io
-    out = os.path.join(tempfile.mkdtemp(), "h.csv")
-    with contextlib.redirect_stdout(io.StringIO()):
-        m.emit({"rows": [{"=HYPERLINK(\"https://x.example\")": 1, "Asset_Name": "a"}]}, "rows", "csv", out)
+    out = os.path.join(tempfile.mkdtemp(dir=tmp_path), "h.csv")
+    m.emit({"rows": [{"=HYPERLINK(\"https://x.example\")": 1, "Asset_Name": "a"}]}, "rows", "csv", out)
     with open(out, encoding="utf-8-sig") as f:
         header = f.readline()
     check("a formula-shaped column name is neutralized in the header", header.startswith('"\'=HYPERLINK'), True)
     check("...and an ordinary column name is untouched", header.rstrip().endswith(",Asset_Name"), True)
 
 
-def test_list(m):
+def test_list(m, monkeypatch, capsys, tmp_path):
     """The default `list` (one page) reads count and rows from the same page-0 fetch -- the
     separate recordsPerPage:1 count call was pure duplication. Multi-page and --all keep the
     count-first shape on purpose: the cheap count lets every data page go out in one concurrent
     wave, where merging would serialize page 0 ahead of the rest."""
-    print("[12b] list call budget (offline)")
-    import contextlib, io
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.call, m.load_config)
-    m.CFG_DIR, m.load_config = tmp, lambda: ("s.example", "tok", None)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
     calls = []
     TOTAL = 120
 
@@ -2668,95 +2509,90 @@ def test_list(m):
         for k, v in kw.items():
             setattr(a, k, v)
         calls.clear()
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_list(a)
-        return json.loads(buf.getvalue())
+        m.cmd_list(a)
+        buf = capsys.readouterr().out
+        return json.loads(buf)
 
-    try:
-        m._FIELD_MAP.clear()
-        m.call = fake_call
-        out = run()
-        check("default list costs ONE call", (out["apiCalls"], len(calls)), (1, 1))
-        check("...rows honour the limit", out["shown"], 50)
-        check("...the total comes from the same page", out["totalRecords"], 120)
-        check("...truncation is still declared", out["truncated"], True)
-        check("...and rows are projected to the selected fields", "Extra_Field" in out["rows"][0], False)
+    monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))
+    m._FIELD_MAP.clear()
+    monkeypatch.setattr(m, "call", fake_call)
+    out = run()
+    check("default list costs ONE call", (out["apiCalls"], len(calls)), (1, 1))
+    check("...rows honour the limit", out["shown"], 50)
+    check("...the total comes from the same page", out["totalRecords"], 120)
+    check("...truncation is still declared", out["truncated"], True)
+    check("...and rows are projected to the selected fields", "Extra_Field" in out["rows"][0], False)
 
-        out = run(limit=250)
-        check("a multi-page list keeps count-first", (out["apiCalls"], len(calls)), (3, 3))  # count + 2 pages
-        check("...returning everything", (out["shown"], out["truncated"]), (120, False))
+    out = run(limit=250)
+    check("a multi-page list keeps count-first", (out["apiCalls"], len(calls)), (3, 3))  # count + 2 pages
+    check("...returning everything", (out["shown"], out["truncated"]), (120, False))
 
-        out = run(count_only=True)
-        check("count-only costs one call", len(calls), 1)
-        check("...returning the total", out["totalRecords"], 120)
-    finally:
-        m.CFG_DIR, m.call, m.load_config = real
-        m._FIELD_MAP.clear()
+    out = run(count_only=True)
+    check("count-only costs one call", len(calls), 1)
+    check("...returning the total", out["totalRecords"], 120)
 
 
-def test_digest(m):
+def test_digest(m, monkeypatch):
     """A digest runs unattended, so a failed section must be named rather than quietly absent -- and its
     report tables must render row VALUES. _simple_table takes positional cells; handing it dicts renders
     the header names as data, which is exactly what happened the first time."""
-    print("[13] digest (offline)")
     import contextlib, io
-    real = (m.stack_metrics, m.summarize_connectors, m.summarize_by, m.top_n, m.load_config)
-    m.load_config = lambda: ("s.example", "tok", None)
-    m.stack_metrics = lambda: {"metrics": {"assetCount": 34229, "userCount": 10305,
-                                           "avg30DaysAssetCount": 34164, "avg30DaysUserCount": 10067}}
-    m.summarize_connectors = lambda *a, **k: {"summary": {"connectorsEnabled": 19, "healthy": 2,
-                                              "degraded": 9, "failing": 8, "idle": 0,
-                                              "recordsLastRun": 93583},
-                                              "failures": [{"service": "intune", "serviceCount": 2,
-                                                            "message": "auth failed <script>"}]}
-    m.summarize_by = lambda t, b, w=None, **k: {"table": t, "by": b, "total": 34229, "complete": True,
-                                                "groups": [{"value": "1-low", "count": 16739}]}
-    m.top_n = lambda t, f, n, w=None, s=None, **k: {"table": t, "field": f,
-                                                    "top": [{"Owner_Name": "U1", "Risk_Score": 1500}]}
-    try:
-        class A: table, by, field, top = "asset", None, "Risk_Score", 5
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_digest(A())
-        d = json.loads(buf.getvalue())
-        check("digest is tagged for the report renderer", d.get("generated"), "digest")
-        check("all sections assembled",
-              sorted(k for k in ("metrics", "connectors", "breakdown", "topUsers", "topAssets") if k in d),
-              ["breakdown", "connectors", "metrics", "topAssets", "topUsers"])
-        check("headline carries the 30-day averages", d["headline"]["assets30DayAvg"], 34164)
-        check("headline surfaces failing connectors", d["headline"]["connectorsFailing"], 8)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "stack_metrics",
+                        lambda: {"metrics": {"assetCount": 34229, "userCount": 10305,
+                                             "avg30DaysAssetCount": 34164, "avg30DaysUserCount": 10067}})
+    monkeypatch.setattr(m, "summarize_connectors",
+                        lambda *a, **k: {"summary": {"connectorsEnabled": 19, "healthy": 2,
+                                         "degraded": 9, "failing": 8, "idle": 0,
+                                         "recordsLastRun": 93583},
+                                         "failures": [{"service": "intune", "serviceCount": 2,
+                                                       "message": "auth failed <script>"}]})
+    monkeypatch.setattr(m, "summarize_by",
+                        lambda t, b, w=None, **k: {"table": t, "by": b, "total": 34229, "complete": True,
+                                                   "groups": [{"value": "1-low", "count": 16739}]})
+    monkeypatch.setattr(m, "top_n",
+                        lambda t, f, n, w=None, s=None, **k: {"table": t, "field": f,
+                                                              "top": [{"Owner_Name": "U1", "Risk_Score": 1500}]})
+    class A: table, by, field, top = "asset", None, "Risk_Score", 5
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_digest(A())
+    d = json.loads(buf.getvalue())
+    check("digest is tagged for the report renderer", d.get("generated"), "digest")
+    check("all sections assembled",
+          sorted(k for k in ("metrics", "connectors", "breakdown", "topUsers", "topAssets") if k in d),
+          ["breakdown", "connectors", "metrics", "topAssets", "topUsers"])
+    check("headline carries the 30-day averages", d["headline"]["assets30DayAvg"], 34164)
+    check("headline surfaces failing connectors", d["headline"]["connectorsFailing"], 8)
 
-        sub, stats, body = m._digest_html(d)
-        check("report subtitle names the stack", "s.example" in sub, True)
-        check("trend arrow computed against the average", "▲ 34,229" in body, True)
-        check("percent delta shown", "+0.2%" in body, True)
-        check("header names are NOT rendered as cell values", "<td>Measure</td>" in body, False)
-        check("real coverage numbers rendered", "<td>93,583</td>" in body, True)
-        check("untrusted connector message is escaped", "&lt;script&gt;" in body, True)
-        check("...and not left raw", "<script>" in body, False)
+    sub, stats, body = m._digest_html(d)
+    check("report subtitle names the stack", "s.example" in sub, True)
+    check("trend arrow computed against the average", "▲ 34,229" in body, True)
+    check("percent delta shown", "+0.2%" in body, True)
+    check("header names are NOT rendered as cell values", "<td>Measure</td>" in body, False)
+    check("real coverage numbers rendered", "<td>93,583</td>" in body, True)
+    check("untrusted connector message is escaped", "&lt;script&gt;" in body, True)
+    check("...and not left raw", "<script>" in body, False)
 
-        # One section failing must be reported, not silently dropped from a scheduled report.
-        m.summarize_by = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden"))
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_digest(A())
-        d2 = json.loads(buf.getvalue())
-        check("failed section is named", [s["section"] for s in d2.get("sectionsUnavailable", [])], ["breakdown"])
-        check("...and omitted rather than faked", "breakdown" in d2, False)
-        check("other sections still present", "topUsers" in d2, True)
-        _, _, body2 = m._digest_html(d2)
-        check("the PDF says a section was unavailable", "Sections unavailable" in body2, True)
-    finally:
-        m.stack_metrics, m.summarize_connectors, m.summarize_by, m.top_n, m.load_config = real
+    # One section failing must be reported, not silently dropped from a scheduled report.
+    monkeypatch.setattr(m, "summarize_by",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden")))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_digest(A())
+    d2 = json.loads(buf.getvalue())
+    check("failed section is named", [s["section"] for s in d2.get("sectionsUnavailable", [])], ["breakdown"])
+    check("...and omitted rather than faked", "breakdown" in d2, False)
+    check("other sections still present", "topUsers" in d2, True)
+    _, _, body2 = m._digest_html(d2)
+    check("the PDF says a section was unavailable", "Sections unavailable" in body2, True)
 
 
-def test_multi_profile_report(m):
+def test_multi_profile_report(m, tmp_path):
     """`report --input a.json b.json ...` renders one document with several subjects -- an identity
     plus each of its linked assets. The rules: nothing is aggregated across subjects, non-profile
     input is refused by name rather than rendered into something that looks deliberate, and a
     single-profile report must come out exactly as it did before this existed."""
-    print("[19b] multi-subject profile reports (offline)")
     import contextlib, io, json as _json, os, tempfile
 
     user = {"type": "user",
@@ -2825,7 +2661,7 @@ def test_multi_profile_report(m):
     check("...and its level is unknown, not blank", "(unknown)" in desc, True)
 
     # --- the CLI ----------------------------------------------------------------------------------
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=tmp_path)
     paths = []
     for i, d in enumerate([user, asset("HOST1"), asset("HOST2")]):
         p = os.path.join(tmp, "p%d.json" % i)
@@ -2909,14 +2745,12 @@ def _snap_digest():
     }
 
 
-def test_report_cleanup(m):
+def test_report_cleanup(m, monkeypatch, capsys, tmp_path):
     """The print-to-PDF temp HTML carries the same customer PII as the PDF. A double browser
     failure (e.g. two timeouts) used to propagate before the os.remove, orphaning it in the
     working tree -- where no gitignore rule covered it -- and killing the verb instead of
     degrading to the documented HTML fallback."""
-    print("[13b] report: PII temp-file cleanup on browser failure (offline)")
-    import contextlib, io
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=tmp_path)
     inp = os.path.join(tmp, "in.json")
     with open(inp, "w", encoding="utf-8") as f:
         json.dump({"table": "asset", "totalRecords": 1, "shown": 1,
@@ -2927,29 +2761,24 @@ def test_report_cleanup(m):
         title, date, html = None, None, False
     a = A(); a.input, a.out = inp, out
 
-    real = (m._find_browser, m._print_to_pdf, m.load_config)
-    m.load_config = lambda: ("s.example", "tok", None)
-    m._find_browser = lambda: "fake-chrome"
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "_find_browser", lambda: "fake-chrome")
 
     def hang(*args):
         raise RuntimeError("browser hung twice")  # what a double TimeoutExpired surfaces as
 
-    m._print_to_pdf = hang
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_report(a)
-        res = json.loads(buf.getvalue())
-        check("a twice-failed browser still answers (HTML fallback)", res.get("format"), "html")
-        check("...saying the conversion failed", "failed" in (res.get("note") or ""), True)
-        check("...and the PII temp file is gone", os.path.exists(out + ".tmp.html"), False)
-        check("...leaving only the declared fallback next to the input",
-              sorted(os.listdir(tmp)), ["in.json", "r.pdf.html"])
-    finally:
-        (m._find_browser, m._print_to_pdf, m.load_config) = real
+    monkeypatch.setattr(m, "_print_to_pdf", hang)
+    m.cmd_report(a)
+    buf = capsys.readouterr().out
+    res = json.loads(buf)
+    check("a twice-failed browser still answers (HTML fallback)", res.get("format"), "html")
+    check("...saying the conversion failed", "failed" in (res.get("note") or ""), True)
+    check("...and the PII temp file is gone", os.path.exists(out + ".tmp.html"), False)
+    check("...leaving only the declared fallback next to the input",
+          sorted(os.listdir(tmp)), ["in.json", "r.pdf.html"])
 
 
-def test_snapshots(m):
+def test_snapshots(m, monkeypatch, tmp_path):
     """Local snapshot storage (design/trends.md phase 1). Nothing here is reachable from a
     natural-language question yet -- SKILL.md gains no trend routing until phase 5 -- but the storage
     guarantees are the ones a trend built on top will inherit, so they are pinned now.
@@ -2957,173 +2786,161 @@ def test_snapshots(m):
     The load-bearing one: a snapshot's `coverage` is mandatory and null-when-unreadable, because a
     vulnerability count that fell when its scanner broke is not an improvement. The number is real;
     only the interpretation is wrong, and nothing about the output looks partial."""
-    print("[14] snapshot storage (offline)")
     import contextlib, io
-    tmp = tempfile.mkdtemp()
-    real_cfg_dir, real_load_config, real_build = m.CFG_DIR, m.load_config, m.build_digest
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("demo.example.com", "tok", None)
-    try:
-        # --- round trip, and the schema is honoured rather than assumed -------------------------
-        path = m._snapshots_path()
-        check("history file is per-stack and JSONL", os.path.basename(path),
-              "snapshots.demo.example.com.jsonl")
-        rec = m.snapshot_record(_snap_digest())
-        m.append_snapshot(rec)
-        recs, skipped = m.load_snapshots(path)
-        check("one appended record reads back", (len(recs), len(skipped)), (1, 0))
-        check("record carries schema 1", recs[0].get("schema"), 1)
-        check("one line per snapshot", len(open(path, encoding="utf-8-sig").read().strip().splitlines()), 1)
-        m.append_snapshot(rec)
-        recs, _ = m.load_snapshots(path)
-        check("appending never rewrites history", len(recs), 2)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("demo.example.com", "tok", None))
+    # --- round trip, and the schema is honoured rather than assumed -------------------------
+    path = m._snapshots_path()
+    check("history file is per-stack and JSONL", os.path.basename(path),
+          "snapshots.demo.example.com.jsonl")
+    rec = m.snapshot_record(_snap_digest())
+    m.append_snapshot(rec)
+    recs, skipped = m.load_snapshots(path)
+    check("one appended record reads back", (len(recs), len(skipped)), (1, 0))
+    check("record carries schema 1", recs[0].get("schema"), 1)
+    check("one line per snapshot", len(open(path, encoding="utf-8-sig").read().strip().splitlines()), 1)
+    m.append_snapshot(rec)
+    recs, _ = m.load_snapshots(path)
+    check("appending never rewrites history", len(recs), 2)
 
-        # --- an unrecognised schema is skipped WITH A REASON, never coerced ---------------------
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"schema": 99, "totals": {"assets": 1}}) + "\n")
-            f.write("{not json at all\n")
-            f.write(json.dumps({"schema": 1, "stackDate": "2026-08-06", "totals": {"assets": 5}}) + "\n")
-        recs, skipped = m.load_snapshots(path)
-        check("forward-schema line is not parsed as history", len(recs), 3)
-        check("...it is skipped, with the line numbered", [s["line"] for s in skipped], [3, 4])
-        check("...and the reason names the schema it saw", "99" in skipped[0]["reason"], True)
-        check("...and says which schema this build reads", "schema 1" in skipped[0]["reason"], True)
-        check("unparsable line is skipped, not fatal", skipped[1]["reason"], "line is not valid JSON")
-        check("later valid records still load", recs[-1]["totals"]["assets"], 5)
+    # --- an unrecognised schema is skipped WITH A REASON, never coerced ---------------------
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"schema": 99, "totals": {"assets": 1}}) + "\n")
+        f.write("{not json at all\n")
+        f.write(json.dumps({"schema": 1, "stackDate": "2026-08-06", "totals": {"assets": 5}}) + "\n")
+    recs, skipped = m.load_snapshots(path)
+    check("forward-schema line is not parsed as history", len(recs), 3)
+    check("...it is skipped, with the line numbered", [s["line"] for s in skipped], [3, 4])
+    check("...and the reason names the schema it saw", "99" in skipped[0]["reason"], True)
+    check("...and says which schema this build reads", "schema 1" in skipped[0]["reason"], True)
+    check("unparsable line is skipped, not fatal", skipped[1]["reason"], "line is not valid JSON")
+    check("later valid records still load", recs[-1]["totals"]["assets"], 5)
 
-        # --- per-stack isolation: two FQDNs never read each other's history ---------------------
-        m.load_config = lambda: ("other.example.com", "tok", None)
-        other = m._snapshots_path()
-        check("a second stack gets its own file", other != path, True)
-        orecs, _ = m.load_snapshots(other)
-        check("...and starts empty rather than inheriting", len(orecs), 0)
-        m.append_snapshot(m.snapshot_record(_snap_digest()))
-        check("...writing it leaves the first stack's history alone", len(m.load_snapshots(path)[0]), 3)
-        m.load_config = lambda: ("demo.example.com", "tok", None)
+    # --- per-stack isolation: two FQDNs never read each other's history ---------------------
+    monkeypatch.setattr(m, "load_config", lambda: ("other.example.com", "tok", None))
+    other = m._snapshots_path()
+    check("a second stack gets its own file", other != path, True)
+    orecs, _ = m.load_snapshots(other)
+    check("...and starts empty rather than inheriting", len(orecs), 0)
+    m.append_snapshot(m.snapshot_record(_snap_digest()))
+    check("...writing it leaves the first stack's history alone", len(m.load_snapshots(path)[0]), 3)
+    monkeypatch.setattr(m, "load_config", lambda: ("demo.example.com", "tok", None))
 
-        # --- the record shape (design/trends.md §3) ---------------------------------------------
-        check("stackDate comes from the API's own date", rec["stackDate"], "2026-08-05")
-        check("takenAt is a UTC local-clock stamp", rec["takenAt"].endswith("Z") and len(rec["takenAt"]) == 20, True)
-        check("totals captured", (rec["totals"]["assets"], rec["totals"]["users"]), (34229, 10305))
-        check("...including the stack-side 30-day averages", rec["totals"]["assets30DayAvg"], 34164)
-        check("coverage tally captured", (rec["coverage"]["connectorsEnabled"], rec["coverage"]["failing"]), (4, 2))
-        check("failing connectors named, for the coverage check a trend needs",
-              rec["coverage"]["failingNames"], ["azure", "intune"])
-        check("degraded named separately rather than mislabelled failing",
-              rec["coverage"]["degradedNames"], ["tenable"])
-        check("last ingest recorded", rec["coverage"]["lastIngestAt"], "2026-08-05T14:58:00Z")
-        b = rec["breakdowns"][0]
-        check("breakdown groups become a {value: count} map", b["groups"],
-              {"1-low": 29899, "2-medium": 4210, "3-high": 120})
-        check("...with the completeness verdict carried through", (b["complete"], b["accountedRecords"]),
-              (True, 34229))
-        check("rankings trimmed to counts", (rec["rankings"][0]["totalInTail"], rec["rankings"][0]["top"]),
-              (512, 2))
-        check("...and a truncated tail stays flagged", rec["rankings"][1]["truncated"], True)
+    # --- the record shape (design/trends.md §3) ---------------------------------------------
+    check("stackDate comes from the API's own date", rec["stackDate"], "2026-08-05")
+    check("takenAt is a UTC local-clock stamp", rec["takenAt"].endswith("Z") and len(rec["takenAt"]) == 20, True)
+    check("totals captured", (rec["totals"]["assets"], rec["totals"]["users"]), (34229, 10305))
+    check("...including the stack-side 30-day averages", rec["totals"]["assets30DayAvg"], 34164)
+    check("coverage tally captured", (rec["coverage"]["connectorsEnabled"], rec["coverage"]["failing"]), (4, 2))
+    check("failing connectors named, for the coverage check a trend needs",
+          rec["coverage"]["failingNames"], ["azure", "intune"])
+    check("degraded named separately rather than mislabelled failing",
+          rec["coverage"]["degradedNames"], ["tenable"])
+    check("last ingest recorded", rec["coverage"]["lastIngestAt"], "2026-08-05T14:58:00Z")
+    b = rec["breakdowns"][0]
+    check("breakdown groups become a {value: count} map", b["groups"],
+          {"1-low": 29899, "2-medium": 4210, "3-high": 120})
+    check("...with the completeness verdict carried through", (b["complete"], b["accountedRecords"]),
+          (True, 34229))
+    check("rankings trimmed to counts", (rec["rankings"][0]["totalInTail"], rec["rankings"][0]["top"]),
+          (512, 2))
+    check("...and a truncated tail stays flagged", rec["rankings"][1]["truncated"], True)
 
-        # --- no customer identifier reaches disk (§5/§7: PII policy, not a size trim) -----------
-        blob = open(path, encoding="utf-8-sig").read()
-        for leak in ("Dana Whitfield", "Priya Raman", "PROD-DB-04", "10.4.1.9",
-                     "Owner_Name", "Asset_Name", "IP_Address"):
-            check("no %r in the written history" % leak, leak in blob, False)
+    # --- no customer identifier reaches disk (§5/§7: PII policy, not a size trim) -----------
+    blob = open(path, encoding="utf-8-sig").read()
+    for leak in ("Dana Whitfield", "Priya Raman", "PROD-DB-04", "10.4.1.9",
+                 "Owner_Name", "Asset_Name", "IP_Address"):
+        check("no %r in the written history" % leak, leak in blob, False)
 
-        # --- coverage is mandatory: null + a stated reason, never a silent zero -----------------
-        d = _snap_digest()
-        d["connectors"]["fetched"]["profiles"] = "HTTP 403: Forbidden"
-        r2 = m.snapshot_record(d)
-        check("unreadable connector health records coverage as null", r2["coverage"], None)
-        check("...with the reason kept, not the misleading 0-failing tally",
-              [s["section"] for s in r2["sectionsUnavailable"]], ["coverage"])
-        check("...naming the HTTP status", "403" in r2["sectionsUnavailable"][0]["error"], True)
-        check("the coverage key is present, never omitted", "coverage" in r2, True)
+    # --- coverage is mandatory: null + a stated reason, never a silent zero -----------------
+    d = _snap_digest()
+    d["connectors"]["fetched"]["profiles"] = "HTTP 403: Forbidden"
+    r2 = m.snapshot_record(d)
+    check("unreadable connector health records coverage as null", r2["coverage"], None)
+    check("...with the reason kept, not the misleading 0-failing tally",
+          [s["section"] for s in r2["sectionsUnavailable"]], ["coverage"])
+    check("...naming the HTTP status", "403" in r2["sectionsUnavailable"][0]["error"], True)
+    check("the coverage key is present, never omitted", "coverage" in r2, True)
 
-        d = _snap_digest()
-        del d["connectors"]
-        d["sectionsUnavailable"] = [{"section": "connectors", "error": "HTTP 403: Forbidden"}]
-        r3 = m.snapshot_record(d)
-        check("a failed connectors section also yields coverage null", r3["coverage"], None)
-        check("...and the original failure is preserved",
-              [s["section"] for s in r3["sectionsUnavailable"]], ["connectors"])
+    d = _snap_digest()
+    del d["connectors"]
+    d["sectionsUnavailable"] = [{"section": "connectors", "error": "HTTP 403: Forbidden"}]
+    r3 = m.snapshot_record(d)
+    check("a failed connectors section also yields coverage null", r3["coverage"], None)
+    check("...and the original failure is preserved",
+          [s["section"] for s in r3["sectionsUnavailable"]], ["connectors"])
 
-        d = _snap_digest()
-        d["connectors"]["fetched"]["ingestion"] = "HTTP 500: boom"
-        r4 = m.snapshot_record(d)
-        check("health readable but run history not is flagged, not assumed",
-              r4["coverage"]["ingestionUnreadable"], True)
+    d = _snap_digest()
+    d["connectors"]["fetched"]["ingestion"] = "HTTP 500: boom"
+    r4 = m.snapshot_record(d)
+    check("health readable but run history not is flagged, not assumed",
+          r4["coverage"]["ingestionUnreadable"], True)
 
-        # --- an incomplete breakdown is inherited, not laundered --------------------------------
-        d = _snap_digest()
-        d["breakdown"].update({"complete": False, "accountedRecords": 21549,
-                               "unaccountedRecords": 12680, "note": "37% unaccounted"})
-        r5 = m.snapshot_record(d)
-        check("incomplete breakdown stays incomplete in history",
-              (r5["breakdowns"][0]["complete"], r5["breakdowns"][0]["unaccountedRecords"]), (False, 12680))
+    # --- an incomplete breakdown is inherited, not laundered --------------------------------
+    d = _snap_digest()
+    d["breakdown"].update({"complete": False, "accountedRecords": 21549,
+                           "unaccountedRecords": 12680, "note": "37% unaccounted"})
+    r5 = m.snapshot_record(d)
+    check("incomplete breakdown stays incomplete in history",
+          (r5["breakdowns"][0]["complete"], r5["breakdowns"][0]["unaccountedRecords"]), (False, 12680))
 
-        # --- a high-cardinality breakdown warns with its measured cost --------------------------
-        d = _snap_digest()
-        d["breakdown"].update({"by": "OS", "distinctValuesSeen": 51, "groupsCapped": 40})
-        r6 = m.snapshot_record(d)
-        w = r6["warnings"][0]
-        check("expensive breakdown is flagged", w["breakdown"], "OS")
-        check("...with the measured call cost, not a vague caution", w["estimatedCalls"], 49)
-        check("...and points at the one-call alternative", "metric" in w["warning"], True)
-        check("a 3-group breakdown warns about nothing", "warnings" in rec, False)
+    # --- a high-cardinality breakdown warns with its measured cost --------------------------
+    d = _snap_digest()
+    d["breakdown"].update({"by": "OS", "distinctValuesSeen": 51, "groupsCapped": 40})
+    r6 = m.snapshot_record(d)
+    w = r6["warnings"][0]
+    check("expensive breakdown is flagged", w["breakdown"], "OS")
+    check("...with the measured call cost, not a vague caution", w["estimatedCalls"], 49)
+    check("...and points at the one-call alternative", "metric" in w["warning"], True)
+    check("a 3-group breakdown warns about nothing", "warnings" in rec, False)
 
-        # ...and the *next* run warns before spending the calls, from what the last one measured.
-        # Cardinality can't be known in advance -- field metadata carries no values -- so the previous
-        # measurement is the only honest pre-check, and it costs no API call.
-        m.build_digest = lambda *a, **k: _snap_digest()
-        m.append_snapshot(r6)
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.redirect_stderr(err):
-                m.take_snapshot(table="asset", by="OS")
-        check("a repeat of an expensive breakdown warns BEFORE running", "49 of the 60 calls" in err.getvalue(), True)
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.redirect_stderr(err):
-                m.take_snapshot(table="asset", by="Risk_Level")
-        check("...and a cheap one says nothing", err.getvalue(), "")
+    # ...and the *next* run warns before spending the calls, from what the last one measured.
+    # Cardinality can't be known in advance -- field metadata carries no values -- so the previous
+    # measurement is the only honest pre-check, and it costs no API call.
+    monkeypatch.setattr(m, "build_digest", lambda *a, **k: _snap_digest())
+    m.append_snapshot(r6)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        m.take_snapshot(table="asset", by="OS")
+    check("a repeat of an expensive breakdown warns BEFORE running", "49 of the 60 calls" in err.getvalue(), True)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        m.take_snapshot(table="asset", by="Risk_Level")
+    check("...and a cheap one says nothing", err.getvalue(), "")
 
-        # --- entry points ----------------------------------------------------------------------
-        before = len(m.load_snapshots(path)[0])
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            with contextlib.redirect_stderr(io.StringIO()):
-                m.cmd_snapshot(argparse.Namespace(table="asset", by=None, field="Risk_Score", top=2))
-        info = json.loads(buf.getvalue())
-        check("`snapshot` reports where it wrote", os.path.basename(info["path"]),
-              "snapshots.demo.example.com.jsonl")
-        check("...and adds exactly one record", len(m.load_snapshots(path)[0]) - before, 1)
-        check("...and states that coverage was recorded", info["coverageRecorded"], True)
-        check("...and names what it captured", info["breakdownsCaptured"], ["Risk_Level"])
-        check("...and names the lines it could not read", [s["line"] for s in info["historySkipped"]], [3, 4])
+    # --- entry points ----------------------------------------------------------------------
+    before = len(m.load_snapshots(path)[0])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_snapshot(argparse.Namespace(table="asset", by=None, field="Risk_Score", top=2))
+    info = json.loads(buf.getvalue())
+    check("`snapshot` reports where it wrote", os.path.basename(info["path"]),
+          "snapshots.demo.example.com.jsonl")
+    check("...and adds exactly one record", len(m.load_snapshots(path)[0]) - before, 1)
+    check("...and states that coverage was recorded", info["coverageRecorded"], True)
+    check("...and names what it captured", info["breakdownsCaptured"], ["Risk_Level"])
+    check("...and names the lines it could not read", [s["line"] for s in info["historySkipped"]], [3, 4])
 
-        # `digest --snapshot` must append from the payload it already has: zero extra API calls, and
-        # one JSON document on stdout so `digest --snapshot | report` still parses.
-        real_call = m.call
-        m.call = lambda *a, **k: (_ for _ in ()).throw(AssertionError("snapshot made an API call"))
-        try:
-            before = len(m.load_snapshots(path)[0])
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                m.cmd_digest(argparse.Namespace(table="asset", by=None, field="Risk_Score", top=2,
-                                                snapshot=True))
-            out = json.loads(buf.getvalue())   # one document, not two concatenated
-            check("digest --snapshot costs no extra API call", out["snapshot"]["written"], True)
-            check("...adds exactly one line", len(m.load_snapshots(path)[0]) - before, 1)
-            check("...and the digest payload still comes through intact",
-                  out["metrics"]["metrics"]["assetCount"], 34229)
-        finally:
-            m.call = real_call
+    # `digest --snapshot` must append from the payload it already has: zero extra API calls, and
+    # one JSON document on stdout so `digest --snapshot | report` still parses.
+    monkeypatch.setattr(m, "call",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("snapshot made an API call")))
+    before = len(m.load_snapshots(path)[0])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_digest(argparse.Namespace(table="asset", by=None, field="Risk_Score", top=2,
+                                        snapshot=True))
+    out = json.loads(buf.getvalue())   # one document, not two concatenated
+    check("digest --snapshot costs no extra API call", out["snapshot"]["written"], True)
+    check("...adds exactly one line", len(m.load_snapshots(path)[0]) - before, 1)
+    check("...and the digest payload still comes through intact",
+          out["metrics"]["metrics"]["assetCount"], 34229)
 
-        # Plain `digest` must not write history.
-        before = len(m.load_snapshots(path)[0])
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.cmd_digest(argparse.Namespace(table="asset", by=None, field="Risk_Score", top=2))
-        check("plain digest writes no snapshot", len(m.load_snapshots(path)[0]) - before, 0)
-    finally:
-        m.CFG_DIR, m.load_config, m.build_digest = real_cfg_dir, real_load_config, real_build
+    # Plain `digest` must not write history.
+    before = len(m.load_snapshots(path)[0])
+    m.cmd_digest(argparse.Namespace(table="asset", by=None, field="Risk_Score", top=2))
+    check("plain digest writes no snapshot", len(m.load_snapshots(path)[0]) - before, 0)
 
 
 def _snap(date, assets=34229, users=10305, failing=("intune",), degraded=("tenable",),
@@ -3159,7 +2976,6 @@ def test_coverage_identity(m):
     integration that reported `degraded: 8` beside seven names -- indistinguishable from a connector
     that went unnamed -- and made one of a same-named pair recovering invisible to a set diff.
     """
-    print("[26] connector identity in coverage (the count/name invariant)")
 
     def cov(rows, tally):
         conn = {"fetched": {"profiles": "ok", "ingestion": "ok"},
@@ -3230,14 +3046,13 @@ def test_coverage_identity(m):
     check("...and says so in words", "did NOT pass" in ev["unevaluable"][0]["note"], True)
 
 
-def test_trend(m):
+def test_trend(m, monkeypatch, tmp_path):
     """The `trend` verb (design/trends.md phase 2). Still dormant -- SKILL.md gains no trend routing
     until phase 5 -- but every refusal here is load-bearing.
 
     A vulnerability count that fell because its scanner connector broke is not an improvement. The
     number is real; only the interpretation is wrong, and nothing about a percentage looks partial. So
     the tests below assert on what the verb REFUSES to say as much as on what it computes."""
-    print("[15] trend comparison (offline)")
     import contextlib, io
 
     # --- fewer than two comparable snapshots: never a 0% flat line --------------------------------
@@ -3393,37 +3208,34 @@ def test_trend(m):
     check("unreadable history lines stay visible in a trend", t["historySkipped"][0]["line"], 4)
 
     # --- CSV export keeps the envelope ------------------------------------------------------------
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=tmp_path)
     path = os.path.join(tmp, "trend.csv")
-    real = m.load_snapshots, m.load_config
-    m.load_config = lambda: ("s.example", "tok", None)
-    m.load_snapshots = lambda *a, **k: ([_snap("2026-07-01", assets=33000, failing=("intune",)),
-                                         _snap("2026-08-05", failing=("intune", "vuln-scanner"))], [])
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_trend(argparse.Namespace(since=None, metric=None, table=None, by=None,
-                                           format="csv", out=path))
-        env = json.loads(buf.getvalue())
-        check("CSV mode still prints the coverage flag a spreadsheet cannot hold",
-              env["coverage"]["coverageChanged"], True)
-        check("...and names the connector that started failing", env["coverage"]["failingAdded"],
-              ["vuln-scanner"])
-        check("...and the rows went to the file, not the envelope", "changes" in env, False)
-        check("...reporting how many", env["rowsWritten"] > 0, True)
-        text = open(path, encoding="utf-8-sig").read()
-        check("the CSV carries the delta columns", text.splitlines()[0].startswith("kind,name,from,to,change,percentChange"), True)
-        check("...and a data row", "assets" in text, True)
-        # JSON mode: one document, and the stack is named.
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_trend(argparse.Namespace(since=None, metric=None, table=None, by=None,
-                                           format=None, out=None))
-        d = json.loads(buf.getvalue())
-        check("json mode names the stack", d["stack"], "s.example")
-        check("...and keeps the rows", len(d["changes"]) > 0, True)
-    finally:
-        m.load_snapshots, m.load_config = real
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "load_snapshots",
+                        lambda *a, **k: ([_snap("2026-07-01", assets=33000, failing=("intune",)),
+                                          _snap("2026-08-05", failing=("intune", "vuln-scanner"))], []))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_trend(argparse.Namespace(since=None, metric=None, table=None, by=None,
+                                       format="csv", out=path))
+    env = json.loads(buf.getvalue())
+    check("CSV mode still prints the coverage flag a spreadsheet cannot hold",
+          env["coverage"]["coverageChanged"], True)
+    check("...and names the connector that started failing", env["coverage"]["failingAdded"],
+          ["vuln-scanner"])
+    check("...and the rows went to the file, not the envelope", "changes" in env, False)
+    check("...reporting how many", env["rowsWritten"] > 0, True)
+    text = open(path, encoding="utf-8-sig").read()
+    check("the CSV carries the delta columns", text.splitlines()[0].startswith("kind,name,from,to,change,percentChange"), True)
+    check("...and a data row", "assets" in text, True)
+    # JSON mode: one document, and the stack is named.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_trend(argparse.Namespace(since=None, metric=None, table=None, by=None,
+                                       format=None, out=None))
+    d = json.loads(buf.getvalue())
+    check("json mode names the stack", d["stack"], "s.example")
+    check("...and keeps the rows", len(d["changes"]) > 0, True)
 
 
 ASSET_FIELDS = {"Risk_Score": "Float", "Has_KEV": "Binary", "Internet_Exposed": "Binary",
@@ -3431,12 +3243,11 @@ ASSET_FIELDS = {"Risk_Score": "Float", "Has_KEV": "Binary", "Internet_Exposed": 
 USER_FIELDS = {"Risk_Score": "Float", "Owner_Name": "String", "Joiner_Risk": "Integer"}
 
 
-def test_trend_report(m):
+def test_trend_report(m, monkeypatch, tmp_path):
     """Trend charts (v2.10.0): `trend` output carries a per-date `series`, and `report` renders it
     as branded line charts. The whole feature hangs on one rule inherited from the trend layer: a
     date with no captured value BREAKS the line -- a flat segment (or a zero) across a gap is the
     most convincing possible wrong answer a picture can give."""
-    print("[15b] trend series + branded trend report (offline)")
     import contextlib, io
 
     M = lambda count, ok=True: [{"name": "kev", "label": "KEV-exposed assets", "count": count, "ok": ok}]
@@ -3531,7 +3342,7 @@ def test_trend_report(m):
     check("the delta table's value formatter escapes", m._trend_html.__globals__["_esc"]("<b>"), "&lt;b&gt;")
 
     # --- end to end: branded HTML from a real trend payload ----------------------------------------
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=tmp_path)
     recs = [_snap("2026-07-01", assets=33000, metrics=M(400),
                   groups={"1-low": 100, "<script>alert(1)</script>": 5}),
             _snap("2026-07-15", assets=33600),
@@ -3547,83 +3358,75 @@ def test_trend_report(m):
         title, date, html = None, None, True
     a = A(); a.input, a.out = inp, os.path.join(tmp, "trend.html")
 
-    real_lc = m.load_config
-    m.load_config = lambda: ("s.example", "tok", None)
-    try:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_report(a)
-        check("report answers in html", json.loads(buf.getvalue()).get("format"), "html")
-        with open(a.out, encoding="utf-8") as f:
-            html = f.read()
-        check("the page has line charts", "<svg" in html and "<polyline" in html, True)
-        check("...the gap honesty note", "unknown, never zero" in html, True)
-        check("...the delta table", "Changes, 2026-07-01" in html, True)
-        check("...and customer-originated values are escaped", "<script>alert(1)</script>" in html, False)
-        check("   (but present, escaped)", "&lt;script&gt;" in html, True)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_report(a)
+    check("report answers in html", json.loads(buf.getvalue()).get("format"), "html")
+    with open(a.out, encoding="utf-8") as f:
+        html = f.read()
+    check("the page has line charts", "<svg" in html and "<polyline" in html, True)
+    check("...the gap honesty note", "unknown, never zero" in html, True)
+    check("...the delta table", "Changes, 2026-07-01" in html, True)
+    check("...and customer-originated values are escaped", "<script>alert(1)</script>" in html, False)
+    check("   (but present, escaped)", "&lt;script&gt;" in html, True)
 
-        # A refusal renders AS the refusal -- a branded page saying why, never an empty chart.
-        with open(inp, "w", encoding="utf-8") as f:
-            json.dump(m.compute_trend([_snap("2026-08-05")]), f)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_report(a)
-        with open(a.out, encoding="utf-8") as f:
-            html = f.read()
-        check("a refusal renders as the refusal", "Why there is no trend" in html, True)
-        check("...with no chart to misread", "<polyline" in html, False)
-    finally:
-        m.load_config = real_lc
+    # A refusal renders AS the refusal -- a branded page saying why, never an empty chart.
+    with open(inp, "w", encoding="utf-8") as f:
+        json.dump(m.compute_trend([_snap("2026-08-05")]), f)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_report(a)
+    with open(a.out, encoding="utf-8") as f:
+        html = f.read()
+    check("a refusal renders as the refusal", "Why there is no trend" in html, True)
+    check("...with no chart to misread", "<polyline" in html, False)
 
     # --- CSV mode strips the series (the envelope's caveats must stay readable) --------------------
-    real = (m.CFG_DIR, m.load_config)
-    m.CFG_DIR, m.load_config = tempfile.mkdtemp(), lambda: ("s.example", "tok", None)
-    try:
-        m.append_snapshot(_snap("2026-07-01", metrics=M(400)))
-        m.append_snapshot(_snap("2026-08-05", metrics=M(458)))
+    monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(dir=tmp_path))
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    m.append_snapshot(_snap("2026-07-01", metrics=M(400)))
+    m.append_snapshot(_snap("2026-08-05", metrics=M(458)))
 
-        class T:
-            since = metric = table = by = None
-            derive_label = derive_table = derive_where = derive_smart_label = None
-            name_entities, out = False, None
+    class T:
+        since = metric = table = by = None
+        derive_label = derive_table = derive_where = derive_smart_label = None
+        name_entities, out = False, None
 
-        t1 = T(); t1.format = None
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_trend(t1)
-        check("json mode carries the series", "series" in json.loads(buf.getvalue()), True)
+    t1 = T(); t1.format = None
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_trend(t1)
+    check("json mode carries the series", "series" in json.loads(buf.getvalue()), True)
 
-        t2 = T(); t2.format = "csv"
-        obuf, ebuf = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(obuf), contextlib.redirect_stderr(ebuf):
-            m.cmd_trend(t2)
-        check("csv mode drops it from the envelope", "series" in json.loads(ebuf.getvalue()), False)
-        check("...but keeps the caveat keys", "coverage" in json.loads(ebuf.getvalue()), True)
-    finally:
-        m.CFG_DIR, m.load_config = real
+    t2 = T(); t2.format = "csv"
+    obuf, ebuf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(obuf), contextlib.redirect_stderr(ebuf):
+        m.cmd_trend(t2)
+    check("csv mode drops it from the envelope", "series" in json.loads(ebuf.getvalue()), False)
+    check("...but keeps the caveat keys", "coverage" in json.loads(ebuf.getvalue()), True)
 
 
-def test_metrics(m):
+def test_metrics(m, monkeypatch, tmp_path):
     """Option B, declarative metrics (design/trends.md phase 3). Still dormant until phase 5.
 
     The load-bearing requirement: validate at `metrics add` time, not at snapshot time. A metric that
     silently counts 0 every week, unattended, is the exact wrong-answer class this codebase keeps
     fixing -- and worse, because a zero reads as good news so nobody investigates it."""
-    print("[16] user-defined metrics (offline)")
     import contextlib, io
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.load_config, m.call, m._FIELD_MAP, m._LABELS)
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("s.example", "tok", None)
-    m._FIELD_MAP = {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)}
-    m._LABELS = [{"name": "Crown Jewels", "field": "Crown_Jewels", "table": "asset",
-                  "type": "Binary", "purpose": "Assets the business cannot lose.", "queryable": True}]
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "_FIELD_MAP", {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)})
+    monkeypatch.setattr(m, "_LABELS",
+                        [{"name": "Crown Jewels", "field": "Crown_Jewels", "table": "asset",
+                          "type": "Binary", "purpose": "Assets the business cannot lose.", "queryable": True}])
     bodies = []
 
     def fake_call(method, endpoint, body=None, retries=1):
         bodies.append(body)
         return {"totalRecords": 458, "data": []}
-    m.call = fake_call
+    monkeypatch.setattr(m, "call", fake_call)
 
     def add(**kw):
         kw.setdefault("label", None); kw.setdefault("table", "asset")
@@ -3631,270 +3434,261 @@ def test_metrics(m):
         return m.add_metric(kw.pop("name"), kw.pop("label"), kw.pop("table"), kw.pop("where"),
                             kw.pop("smart_label"), **kw)
 
-    try:
-        # --- validation happens at ADD time, and refuses -----------------------------------------
-        rec, problem = add(name="kev", where=["Hs_KEV == Binary true"])
-        check("a misspelled field is refused at add time", rec, None)
-        check("...naming the closest match", "'Has_KEV'" in problem, True)
-        check("...and nothing was written", m.load_metrics(), [])
-        rec, problem = add(name="kev", where=["has_kev == Binary true"])
-        check("a case-only miss is called out as such", "case-sensitive" in problem, True)
-        rec, problem = add(name="kev", where=["Risk_Score >= 500"])
-        check("a malformed clause is refused too", rec, None)
-        check("...explaining the type slot", "type slot" in problem, True)
-        rec, problem = add(name="kev")
-        check("a metric with no definition at all is refused", "neither" in problem, True)
-        rec, problem = add(name="kev", where=["Has_KEV == Binary true"], smart_label="Crown Jewels")
-        check("both a where and a smart-label is refused", "not both" in problem, True)
-        rec, problem = add(name="bad name!", where=["Has_KEV == Binary true"])
-        check("an unusable metric name is refused", "not usable" in problem, True)
-        check("still nothing written after six refusals", m.load_metrics(), [])
+    # --- validation happens at ADD time, and refuses -----------------------------------------
+    rec, problem = add(name="kev", where=["Hs_KEV == Binary true"])
+    check("a misspelled field is refused at add time", rec, None)
+    check("...naming the closest match", "'Has_KEV'" in problem, True)
+    check("...and nothing was written", m.load_metrics(), [])
+    rec, problem = add(name="kev", where=["has_kev == Binary true"])
+    check("a case-only miss is called out as such", "case-sensitive" in problem, True)
+    rec, problem = add(name="kev", where=["Risk_Score >= 500"])
+    check("a malformed clause is refused too", rec, None)
+    check("...explaining the type slot", "type slot" in problem, True)
+    rec, problem = add(name="kev")
+    check("a metric with no definition at all is refused", "neither" in problem, True)
+    rec, problem = add(name="kev", where=["Has_KEV == Binary true"], smart_label="Crown Jewels")
+    check("both a where and a smart-label is refused", "not both" in problem, True)
+    rec, problem = add(name="bad name!", where=["Has_KEV == Binary true"])
+    check("an unusable metric name is refused", "not usable" in problem, True)
+    check("still nothing written after six refusals", m.load_metrics(), [])
 
-        # --- a valid metric saves, and costs exactly one call to measure --------------------------
-        rec, problem = add(name="kev-exposed", label="KEV-exposed assets",
-                           where=["Has_KEV == Binary true", "Internet_Exposed == Binary true"])
-        check("a valid metric is saved", (problem, rec["name"]), (None, "kev-exposed"))
-        check("...with its two clauses", len(rec["where"]), 2)
-        check("...and reads back from disk", [x["name"] for x in m.load_metrics()], ["kev-exposed"])
-        check("...into a per-stack file", os.path.basename(m._metrics_path()), "metrics.s.example.json")
-        doc = json.load(open(m._metrics_path(), encoding="utf-8-sig"))
-        check("...carrying a schema", doc["schema"], 1)
-        bodies.clear()
-        got = m.measure_metric(rec)
-        check("measuring costs exactly one API call", len(bodies), 1)
-        # The cheapest page is now one past the end: it carries totalRecords and no record at all.
-        # (COUNT_PAGE; see count_records for the measurement.)
-        check("...on the cheapest possible page, never paging for a count",
-              bodies[0]["paging"], {"page": m.COUNT_PAGE, "recordsPerPage": 1})
-        check("...ANDing the clauses as separate inner arrays", len(bodies[0]["query"]), 2)
-        check("...and reads totalRecords", (got["count"], got["ok"]), (458, True))
-        check("...keeping the human label", got["label"], "KEV-exposed assets")
+    # --- a valid metric saves, and costs exactly one call to measure --------------------------
+    rec, problem = add(name="kev-exposed", label="KEV-exposed assets",
+                       where=["Has_KEV == Binary true", "Internet_Exposed == Binary true"])
+    check("a valid metric is saved", (problem, rec["name"]), (None, "kev-exposed"))
+    check("...with its two clauses", len(rec["where"]), 2)
+    check("...and reads back from disk", [x["name"] for x in m.load_metrics()], ["kev-exposed"])
+    check("...into a per-stack file", os.path.basename(m._metrics_path()), "metrics.s.example.json")
+    doc = json.load(open(m._metrics_path(), encoding="utf-8-sig"))
+    check("...carrying a schema", doc["schema"], 1)
+    bodies.clear()
+    got = m.measure_metric(rec)
+    check("measuring costs exactly one API call", len(bodies), 1)
+    # The cheapest page is now one past the end: it carries totalRecords and no record at all.
+    # (COUNT_PAGE; see count_records for the measurement.)
+    check("...on the cheapest possible page, never paging for a count",
+          bodies[0]["paging"], {"page": m.COUNT_PAGE, "recordsPerPage": 1})
+    check("...ANDing the clauses as separate inner arrays", len(bodies[0]["query"]), 2)
+    check("...and reads totalRecords", (got["count"], got["ok"]), (458, True))
+    check("...keeping the human label", got["label"], "KEV-exposed assets")
 
-        # --- a SmartLabel metric resolves through find_label() -----------------------------------
-        rec, problem = add(name="crown-jewels", label="Crown jewels", smart_label="crown jewels")
-        check("a SmartLabel metric saves on a fuzzy term", problem, None)
-        bodies.clear()
-        got = m.measure_metric(rec)
-        check("...resolving to the label's own field", bodies[0]["query"][0][0]["searchFieldName"],
-              "Crown_Jewels")
-        check("...with the label's declared DSL type", bodies[0]["query"][0][0]["type"], "Binary")
-        check("...and its table, not the stored one", bodies[0]["table"], "asset")
-        check("...measured ok", got["ok"], True)
-        # The operator depends on the label's type, and the wrong one is silently, plausibly wrong.
-        # Measured live: `== null` on a String label returned 32,597 of 34,270 records (it matches where
-        # the label is ABSENT); `exists` returned the 1,673 it applies to.
-        m._LABELS = m._LABELS + [{"name": "All Vulns", "field": "All_Vulns_SmartLabel", "table": "asset",
-                                  "type": "String", "purpose": "", "queryable": True}]
-        m._FIELD_MAP["asset"]["All_Vulns_SmartLabel"] = "String"
-        rec, problem = add(name="all-vulns", smart_label="All Vulns")
-        check("a non-Binary SmartLabel saves", problem, None)
-        bodies.clear()
-        m.measure_metric(rec)
-        check("...and is counted with `exists`, never `== null`",
-              bodies[0]["query"][0][0]["operator"], "exists")
-        check("...which is what a Binary label does NOT use",
-              m.metric_query({"name": "x", "smartLabel": "Crown Jewels", "table": "asset"})[0]
-              ["query"][0][0]["operator"], "==")
-        m.save_metrics([x for x in m.load_metrics() if x["name"] != "all-vulns"])
-        rec, problem = add(name="ghost", smart_label="No Such Label")
-        check("a SmartLabel that doesn't exist is refused at add time", rec, None)
-        check("...saying it may have been renamed", "renamed or removed" in problem, True)
+    # --- a SmartLabel metric resolves through find_label() -----------------------------------
+    rec, problem = add(name="crown-jewels", label="Crown jewels", smart_label="crown jewels")
+    check("a SmartLabel metric saves on a fuzzy term", problem, None)
+    bodies.clear()
+    got = m.measure_metric(rec)
+    check("...resolving to the label's own field", bodies[0]["query"][0][0]["searchFieldName"],
+          "Crown_Jewels")
+    check("...with the label's declared DSL type", bodies[0]["query"][0][0]["type"], "Binary")
+    check("...and its table, not the stored one", bodies[0]["table"], "asset")
+    check("...measured ok", got["ok"], True)
+    # The operator depends on the label's type, and the wrong one is silently, plausibly wrong.
+    # Measured live: `== null` on a String label returned 32,597 of 34,270 records (it matches where
+    # the label is ABSENT); `exists` returned the 1,673 it applies to.
+    monkeypatch.setattr(m, "_LABELS",
+                        m._LABELS + [{"name": "All Vulns", "field": "All_Vulns_SmartLabel", "table": "asset",
+                                      "type": "String", "purpose": "", "queryable": True}])
+    m._FIELD_MAP["asset"]["All_Vulns_SmartLabel"] = "String"
+    rec, problem = add(name="all-vulns", smart_label="All Vulns")
+    check("a non-Binary SmartLabel saves", problem, None)
+    bodies.clear()
+    m.measure_metric(rec)
+    check("...and is counted with `exists`, never `== null`",
+          bodies[0]["query"][0][0]["operator"], "exists")
+    check("...which is what a Binary label does NOT use",
+          m.metric_query({"name": "x", "smartLabel": "Crown Jewels", "table": "asset"})[0]
+          ["query"][0][0]["operator"], "==")
+    m.save_metrics([x for x in m.load_metrics() if x["name"] != "all-vulns"])
+    rec, problem = add(name="ghost", smart_label="No Such Label")
+    check("a SmartLabel that doesn't exist is refused at add time", rec, None)
+    check("...saying it may have been renamed", "renamed or removed" in problem, True)
 
-        # --- re-validation on READ: a vanished field is unavailable, never 0 ----------------------
-        kev = next(x for x in m.load_metrics() if x["name"] == "kev-exposed")
-        m._FIELD_MAP = {"asset": {k: v for k, v in ASSET_FIELDS.items() if k != "Has_KEV"},
-                        "user": dict(USER_FIELDS)}
-        bodies.clear()
-        got = m.measure_metric(kev)
-        check("a metric whose field vanished is not resolved", got["ok"], False)
-        check("...is NEVER counted as zero", got["count"], None)
-        check("...costs no API call", len(bodies), 0)
-        check("...and says which field went missing", "'Has_KEV'" in got["error"], True)
-        # An API failure is the same disposition: unavailable, not zero.
-        m._FIELD_MAP = {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)}
-        m.call = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden"))
-        got = m.measure_metric(kev)
-        check("a metric whose query is forbidden is unavailable", (got["ok"], got["count"]), (False, None))
-        check("...with the status kept", "403" in got["error"], True)
-        m.call = fake_call
+    # --- re-validation on READ: a vanished field is unavailable, never 0 ----------------------
+    kev = next(x for x in m.load_metrics() if x["name"] == "kev-exposed")
+    monkeypatch.setattr(m, "_FIELD_MAP",
+                        {"asset": {k: v for k, v in ASSET_FIELDS.items() if k != "Has_KEV"},
+                         "user": dict(USER_FIELDS)})
+    bodies.clear()
+    got = m.measure_metric(kev)
+    check("a metric whose field vanished is not resolved", got["ok"], False)
+    check("...is NEVER counted as zero", got["count"], None)
+    check("...costs no API call", len(bodies), 0)
+    check("...and says which field went missing", "'Has_KEV'" in got["error"], True)
+    # An API failure is the same disposition: unavailable, not zero.
+    monkeypatch.setattr(m, "_FIELD_MAP", {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)})
+    monkeypatch.setattr(m, "call", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("HTTP 403: Forbidden")))
+    got = m.measure_metric(kev)
+    check("a metric whose query is forbidden is unavailable", (got["ok"], got["count"]), (False, None))
+    check("...with the status kept", "403" in got["error"], True)
+    monkeypatch.setattr(m, "call", fake_call)
 
-        # --- `metrics list` names what no longer resolves ----------------------------------------
-        m._FIELD_MAP = {"asset": {k: v for k, v in ASSET_FIELDS.items() if k != "Has_KEV"},
-                        "user": dict(USER_FIELDS)}
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_metrics(argparse.Namespace(metrics_cmd="list"))
-        lst = json.loads(buf.getvalue())
-        check("list reports the tracked count against the cap", (lst["tracked"], lst["cap"]), (2, 20))
-        check("...and names what stopped resolving", lst["notResolving"], ["kev-exposed"])
-        check("...promising unavailable rather than 0", "rather than as 0" in lst["note"], True)
-        check("...while a still-good metric is marked resolving",
-              next(r for r in lst["metrics"] if r["name"] == "crown-jewels")["resolves"], True)
-        m._FIELD_MAP = {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)}
+    # --- `metrics list` names what no longer resolves ----------------------------------------
+    monkeypatch.setattr(m, "_FIELD_MAP",
+                        {"asset": {k: v for k, v in ASSET_FIELDS.items() if k != "Has_KEV"},
+                         "user": dict(USER_FIELDS)})
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_metrics(argparse.Namespace(metrics_cmd="list"))
+    lst = json.loads(buf.getvalue())
+    check("list reports the tracked count against the cap", (lst["tracked"], lst["cap"]), (2, 20))
+    check("...and names what stopped resolving", lst["notResolving"], ["kev-exposed"])
+    check("...promising unavailable rather than 0", "rather than as 0" in lst["note"], True)
+    check("...while a still-good metric is marked resolving",
+          next(r for r in lst["metrics"] if r["name"] == "crown-jewels")["resolves"], True)
+    monkeypatch.setattr(m, "_FIELD_MAP", {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)})
 
-        # --- the 20-metric cap refuses; it never evicts ------------------------------------------
-        for i in range(18):
-            _, problem = add(name="filler%d" % i, where=["Risk_Score >= Float %d" % (i + 1)])
-            check("filler %d saved" % i, problem, None) if problem else None
-        check("at the cap, exactly 20 are tracked", len(m.load_metrics()), 20)
-        rec, problem = add(name="twenty-first", where=["Risk_Score >= Float 999"])
-        check("the 21st metric is refused", rec, None)
-        check("...saying the cap is reached", "cap is reached" in problem, True)
-        check("...promising nothing was evicted", "Nothing was evicted" in problem, True)
-        check("...listing what is tracked so a human can choose", "kev-exposed" in problem, True)
-        check("...and the 20 on disk are untouched", len(m.load_metrics()), 20)
-        # Replacing an existing name is not blocked by the cap -- it is not a 21st metric.
-        rec, problem = add(name="kev-exposed", label="Renamed", where=["Has_KEV == Binary true"])
-        check("redefining an existing metric works at the cap", problem, None)
-        check("...without growing the list", len(m.load_metrics()), 20)
-        check("...and takes the new label",
-              next(x for x in m.load_metrics() if x["name"] == "kev-exposed")["label"], "Renamed")
+    # --- the 20-metric cap refuses; it never evicts ------------------------------------------
+    for i in range(18):
+        _, problem = add(name="filler%d" % i, where=["Risk_Score >= Float %d" % (i + 1)])
+        check("filler %d saved" % i, problem, None) if problem else None
+    check("at the cap, exactly 20 are tracked", len(m.load_metrics()), 20)
+    rec, problem = add(name="twenty-first", where=["Risk_Score >= Float 999"])
+    check("the 21st metric is refused", rec, None)
+    check("...saying the cap is reached", "cap is reached" in problem, True)
+    check("...promising nothing was evicted", "Nothing was evicted" in problem, True)
+    check("...listing what is tracked so a human can choose", "kev-exposed" in problem, True)
+    check("...and the 20 on disk are untouched", len(m.load_metrics()), 20)
+    # Replacing an existing name is not blocked by the cap -- it is not a 21st metric.
+    rec, problem = add(name="kev-exposed", label="Renamed", where=["Has_KEV == Binary true"])
+    check("redefining an existing metric works at the cap", problem, None)
+    check("...without growing the list", len(m.load_metrics()), 20)
+    check("...and takes the new label",
+          next(x for x in m.load_metrics() if x["name"] == "kev-exposed")["label"], "Renamed")
 
-        # --- rm keeps captured history ------------------------------------------------------------
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_metrics(argparse.Namespace(metrics_cmd="rm", name="filler0"))
-        rm = json.loads(buf.getvalue())
-        check("rm removes one", (rm["removed"], rm["tracked"]), ("filler0", 19))
-        check("...and says history is kept", "History already captured" in rm["note"], True)
+    # --- rm keeps captured history ------------------------------------------------------------
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_metrics(argparse.Namespace(metrics_cmd="rm", name="filler0"))
+    rm = json.loads(buf.getvalue())
+    check("rm removes one", (rm["removed"], rm["tracked"]), ("filler0", 19))
+    check("...and says history is kept", "History already captured" in rm["note"], True)
 
-        # --- snapshots capture metrics at one call each -------------------------------------------
-        for x in list(m.load_metrics()):
-            if x["name"] not in ("kev-exposed", "crown-jewels"):
-                m.save_metrics([y for y in m.load_metrics() if y["name"] != x["name"]])
-        check("trimmed back to two metrics", len(m.load_metrics()), 2)
-        real_build = m.build_digest
-        m.build_digest = lambda *a, **k: _snap_digest()
-        try:
-            bodies.clear()
-            with contextlib.redirect_stderr(io.StringIO()):
-                info = m.take_snapshot()
-            check("a snapshot captures both metrics", info["metricsCaptured"], 2)
-            check("...at one API call each", len(bodies), 2)
-            recs, _ = m.load_snapshots()
-            check("...writing them into the record", len(recs[-1]["metrics"]), 2)
-            check("...with counts", recs[-1]["metrics"][0]["count"], 458)
-            # A broken metric is named in the snapshot report AND the record, never silently 0.
-            m._FIELD_MAP = {"asset": {k: v for k, v in ASSET_FIELDS.items() if k != "Has_KEV"},
-                            "user": dict(USER_FIELDS)}
-            with contextlib.redirect_stderr(io.StringIO()):
-                info = m.take_snapshot()
-            check("a broken metric is reported by the snapshot",
-                  [u["metric"] for u in info["metricsUnresolved"]], ["kev-exposed"])
-            check("...and only the good one counts as captured", info["metricsCaptured"], 1)
-            recs, _ = m.load_snapshots()
-            bad = next(x for x in recs[-1]["metrics"] if x["name"] == "kev-exposed")
-            check("...recorded ok: false in history, not count: 0", (bad["ok"], bad["count"]),
-                  (False, None))
-            check("...and named in sectionsUnavailable",
-                  [s["section"] for s in recs[-1]["sectionsUnavailable"]], ["metrics"])
-            m._FIELD_MAP = {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)}
-            # --no-metrics skips them entirely.
-            bodies.clear()
-            with contextlib.redirect_stderr(io.StringIO()):
-                info = m.take_snapshot(with_metrics=False)
-            check("--no-metrics captures none", (info["metricCalls"], len(bodies)), (0, 0))
-            check("...and writes no metrics key", "metrics" in m.load_snapshots()[0][-1], False)
-        finally:
-            m.build_digest = real_build
+    # --- snapshots capture metrics at one call each -------------------------------------------
+    for x in list(m.load_metrics()):
+        if x["name"] not in ("kev-exposed", "crown-jewels"):
+            m.save_metrics([y for y in m.load_metrics() if y["name"] != x["name"]])
+    check("trimmed back to two metrics", len(m.load_metrics()), 2)
+    monkeypatch.setattr(m, "build_digest", lambda *a, **k: _snap_digest())
+    bodies.clear()
+    info = m.take_snapshot()
+    check("a snapshot captures both metrics", info["metricsCaptured"], 2)
+    check("...at one API call each", len(bodies), 2)
+    recs, _ = m.load_snapshots()
+    check("...writing them into the record", len(recs[-1]["metrics"]), 2)
+    check("...with counts", recs[-1]["metrics"][0]["count"], 458)
+    # A broken metric is named in the snapshot report AND the record, never silently 0.
+    monkeypatch.setattr(m, "_FIELD_MAP",
+                        {"asset": {k: v for k, v in ASSET_FIELDS.items() if k != "Has_KEV"},
+                         "user": dict(USER_FIELDS)})
+    info = m.take_snapshot()
+    check("a broken metric is reported by the snapshot",
+          [u["metric"] for u in info["metricsUnresolved"]], ["kev-exposed"])
+    check("...and only the good one counts as captured", info["metricsCaptured"], 1)
+    recs, _ = m.load_snapshots()
+    bad = next(x for x in recs[-1]["metrics"] if x["name"] == "kev-exposed")
+    check("...recorded ok: false in history, not count: 0", (bad["ok"], bad["count"]),
+          (False, None))
+    check("...and named in sectionsUnavailable",
+          [s["section"] for s in recs[-1]["sectionsUnavailable"]], ["metrics"])
+    monkeypatch.setattr(m, "_FIELD_MAP", {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)})
+    # --no-metrics skips them entirely.
+    bodies.clear()
+    info = m.take_snapshot(with_metrics=False)
+    check("--no-metrics captures none", (info["metricCalls"], len(bodies)), (0, 0))
+    check("...and writes no metrics key", "metrics" in m.load_snapshots()[0][-1], False)
 
-        # --- the question-to-metric loop -----------------------------------------------------------
-        # An untracked metric: notTracked, a baseline, a registration, and NEVER a zero delta.
-        m.save_metrics([])
-        out = {"notTracked": [{"metric": "kev-exposed", "reason": "not captured in either snapshot"}],
-               "changes": [{"kind": "total", "name": "assets", "from": 1, "to": 2,
-                            "change": 1, "percentChange": 100.0}]}
-        m.resolve_not_tracked(out, "kev-exposed", label="KEV-exposed assets", table="asset",
-                              where=["Has_KEV == Binary true"])
-        nt = out["notTracked"][0]
-        check("an untracked metric registers itself", nt["registered"]["name"], "kev-exposed")
-        check("...reporting the implicit config write", "wrote to the user's config" in nt["registeredNote"], True)
-        check("...and is now on disk", [x["name"] for x in m.load_metrics()], ["kev-exposed"])
-        check("...answered with today's value as a baseline", nt["baseline"]["count"], 458)
-        check("...labelled a baseline, not a trend", "not a trend" in nt["baselineNote"], True)
-        check("...and no metric delta was invented",
-              [r for r in out["changes"] if r["kind"] == "metric"], [])
-        check("...nor a zero anywhere in the entry", ("0%" in json.dumps(nt)) or (nt.get("change") == 0), False)
+    # --- the question-to-metric loop -----------------------------------------------------------
+    # An untracked metric: notTracked, a baseline, a registration, and NEVER a zero delta.
+    m.save_metrics([])
+    out = {"notTracked": [{"metric": "kev-exposed", "reason": "not captured in either snapshot"}],
+           "changes": [{"kind": "total", "name": "assets", "from": 1, "to": 2,
+                        "change": 1, "percentChange": 100.0}]}
+    m.resolve_not_tracked(out, "kev-exposed", label="KEV-exposed assets", table="asset",
+                          where=["Has_KEV == Binary true"])
+    nt = out["notTracked"][0]
+    check("an untracked metric registers itself", nt["registered"]["name"], "kev-exposed")
+    check("...reporting the implicit config write", "wrote to the user's config" in nt["registeredNote"], True)
+    check("...and is now on disk", [x["name"] for x in m.load_metrics()], ["kev-exposed"])
+    check("...answered with today's value as a baseline", nt["baseline"]["count"], 458)
+    check("...labelled a baseline, not a trend", "not a trend" in nt["baselineNote"], True)
+    check("...and no metric delta was invented",
+          [r for r in out["changes"] if r["kind"] == "metric"], [])
+    check("...nor a zero anywhere in the entry", ("0%" in json.dumps(nt)) or (nt.get("change") == 0), False)
 
-        # A derived metric that fails validation is NOT written -- an unanswerable question must not
-        # leave a permanently broken metric behind.
-        m.save_metrics([])
-        out = {"notTracked": [{"metric": "typo-metric", "reason": "not captured"}]}
-        m.resolve_not_tracked(out, "typo-metric", where=["Hs_KEV == Binary true"])
-        nt = out["notTracked"][0]
-        check("an invalid derived metric is refused", nt["registered"], False)
-        check("...naming the closest field", "'Has_KEV'" in nt["registrationRefused"], True)
-        check("...and leaves nothing broken on disk", m.load_metrics(), [])
-        check("...and offers no baseline it cannot measure", "baseline" in nt, False)
+    # A derived metric that fails validation is NOT written -- an unanswerable question must not
+    # leave a permanently broken metric behind.
+    m.save_metrics([])
+    out = {"notTracked": [{"metric": "typo-metric", "reason": "not captured"}]}
+    m.resolve_not_tracked(out, "typo-metric", where=["Hs_KEV == Binary true"])
+    nt = out["notTracked"][0]
+    check("an invalid derived metric is refused", nt["registered"], False)
+    check("...naming the closest field", "'Has_KEV'" in nt["registrationRefused"], True)
+    check("...and leaves nothing broken on disk", m.load_metrics(), [])
+    check("...and offers no baseline it cannot measure", "baseline" in nt, False)
 
-        # A metric defined but not yet snapshotted: baseline available, no registration needed.
-        add(name="already-defined", where=["Has_KEV == Binary true"])
-        out = {"notTracked": [{"metric": "already-defined", "reason": "not captured"}]}
-        m.resolve_not_tracked(out, "already-defined")
-        check("a defined-but-unsnapshotted metric still gets a baseline",
-              out["notTracked"][0]["baseline"]["count"], 458)
-        check("...and is not re-registered", "registered" in out["notTracked"][0], False)
+    # A metric defined but not yet snapshotted: baseline available, no registration needed.
+    add(name="already-defined", where=["Has_KEV == Binary true"])
+    out = {"notTracked": [{"metric": "already-defined", "reason": "not captured"}]}
+    m.resolve_not_tracked(out, "already-defined")
+    check("a defined-but-unsnapshotted metric still gets a baseline",
+          out["notTracked"][0]["baseline"]["count"], 458)
+    check("...and is not re-registered", "registered" in out["notTracked"][0], False)
 
-        # At the cap, auto-registration is REFUSED rather than evicting an existing metric.
-        m.save_metrics([{"name": "m%d" % i, "label": "m%d" % i, "table": "asset",
-                         "where": ["Risk_Score >= Float %d" % (i + 1)]} for i in range(20)])
-        out = {"notTracked": [{"metric": "one-too-many", "reason": "not captured"}]}
-        m.resolve_not_tracked(out, "one-too-many", where=["Has_KEV == Binary true"])
-        nt = out["notTracked"][0]
-        check("at the cap, auto-registration is refused", nt["registered"], False)
-        check("...saying the cap is reached", "cap is reached" in nt["registrationRefused"], True)
-        check("...rather than evicting one", len(m.load_metrics()), 20)
-        check("...and listing the tracked names so a human can pick",
-              "m0" in nt["registrationRefused"], True)
+    # At the cap, auto-registration is REFUSED rather than evicting an existing metric.
+    m.save_metrics([{"name": "m%d" % i, "label": "m%d" % i, "table": "asset",
+                     "where": ["Risk_Score >= Float %d" % (i + 1)]} for i in range(20)])
+    out = {"notTracked": [{"metric": "one-too-many", "reason": "not captured"}]}
+    m.resolve_not_tracked(out, "one-too-many", where=["Has_KEV == Binary true"])
+    nt = out["notTracked"][0]
+    check("at the cap, auto-registration is refused", nt["registered"], False)
+    check("...saying the cap is reached", "cap is reached" in nt["registrationRefused"], True)
+    check("...rather than evicting one", len(m.load_metrics()), 20)
+    check("...and listing the tracked names so a human can pick",
+          "m0" in nt["registrationRefused"], True)
 
-        # The loop must fire even when history is ALSO insufficient -- which is the common case, not an
-        # edge one. Someone asks for a trend early, when there is little history and the metric was never
-        # defined; answering only "come back later" would leave the list just as empty next month.
-        m.save_metrics([])
-        t = m.compute_trend([_snap("2026-08-05")], metric="kev-exposed")
-        check("insufficient history still reports the requested metric as untracked",
-              t["notTracked"][0]["metric"], "kev-exposed")
-        m.resolve_not_tracked(t, "kev-exposed", where=["Has_KEV == Binary true"])
-        check("...so it still registers", t["notTracked"][0]["registered"]["name"], "kev-exposed")
-        check("...and still returns a baseline", t["notTracked"][0]["baseline"]["count"], 458)
-        check("...while insufficientHistory still stands", t["insufficientHistory"], True)
-        check("...with no changes fabricated", t["changes"], [])
-        # A metric that IS in the history is not re-reported as untracked on that path.
-        t = m.compute_trend([_snap("2026-08-05", metrics=[{"name": "kev-exposed", "count": 5, "ok": True}])],
-                            metric="kev-exposed")
-        check("a captured metric is not called untracked just because history is short",
-              "notTracked" in t, False)
+    # The loop must fire even when history is ALSO insufficient -- which is the common case, not an
+    # edge one. Someone asks for a trend early, when there is little history and the metric was never
+    # defined; answering only "come back later" would leave the list just as empty next month.
+    m.save_metrics([])
+    t = m.compute_trend([_snap("2026-08-05")], metric="kev-exposed")
+    check("insufficient history still reports the requested metric as untracked",
+          t["notTracked"][0]["metric"], "kev-exposed")
+    m.resolve_not_tracked(t, "kev-exposed", where=["Has_KEV == Binary true"])
+    check("...so it still registers", t["notTracked"][0]["registered"]["name"], "kev-exposed")
+    check("...and still returns a baseline", t["notTracked"][0]["baseline"]["count"], 458)
+    check("...while insufficientHistory still stands", t["insufficientHistory"], True)
+    check("...with no changes fabricated", t["changes"], [])
+    # A metric that IS in the history is not re-reported as untracked on that path.
+    t = m.compute_trend([_snap("2026-08-05", metrics=[{"name": "kev-exposed", "count": 5, "ok": True}])],
+                        metric="kev-exposed")
+    check("a captured metric is not called untracked just because history is short",
+          "notTracked" in t, False)
 
-        # A metric that resolved-and-failed is a different report; the loop must not overwrite it.
-        out = {"notTracked": [{"metric": "kev-exposed", "unavailableAt": ["to"],
-                               "reason": "did not resolve"}]}
-        m.resolve_not_tracked(out, "kev-exposed", where=["Has_KEV == Binary true"])
-        check("an unavailable metric is not treated as untracked",
-              "baseline" in out["notTracked"][0], False)
+    # A metric that resolved-and-failed is a different report; the loop must not overwrite it.
+    out = {"notTracked": [{"metric": "kev-exposed", "unavailableAt": ["to"],
+                           "reason": "did not resolve"}]}
+    m.resolve_not_tracked(out, "kev-exposed", where=["Has_KEV == Binary true"])
+    check("an unavailable metric is not treated as untracked",
+          "baseline" in out["notTracked"][0], False)
 
-        # --- end to end through the CLI -----------------------------------------------------------
-        m.save_metrics([])
-        real_snaps = m.load_snapshots
-        m.load_snapshots = lambda *a, **k: ([_snap("2026-07-01", assets=33000), _snap("2026-08-05")], [])
-        try:
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                m.cmd_trend(argparse.Namespace(
-                    since=None, metric="kev-exposed", table=None, by=None, format=None, out=None,
-                    derive_where=["Has_KEV == Binary true"], derive_smart_label=None,
-                    derive_label="KEV-exposed assets", derive_table="asset"))
-            d = json.loads(buf.getvalue())
-            nt = d["notTracked"][0]
-            check("trend --metric with a definition registers it", nt["registered"]["name"], "kev-exposed")
-            check("...and answers with a baseline", nt["baseline"]["count"], 458)
-            check("...while still computing the trends it CAN", len(d["changes"]) > 0, True)
-            check("...and emitting no metric row", [r for r in d["changes"] if r["kind"] == "metric"], [])
-            check("...with the never-render-as-zero rule in the envelope",
-                  "unanswerable" in d["notTrackedNote"], True)
-        finally:
-            m.load_snapshots = real_snaps
-    finally:
-        m.CFG_DIR, m.load_config, m.call, m._FIELD_MAP, m._LABELS = real
+    # --- end to end through the CLI -----------------------------------------------------------
+    m.save_metrics([])
+    monkeypatch.setattr(m, "load_snapshots",
+                        lambda *a, **k: ([_snap("2026-07-01", assets=33000), _snap("2026-08-05")], []))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_trend(argparse.Namespace(
+            since=None, metric="kev-exposed", table=None, by=None, format=None, out=None,
+            derive_where=["Has_KEV == Binary true"], derive_smart_label=None,
+            derive_label="KEV-exposed assets", derive_table="asset"))
+    d = json.loads(buf.getvalue())
+    nt = d["notTracked"][0]
+    check("trend --metric with a definition registers it", nt["registered"]["name"], "kev-exposed")
+    check("...and answers with a baseline", nt["baseline"]["count"], 458)
+    check("...while still computing the trends it CAN", len(d["changes"]) > 0, True)
+    check("...and emitting no metric row", [r for r in d["changes"] if r["kind"] == "metric"], [])
+    check("...with the never-render-as-zero rule in the envelope",
+          "unanswerable" in d["notTrackedNote"], True)
 
 
 CUSTOMER_ASSETS = [{"Asset_Name": "PROD-DB-04", "Risk_Score": 4120},
@@ -3902,25 +3696,24 @@ CUSTOMER_ASSETS = [{"Asset_Name": "PROD-DB-04", "Risk_Score": 4120},
                    {"Asset_Name": "vpn-gw-lon-02", "Risk_Score": 700}]
 
 
-def test_entities(m):
+def test_entities(m, monkeypatch, tmp_path):
     """Option C, scoped entity deltas (design/trends.md phase 4). Still dormant until phase 5.
 
     Two things carry this phase. Scope is bounded, because the full inventory is ~343 pages and ~13
     minutes -- about 6x the rate budget. And identity is a salted hash, because a delta only needs
     "same entity across time" and there is no reason to put customer names on disk to get it."""
-    print("[17] scoped entity deltas (offline)")
     import contextlib, io
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.load_config, m.top_n, m._LABELS, m._FIELD_MAP, m.build_digest)
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("s.example", "tok", None)
-    m._FIELD_MAP = {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)}
-    m._LABELS = [{"name": "Crown Jewels", "field": "Crown_Jewels", "table": "asset",
-                  "type": "Binary", "purpose": "", "queryable": True},
-                 {"name": "All Vulns", "field": "All_Vulns_SmartLabel", "table": "asset",
-                  "type": "String", "purpose": "", "queryable": True}]
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "_FIELD_MAP", {"asset": dict(ASSET_FIELDS), "user": dict(USER_FIELDS)})
+    monkeypatch.setattr(m, "_LABELS",
+                        [{"name": "Crown Jewels", "field": "Crown_Jewels", "table": "asset",
+                          "type": "Binary", "purpose": "", "queryable": True},
+                         {"name": "All Vulns", "field": "All_Vulns_SmartLabel", "table": "asset",
+                          "type": "String", "purpose": "", "queryable": True}])
     m._FIELD_MAP["asset"]["All_Vulns_SmartLabel"] = "String"
-    m.build_digest = lambda *a, **k: _snap_digest()
+    monkeypatch.setattr(m, "build_digest", lambda *a, **k: _snap_digest())
     calls = []
 
     def fake_top(table, field, n, where=None, select=None):
@@ -3928,202 +3721,185 @@ def test_entities(m):
         cols = (select or "").replace(",", " ").split()
         return {"table": table, "field": field, "matchedAtThreshold": 100, "totalInTail": 3,
                 "top": [{c: r.get(c) for c in cols} for r in CUSTOMER_ASSETS]}
-    m.top_n = fake_top
+    monkeypatch.setattr(m, "top_n", fake_top)
     SALT_A, SALT_B = "a" * 64, "b" * 64
 
-    try:
-        # --- scope is mandatory and bounded ------------------------------------------------------
-        spec, problem = m.parse_entity_scope("top500:asset:Risk_Score")
-        check("the default scope parses", (spec["kind"], spec["n"], spec["table"]), ("top", 500, "asset"))
-        check("...and carries its measured cost", (spec["pages"], spec["estimatedSeconds"]), (5, 11.5))
-        spec, problem = m.parse_entity_scope("all")
-        check("there is no unbounded scope", spec, None)
-        check("...and the refusal states the cost of one", "13 minutes" in problem, True)
-        spec, problem = m.parse_entity_scope("top2000:asset:Risk_Score")
-        check("a scope above the default is refused", spec, None)
-        check("...stating its cost against the default", "20 pages" in problem, True)
-        check("...and naming the flag that accepts it", "--allow-large-scope" in problem, True)
-        spec, problem = m.parse_entity_scope("top2000:asset:Risk_Score", allow_large=True)
-        check("...and allowed behind the flag", spec["n"], 2000)
-        spec, problem = m.parse_entity_scope("top9000:asset:Risk_Score", allow_large=True)
-        check("above the 5000 ceiling it is refused even with the flag", spec, None)
-        check("...naming the ceiling", "5000 ceiling" in problem, True)
-        spec, problem = m.parse_entity_scope("label:Crown Jewels:Risk_Score")
-        check("a SmartLabel scope resolves through find_label", spec["labelField"], "Crown_Jewels")
-        check("...taking the label's own table", spec["table"], "asset")
-        check("...bounded by the default, so a small label isn't refused for costing nothing",
-              spec["n"], 500)
-        check("...and raised to the existing ceiling only behind the flag",
-              m.parse_entity_scope("label:Crown Jewels:Risk_Score", allow_large=True)[0]["n"], 5000)
-        spec, problem = m.parse_entity_scope("label:No Such Thing:Risk_Score")
-        check("an unknown label scope is refused", spec, None)
-        check("...pointing at labels --search", "labels --search" in problem, True)
+    # --- scope is mandatory and bounded ------------------------------------------------------
+    spec, problem = m.parse_entity_scope("top500:asset:Risk_Score")
+    check("the default scope parses", (spec["kind"], spec["n"], spec["table"]), ("top", 500, "asset"))
+    check("...and carries its measured cost", (spec["pages"], spec["estimatedSeconds"]), (5, 11.5))
+    spec, problem = m.parse_entity_scope("all")
+    check("there is no unbounded scope", spec, None)
+    check("...and the refusal states the cost of one", "13 minutes" in problem, True)
+    spec, problem = m.parse_entity_scope("top2000:asset:Risk_Score")
+    check("a scope above the default is refused", spec, None)
+    check("...stating its cost against the default", "20 pages" in problem, True)
+    check("...and naming the flag that accepts it", "--allow-large-scope" in problem, True)
+    spec, problem = m.parse_entity_scope("top2000:asset:Risk_Score", allow_large=True)
+    check("...and allowed behind the flag", spec["n"], 2000)
+    spec, problem = m.parse_entity_scope("top9000:asset:Risk_Score", allow_large=True)
+    check("above the 5000 ceiling it is refused even with the flag", spec, None)
+    check("...naming the ceiling", "5000 ceiling" in problem, True)
+    spec, problem = m.parse_entity_scope("label:Crown Jewels:Risk_Score")
+    check("a SmartLabel scope resolves through find_label", spec["labelField"], "Crown_Jewels")
+    check("...taking the label's own table", spec["table"], "asset")
+    check("...bounded by the default, so a small label isn't refused for costing nothing",
+          spec["n"], 500)
+    check("...and raised to the existing ceiling only behind the flag",
+          m.parse_entity_scope("label:Crown Jewels:Risk_Score", allow_large=True)[0]["n"], 5000)
+    spec, problem = m.parse_entity_scope("label:No Such Thing:Risk_Score")
+    check("an unknown label scope is refused", spec, None)
+    check("...pointing at labels --search", "labels --search" in problem, True)
 
-        # --- identity: stable per salt, different across salts, and no names on disk --------------
-        spec, _ = m.parse_entity_scope("top500:asset:Risk_Score")
-        e1 = m.capture_entities(spec, SALT_A)
-        e2 = m.capture_entities(spec, SALT_A)
-        check("ids are stable across snapshots for one salt", e1["scores"], e2["scores"])
-        check("...and are 16-char hashes, not names",
-              all(len(k) == 16 and k.isalnum() for k in e1["scores"]), True)
-        e3 = m.capture_entities(spec, SALT_B)
-        check("...and differ under another salt", set(e1["scores"]) & set(e3["scores"]), set())
-        check("the saltId identifies which salt produced them", e1["saltId"] != e3["saltId"], True)
-        check("...and is not the salt itself", SALT_A[:8] in json.dumps(e1), False)
-        check("the cutoff score is recorded, since a top-N scope is a window", e1["cutoffScore"], 700.0)
-        check("only the identity field and the score are fetched", calls[-1]["select"],
-              "Asset_Name,Risk_Score")
+    # --- identity: stable per salt, different across salts, and no names on disk --------------
+    spec, _ = m.parse_entity_scope("top500:asset:Risk_Score")
+    e1 = m.capture_entities(spec, SALT_A)
+    e2 = m.capture_entities(spec, SALT_A)
+    check("ids are stable across snapshots for one salt", e1["scores"], e2["scores"])
+    check("...and are 16-char hashes, not names",
+          all(len(k) == 16 and k.isalnum() for k in e1["scores"]), True)
+    e3 = m.capture_entities(spec, SALT_B)
+    check("...and differ under another salt", set(e1["scores"]) & set(e3["scores"]), set())
+    check("the saltId identifies which salt produced them", e1["saltId"] != e3["saltId"], True)
+    check("...and is not the salt itself", SALT_A[:8] in json.dumps(e1), False)
+    check("the cutoff score is recorded, since a top-N scope is a window", e1["cutoffScore"], 700.0)
+    check("only the identity field and the score are fetched", calls[-1]["select"],
+          "Asset_Name,Risk_Score")
 
-        # A SmartLabel scope uses `exists` for a String label, `== true` for Binary -- the same rule a
-        # metric follows, because `== null` matches where the label is ABSENT.
-        spec, _ = m.parse_entity_scope("label:All Vulns:Risk_Score")
-        m.capture_entities(spec, SALT_A)
-        check("a String-label scope filters with exists", calls[-1]["where"],
-              ["All_Vulns_SmartLabel exists String"])
-        spec, _ = m.parse_entity_scope("label:Crown Jewels:Risk_Score")
-        m.capture_entities(spec, SALT_A)
-        check("...and a Binary-label scope with == true", calls[-1]["where"],
-              ["Crown_Jewels == Binary true"])
+    # A SmartLabel scope uses `exists` for a String label, `== true` for Binary -- the same rule a
+    # metric follows, because `== null` matches where the label is ABSENT.
+    spec, _ = m.parse_entity_scope("label:All Vulns:Risk_Score")
+    m.capture_entities(spec, SALT_A)
+    check("a String-label scope filters with exists", calls[-1]["where"],
+          ["All_Vulns_SmartLabel exists String"])
+    spec, _ = m.parse_entity_scope("label:Crown Jewels:Risk_Score")
+    m.capture_entities(spec, SALT_A)
+    check("...and a Binary-label scope with == true", calls[-1]["where"],
+          ["Crown_Jewels == Binary true"])
 
-        # --- THE grep: no customer identifier reaches disk without --with-names ------------------
-        spec, _ = m.parse_entity_scope("top500:asset:Risk_Score")
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.redirect_stderr(io.StringIO()):
-                m.take_snapshot(entities="top500:asset:Risk_Score", salt=SALT_A)
-        blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
-        for leak in ("PROD-DB-04", "dana-whitfield-mbp", "vpn-gw-lon-02", "Asset_Name", "Owner_Name"):
-            check("no %r in the written history" % leak, leak in blob, False)
-        check("...and the salt itself is never written", SALT_A in blob, False)
-        check("...while the saltId is", m.salt_id(SALT_A) in blob, True)
-        recs, _ = m.load_snapshots()
-        check("the scope is recorded", recs[-1]["entities"]["scope"], "top500:asset:Risk_Score")
-        check("...with three hashed entities", recs[-1]["entities"]["count"], 3)
-        check("...marked as not storing names", recs[-1]["entities"]["namesStored"], False)
+    # --- THE grep: no customer identifier reaches disk without --with-names ------------------
+    spec, _ = m.parse_entity_scope("top500:asset:Risk_Score")
+    m.take_snapshot(entities="top500:asset:Risk_Score", salt=SALT_A)
+    blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
+    for leak in ("PROD-DB-04", "dana-whitfield-mbp", "vpn-gw-lon-02", "Asset_Name", "Owner_Name"):
+        check("no %r in the written history" % leak, leak in blob, False)
+    check("...and the salt itself is never written", SALT_A in blob, False)
+    check("...while the saltId is", m.salt_id(SALT_A) in blob, True)
+    recs, _ = m.load_snapshots()
+    check("the scope is recorded", recs[-1]["entities"]["scope"], "top500:asset:Risk_Score")
+    check("...with three hashed entities", recs[-1]["entities"]["count"], 3)
+    check("...marked as not storing names", recs[-1]["entities"]["namesStored"], False)
 
-        # --with-names is an explicit opt-in, warns once, and says so in the record.
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.redirect_stderr(err):
-                info = m.take_snapshot(entities="top500:asset:Risk_Score", with_names=True, salt=SALT_A)
-        check("--with-names warns about customer data", "customer data" in err.getvalue(), True)
-        check("...naming the permissions.deny protection", "permissions.deny" in err.getvalue(), True)
-        check("...and reports that it warned", info["entitiesCaptured"]["privacyWarningShown"], True)
-        check("...storing names as asked", info["entitiesCaptured"]["namesStored"], True)
-        blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
-        check("...so identifiers ARE on disk now", "PROD-DB-04" in blob, True)
-        recs, _ = m.load_snapshots()
-        check("...with the record saying what it holds", "permissions.deny" in recs[-1]["entities"]["privacyNote"], True)
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.redirect_stderr(err):
-                info = m.take_snapshot(entities="top500:asset:Risk_Score", with_names=True, salt=SALT_A)
-        check("the privacy warning is made once, not every run", "customer data" in err.getvalue(), False)
-        check("...and not re-reported", "privacyWarningShown" in info["entitiesCaptured"], False)
+    # --with-names is an explicit opt-in, warns once, and says so in the record.
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        info = m.take_snapshot(entities="top500:asset:Risk_Score", with_names=True, salt=SALT_A)
+    check("--with-names warns about customer data", "customer data" in err.getvalue(), True)
+    check("...naming the permissions.deny protection", "permissions.deny" in err.getvalue(), True)
+    check("...and reports that it warned", info["entitiesCaptured"]["privacyWarningShown"], True)
+    check("...storing names as asked", info["entitiesCaptured"]["namesStored"], True)
+    blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
+    check("...so identifiers ARE on disk now", "PROD-DB-04" in blob, True)
+    recs, _ = m.load_snapshots()
+    check("...with the record saying what it holds", "permissions.deny" in recs[-1]["entities"]["privacyNote"], True)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        info = m.take_snapshot(entities="top500:asset:Risk_Score", with_names=True, salt=SALT_A)
+    check("the privacy warning is made once, not every run", "customer data" in err.getvalue(), False)
+    check("...and not re-reported", "privacyWarningShown" in info["entitiesCaptured"], False)
 
-        # A refused scope is named, not silently skipped.
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.redirect_stderr(io.StringIO()):
-                info = m.take_snapshot(entities="top9000:asset:Risk_Score", salt=SALT_A)
-        check("a refused scope is reported", "5000 ceiling" in info["entitiesUnavailable"], True)
-        check("...and no entities key is written", "entities" in m.load_snapshots()[0][-1], False)
+    # A refused scope is named, not silently skipped.
+    info = m.take_snapshot(entities="top9000:asset:Risk_Score", salt=SALT_A)
+    check("a refused scope is reported", "5000 ceiling" in info["entitiesUnavailable"], True)
+    check("...and no entities key is written", "entities" in m.load_snapshots()[0][-1], False)
 
-        # --- the diff ----------------------------------------------------------------------------
-        def ents(scores, scope="top500:asset:Risk_Score", salt=SALT_A, names=False, cutoff=None):
-            return {"scope": scope, "table": "asset", "field": "Risk_Score", "count": len(scores),
-                    "saltId": m.salt_id(salt), "namesStored": names, "requested": 500,
-                    "matchedAtThreshold": 100, "cutoffScore": cutoff if cutoff is not None
-                    else (min(scores.values()) if scores else None), "scores": scores}
+    # --- the diff ----------------------------------------------------------------------------
+    def ents(scores, scope="top500:asset:Risk_Score", salt=SALT_A, names=False, cutoff=None):
+        return {"scope": scope, "table": "asset", "field": "Risk_Score", "count": len(scores),
+                "saltId": m.salt_id(salt), "namesStored": names, "requested": 500,
+                "matchedAtThreshold": 100, "cutoffScore": cutoff if cutoff is not None
+                else (min(scores.values()) if scores else None), "scores": scores}
 
-        a = _snap("2026-07-01"); a["entities"] = ents({"aa": 100.0, "bb": 200.0, "cc": 300.0})
-        b = _snap("2026-08-05"); b["entities"] = ents({"bb": 250.0, "cc": 150.0, "dd": 400.0})
-        t = m.compute_trend([a, b])
-        d = t["entities"]
-        check("a comparable scope is diffed", d["comparable"], True)
-        check("appeared", d["appeared"], ["dd"])
-        check("disappeared", d["disappeared"], ["aa"])
-        check("worsened, by how much", [(x["id"], x["change"]) for x in d["worsened"]], [("bb", 50.0)])
-        check("improved", [(x["id"], x["change"]) for x in d["improved"]], [("cc", -150.0)])
-        check("counts are exact", (d["counts"]["appeared"], d["counts"]["worsened"]), (1, 1))
-        check("the score direction is stated, not assumed", "higher" in d["scoreDirection"], True)
-        check("...and hashes are flagged as nameable live", "--name-entities" in d["namingNote"], True)
-        check("a moving cutoff is called out", d["cutoffMoved"], True)
-        check("...explaining disappeared != left the inventory",
-              "not the same as leaving the inventory" in d["note"], True)
+    a = _snap("2026-07-01"); a["entities"] = ents({"aa": 100.0, "bb": 200.0, "cc": 300.0})
+    b = _snap("2026-08-05"); b["entities"] = ents({"bb": 250.0, "cc": 150.0, "dd": 400.0})
+    t = m.compute_trend([a, b])
+    d = t["entities"]
+    check("a comparable scope is diffed", d["comparable"], True)
+    check("appeared", d["appeared"], ["dd"])
+    check("disappeared", d["disappeared"], ["aa"])
+    check("worsened, by how much", [(x["id"], x["change"]) for x in d["worsened"]], [("bb", 50.0)])
+    check("improved", [(x["id"], x["change"]) for x in d["improved"]], [("cc", -150.0)])
+    check("counts are exact", (d["counts"]["appeared"], d["counts"]["worsened"]), (1, 1))
+    check("the score direction is stated, not assumed", "higher" in d["scoreDirection"], True)
+    check("...and hashes are flagged as nameable live", "--name-entities" in d["namingNote"], True)
+    check("a moving cutoff is called out", d["cutoffMoved"], True)
+    check("...explaining disappeared != left the inventory",
+          "not the same as leaving the inventory" in d["note"], True)
 
-        # A mismatched saltId REFUSES rather than reporting 100% churn.
-        b2 = _snap("2026-08-05"); b2["entities"] = ents({"zz": 100.0}, salt=SALT_B)
-        d = m.compute_trend([a, b2])["entities"]
-        check("a mismatched salt refuses to diff", (d["comparable"], d["saltMismatch"]), (False, True))
-        check("...naming both salt ids", m.salt_id(SALT_B) in d["reason"], True)
-        check("...and saying why it would be wrong", "did not happen" in d["reason"], True)
-        check("...producing no appeared/disappeared at all", "appeared" in d, False)
+    # A mismatched saltId REFUSES rather than reporting 100% churn.
+    b2 = _snap("2026-08-05"); b2["entities"] = ents({"zz": 100.0}, salt=SALT_B)
+    d = m.compute_trend([a, b2])["entities"]
+    check("a mismatched salt refuses to diff", (d["comparable"], d["saltMismatch"]), (False, True))
+    check("...naming both salt ids", m.salt_id(SALT_B) in d["reason"], True)
+    check("...and saying why it would be wrong", "did not happen" in d["reason"], True)
+    check("...producing no appeared/disappeared at all", "appeared" in d, False)
 
-        # A different scope, or a different identity kind, is not comparable either.
-        b3 = _snap("2026-08-05"); b3["entities"] = ents({"bb": 250.0}, scope="top1000:asset:Risk_Score")
-        d = m.compute_trend([a, b3])["entities"]
-        check("a different scope is not compared", d["comparable"], False)
-        check("...saying the scopes share no cutoff", "share no cutoff" in d["reason"], True)
-        b4 = _snap("2026-08-05"); b4["entities"] = ents({"PROD-DB-04": 1.0}, names=True)
-        d = m.compute_trend([a, b4])["entities"]
-        check("names against hashes is not compared", d["comparable"], False)
-        check("...saying they are not the same kind of thing", "same kind of thing" in d["reason"], True)
+    # A different scope, or a different identity kind, is not comparable either.
+    b3 = _snap("2026-08-05"); b3["entities"] = ents({"bb": 250.0}, scope="top1000:asset:Risk_Score")
+    d = m.compute_trend([a, b3])["entities"]
+    check("a different scope is not compared", d["comparable"], False)
+    check("...saying the scopes share no cutoff", "share no cutoff" in d["reason"], True)
+    b4 = _snap("2026-08-05"); b4["entities"] = ents({"PROD-DB-04": 1.0}, names=True)
+    d = m.compute_trend([a, b4])["entities"]
+    check("names against hashes is not compared", d["comparable"], False)
+    check("...saying they are not the same kind of thing", "same kind of thing" in d["reason"], True)
 
-        # Captured at one end only.
-        c = _snap("2026-08-05")
-        d = m.compute_trend([a, c])["entities"]
-        check("a scope at one end only is not compared", d["comparable"], False)
-        check("...naming which end", "the later snapshot" in d["reason"], True)
-        check("...and saying it cannot be backfilled", "no way to backfill" in d["reason"], True)
+    # Captured at one end only.
+    c = _snap("2026-08-05")
+    d = m.compute_trend([a, c])["entities"]
+    check("a scope at one end only is not compared", d["comparable"], False)
+    check("...naming which end", "the later snapshot" in d["reason"], True)
+    check("...and saying it cannot be backfilled", "no way to backfill" in d["reason"], True)
 
-        # Lists are sampled; counts stay exact, and the truncation is stated.
-        big_a = _snap("2026-07-01"); big_a["entities"] = ents({"x%d" % i: 1.0 for i in range(60)})
-        big_b = _snap("2026-08-05"); big_b["entities"] = ents({"y%d" % i: 1.0 for i in range(60)})
-        d = m.compute_trend([big_a, big_b])["entities"]
-        check("counts are exact past the sample cap", d["counts"]["appeared"], 60)
-        check("...the list is capped", len(d["appeared"]), 25)
-        check("...and the truncation is stated", d["listsTruncated"]["appeared"], 60)
+    # Lists are sampled; counts stay exact, and the truncation is stated.
+    big_a = _snap("2026-07-01"); big_a["entities"] = ents({"x%d" % i: 1.0 for i in range(60)})
+    big_b = _snap("2026-08-05"); big_b["entities"] = ents({"y%d" % i: 1.0 for i in range(60)})
+    d = m.compute_trend([big_a, big_b])["entities"]
+    check("counts are exact past the sample cap", d["counts"]["appeared"], 60)
+    check("...the list is capped", len(d["appeared"]), 25)
+    check("...and the truncation is stated", d["listsTruncated"]["appeared"], 60)
 
-        # --- naming the movers happens live, and is never persisted ------------------------------
-        a5 = _snap("2026-07-01")
-        a5["entities"] = ents({m.hash_entity(SALT_A, "PROD-DB-04"): 100.0,
-                               m.hash_entity(SALT_A, "gone-forever"): 50.0})
-        b5 = _snap("2026-08-05")
-        b5["entities"] = ents({m.hash_entity(SALT_A, "PROD-DB-04"): 400.0,
-                               m.hash_entity(SALT_A, "vpn-gw-lon-02"): 60.0})
-        t = m.compute_trend([a5, b5])
-        real_salt = m.entity_salt
-        m.entity_salt = lambda: SALT_A
-        try:
-            m.name_entities(t["entities"])
-        finally:
-            m.entity_salt = real_salt
-        named = t["entities"]["names"]
-        check("a still-present mover is named from the live query",
-              named["worsened"][m.hash_entity(SALT_A, "PROD-DB-04")], "PROD-DB-04")
-        check("...and the count that could not be named is stated",
-              "could not be named" in t["entities"]["namesNote"], True)
-        check("...saying the names were not stored", "not stored" in t["entities"]["namesNote"], True)
-        blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
-        check("naming wrote nothing to the history file", "PROD-DB-04" in blob.split("privacyNote")[0], False)
+    # --- naming the movers happens live, and is never persisted ------------------------------
+    a5 = _snap("2026-07-01")
+    a5["entities"] = ents({m.hash_entity(SALT_A, "PROD-DB-04"): 100.0,
+                           m.hash_entity(SALT_A, "gone-forever"): 50.0})
+    b5 = _snap("2026-08-05")
+    b5["entities"] = ents({m.hash_entity(SALT_A, "PROD-DB-04"): 400.0,
+                           m.hash_entity(SALT_A, "vpn-gw-lon-02"): 60.0})
+    t = m.compute_trend([a5, b5])
+    monkeypatch.setattr(m, "entity_salt", lambda: SALT_A)
+    m.name_entities(t["entities"])
+    named = t["entities"]["names"]
+    check("a still-present mover is named from the live query",
+          named["worsened"][m.hash_entity(SALT_A, "PROD-DB-04")], "PROD-DB-04")
+    check("...and the count that could not be named is stated",
+          "could not be named" in t["entities"]["namesNote"], True)
+    check("...saying the names were not stored", "not stored" in t["entities"]["namesNote"], True)
+    blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
+    check("naming wrote nothing to the history file", "PROD-DB-04" in blob.split("privacyNote")[0], False)
 
-        # --- the salt survives a stacks switch ---------------------------------------------------
-        reg = {"active": "one", "stacks": {
-            "one": {"fqdn": "one.example", "api_token": "t1", "entity_salt": SALT_A},
-            "two": {"fqdn": "two.example", "api_token": "t2", "entity_salt": SALT_B}}}
-        real_cfg_path = m.CFG_PATH
-        m.CFG_PATH = os.path.join(tmp, "cfg.json")
-        try:
-            m.mirror_active_to_config(reg)
-            check("switching a stack carries its salt into config.json",
-                  json.load(open(m.CFG_PATH, encoding="utf-8-sig"))["entity_salt"], SALT_A)
-            reg["active"] = "two"
-            m.mirror_active_to_config(reg)
-            check("...and each stack keeps its own",
-                  json.load(open(m.CFG_PATH, encoding="utf-8-sig"))["entity_salt"], SALT_B)
-        finally:
-            m.CFG_PATH = real_cfg_path
-    finally:
-        (m.CFG_DIR, m.load_config, m.top_n, m._LABELS, m._FIELD_MAP, m.build_digest) = real
+    # --- the salt survives a stacks switch ---------------------------------------------------
+    reg = {"active": "one", "stacks": {
+        "one": {"fqdn": "one.example", "api_token": "t1", "entity_salt": SALT_A},
+        "two": {"fqdn": "two.example", "api_token": "t2", "entity_salt": SALT_B}}}
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "cfg.json"))
+    m.mirror_active_to_config(reg)
+    check("switching a stack carries its salt into config.json",
+          json.load(open(m.CFG_PATH, encoding="utf-8-sig"))["entity_salt"], SALT_A)
+    reg["active"] = "two"
+    m.mirror_active_to_config(reg)
+    check("...and each stack keeps its own",
+          json.load(open(m.CFG_PATH, encoding="utf-8-sig"))["entity_salt"], SALT_B)
 
 
 SKILL_MD = os.path.join(os.path.dirname(HERE), "SKILL.md")
@@ -4147,321 +3923,315 @@ def _skill_frontmatter():
     return out
 
 
-def test_alerts(m):
+def test_alerts(m, monkeypatch, tmp_path):
     """Alert rules (MVP, dormant). The three-verdict model is the entire point of this feature.
 
     A two-state alerting layer reports a rule it could not test as "clear", and alerting is the layer
     people stop watching precisely because it is supposed to watch for them. So the first assertion here
     is the one that matters: a run where nothing could be evaluated must NOT exit 0."""
-    print("[22] alert rules (offline)")
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.load_config, m.load_metrics)
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("s.example", "tok", None)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
     # Rules validate against the tracked metric list, so stub it rather than the whole metrics file.
-    m.load_metrics = lambda: [{"name": "kev-exposed", "table": "asset"},
-                              {"name": "kev-critical", "table": "asset"}]
+    monkeypatch.setattr(m, "load_metrics",
+                        lambda: [{"name": "kev-exposed", "table": "asset"},
+                                 {"name": "kev-critical", "table": "asset"}])
+    def mt(name, count=None, ok=True, error=None, label=None):
+        r = {"name": name, "ok": ok, "label": label or name}
+        if count is not None:
+            r["count"] = count
+        if error:
+            r["error"] = error
+        return r
+
+    RULE_COV = {"name": "conn", "condition": "coverage-regressed"}
+    RULE_KEV = {"name": "kev", "condition": "above", "metric": "kev-exposed", "value": 1500}
+
+    # --- THE load-bearing test -------------------------------------------------------------------
+    # One snapshot: no comparison is possible, so a coverage rule cannot be answered. If this ever
+    # returns exit 0, the feature is actively lying to a scheduler and everything else here is moot.
+    one = m.compute_trend([_snap("2026-08-05", metrics=[mt("kev-exposed", 1201)])])
+    v = m.evaluate_alerts(one, _snap("2026-08-05", metrics=[mt("kev-exposed", 1201)]), [RULE_COV])
+    check("a single snapshot cannot answer a coverage rule", len(v["unevaluable"]), 1)
+    check("...and it is NOT reported as clear", len(v["clear"]), 0)
+    check("...and the run does not exit 0", v["exitCode"] != 0, True)
+    check("...it exits with the unevaluable bit", v["exitCode"], m.ALERT_EXIT_UNEVALUABLE)
+    check("...saying the rule did not pass",
+          "did NOT pass" in v["unevaluable"][0]["note"], True)
+
+    # An empty rule set is the whole-run version of the same failure: nothing was checked, which is
+    # not an all-clear. It must not exit 0 and must not render a green headline.
+    v = m.evaluate_alerts(one, _snap("2026-08-05"), [])
+    check("no rules configured is not an all-clear", v.get("nothingChecked"), True)
+    check("...and does not exit 0", v["exitCode"] != 0, True)
+    check("...and the headline does not say all clear",
+          "all clear" in m.render_alerts(v).lower(), False)
+    check("...it says nothing was checked", "nothing checked" in m.render_alerts(v).lower(), True)
+
+    # --- coverage-regressed ----------------------------------------------------------------------
+    a = _snap("2026-08-05", failing=("intune",), metrics=[mt("kev-exposed", 1201)])
+    b = _snap("2026-08-12", failing=("intune", "checkpoint"), metrics=[mt("kev-exposed", 1198)])
+    t = m.compute_trend([a, b])
+    v = m.evaluate_alerts(t, b, [RULE_COV])
+    check("a connector entering the failing set fires", len(v["firing"]), 1)
+    check("...naming it", "checkpoint" in v["firing"][0]["failingAdded"], True)
+    check("...and exits with the firing bit", v["exitCode"], m.ALERT_EXIT_FIRING)
+    check("...and says what it means for the answers",
+          "stale" in v["firing"][0]["message"], True)
+    # A connector RESOLVING is not a regression.
+    t2 = m.compute_trend([b, _snap("2026-08-19", failing=("intune",),
+                                   metrics=[mt("kev-exposed", 1150)])])
+    v = m.evaluate_alerts(t2, _snap("2026-08-19", metrics=[mt("kev-exposed", 1150)]), [RULE_COV])
+    check("a connector recovering does not fire", len(v["firing"]), 0)
+    check("...and is genuinely clear, not unevaluable", len(v["clear"]), 1)
+    # degraded is opt-in, because connector churn is normal on a real stack.
+    c = _snap("2026-08-12", failing=("intune",), degraded=("tenable", "okta"),
+              metrics=[mt("kev-exposed", 1198)])
+    t3 = m.compute_trend([a, c])
+    check("a new DEGRADED connector does not fire by default",
+          len(m.evaluate_alerts(t3, c, [RULE_COV])["firing"]), 0)
+    check("...but does with includeDegraded",
+          len(m.evaluate_alerts(t3, c, [dict(RULE_COV, includeDegraded=True)])["firing"]), 1)
+    # --- the degraded picture rides on EVERY coverage-regressed row ------------------------------
+    # Found by replaying this verb day-by-day over real snapshot history: 55 connectors entered the
+    # degraded set in one window and the row said "no connector entered the failing set ... and none
+    # are failing now". The verdict was right; the row read as an all-clear while a third of the
+    # fleet had just degraded. Informational only -- these assertions check the verdict does NOT move.
+    many = tuple("conn%02d" % i for i in range(8))
+    d0 = _snap("2026-08-05", failing=("intune",), degraded=(), metrics=[mt("kev-exposed", 1201)])
+    d1 = _snap("2026-08-06", failing=("intune",), degraded=many, metrics=[mt("kev-exposed", 1198)])
+    td = m.compute_trend([d0, d1])
+    v = m.evaluate_alerts(td, d1, [RULE_COV])
+    check("a fleet-wide degrade does not change the verdict", len(v["clear"]), 1)
+    check("...and still does not fire", len(v["firing"]), 0)
+    row = v["clear"][0]
+    check("...but the row names what entered the degraded set",
+          row.get("degradedEntered"), sorted(many))
+    check("...and carries the standing degraded count", row.get("stillDegradedCount"), len(many))
+    check("...and says so in the message", "DEGRADED" in row["message"], True)
+    check("...saying it did not affect the verdict",
+          "did not affect the verdict" in row["message"], True)
+    # The remainder is DISCLOSED, never silently dropped -- a shortened list that does not say it is
+    # shortened misstates the size of the event.
+    check("...capping the names with the remainder stated", "and 3 more" in row["message"], True)
+
+    # A rule that opted in already carries `degradedAdded` as the evidence that FIRED it; the same
+    # names must not appear twice under two keys meaning two different things.
+    v = m.evaluate_alerts(td, d1, [dict(RULE_COV, includeDegraded=True)])
+    check("includeDegraded fires on the same movement", len(v["firing"]), 1)
+    check("...without duplicating the names", v["firing"][0].get("degradedEntered"), None)
+    check("...and the firing row carries the standing count too",
+          v["firing"][0].get("stillDegradedCount"), len(many))
+
+    # Connectors LEAVING the degraded set is reported as well -- the mirror window of a flap.
+    td2 = m.compute_trend([d1, _snap("2026-08-07", failing=("intune",), degraded=(),
+                                     metrics=[mt("kev-exposed", 1195)])])
+    row = m.evaluate_alerts(td2, _snap("2026-08-07", failing=("intune",), degraded=()),
+                            [RULE_COV])["clear"][0]
+    check("connectors leaving the degraded set are reported",
+          row.get("degradedLeft"), sorted(many))
+
+    # ...and an UNRECORDED degraded set is unknown, never zero. A snapshot that carries no degraded
+    # figures is not saying none are degraded, and "0 degraded in total" would be the reassuring
+    # wrong answer this whole verb exists to refuse.
+    blind = _snap("2026-08-06", failing=("intune",), degraded=())
+    blind["coverage"].pop("degraded")
+    blind["coverage"].pop("degradedNames")
+    row = m.evaluate_alerts(m.compute_trend([d0, blind]), blind, [RULE_COV])["clear"][0]
+    check("an unrecorded degraded set is flagged unknown", row.get("stillDegradedUnknown"), True)
+    check("...and is never reported as zero", row.get("stillDegradedCount"), None)
+    check("...and the message refuses to claim none are degraded",
+          "not a statement that none are degraded" in row["message"], True)
+
+    # Unreadable coverage blocks the trend entirely, so the rule is unevaluable -- not clear.
+    t4 = m.compute_trend([_snap("2026-08-05", coverage=False), b])
+    v = m.evaluate_alerts(t4, b, [RULE_COV])
+    check("unreadable coverage makes the rule unevaluable", len(v["unevaluable"]), 1)
+    check("...never clear", len(v["clear"]), 0)
+
+    # --- the window: day-over-day by default -----------------------------------------------------
+    # The trend layer compares EARLIEST to latest. As an alert window that means a baseline receding
+    # a day further into the past on every run, so a one-off regression fires forever and the rule
+    # stops describing now.
+    ds = ["2026-08-05", "2026-08-06", "2026-08-12", "2026-08-13"]
+    # `since` is the SECOND-to-last date, not the last: compute_trend selects dates at or after it, so
+    # the window has to open on the earlier of the two endpoints to contain both.
+    check("daily window opens on the second-to-last date", m.alert_window_since(ds), "2026-08-12")
+    check("full window compares from the beginning", m.alert_window_since(ds, "full"), None)
+    check("an explicit --since overrides the default",
+          m.alert_window_since(ds, "daily", "2026-08-06"), "2026-08-06")
+    check("...and overrides full too", m.alert_window_since(ds, "full", "2026-08-06"), "2026-08-06")
+    check("one date cannot form a daily window", m.alert_window_since(["2026-08-05"]), None)
+    check("no dates at all is not an error", m.alert_window_since([]), None)
+
+    # The window's real span is stated, because "the last two snapshots" is day-over-day only if a
+    # snapshot was taken both days. A weekend asleep makes the same two records three days apart, and
+    # a 3-day movement read as a 1-day one is quiet wrongness.
+    far = _snap("2026-08-12", failing=("intune",), metrics=[mt("kev-exposed", 1198)])
+    v = m.evaluate_alerts(m.compute_trend([_snap("2026-08-05", failing=("intune",),
+                                                 metrics=[mt("kev-exposed", 1201)]), far]),
+                          far, [RULE_KEV])
+    check("a non-consecutive window reports its true span", v["window"]["days"], 7)
+    check("...and flags that it is not consecutive", v["window"]["consecutive"], False)
+    check("...saying no snapshot was taken between", "no snapshot" in v["window"]["note"], True)
+    check("...and the rendered header names the gap",
+          "7 days — no snapshot in between" in m.render_alerts(v), True)
+    adj = _snap("2026-08-06", failing=("intune",), metrics=[mt("kev-exposed", 1198)])
+    v = m.evaluate_alerts(m.compute_trend([_snap("2026-08-05", failing=("intune",),
+                                                metrics=[mt("kev-exposed", 1201)]), adj]),
+                          adj, [RULE_KEV])
+    check("a genuine day-over-day window says so", v["window"]["days"], 1)
+    check("...and is not flagged as a gap", "consecutive" in v["window"], False)
+    check("...rendering as day over day", "(day over day)" in m.render_alerts(v), True)
+    # A multi-date window must NOT claim "no snapshot in between" -- there are intermediate ones.
+    wide = m.compute_trend([_snap("2026-08-05", failing=("intune",), metrics=[mt("kev-exposed", 1201)]),
+                            _snap("2026-08-08", failing=("intune",), metrics=[mt("kev-exposed", 1200)]),
+                            far])
+    v = m.evaluate_alerts(wide, far, [RULE_KEV])
+    check("a multi-snapshot window does not claim nothing is in between",
+          v["window"].get("consecutive"), None)
+    check("...and renders the snapshot count instead",
+          "3 snapshots" in m.render_alerts(v), True)
+
+    # --- `clear` must never be readable as "healthy" ---------------------------------------------
+    # Day-over-day makes this load-bearing: a connector failing for a fortnight produces NO CHANGE, so
+    # the rule is legitimately clear. If clear were reported bare, "nothing failed since yesterday"
+    # would read as "no connectors are failing" -- the same reassuring wrong answer, relocated from
+    # the unevaluable case to the clear one.
+    s1 = _snap("2026-08-12", failing=("intune", "checkpoint"), metrics=[mt("kev-exposed", 1198)])
+    s2 = _snap("2026-08-13", failing=("intune", "checkpoint"), metrics=[mt("kev-exposed", 1197)])
+    v = m.evaluate_alerts(m.compute_trend([s1, s2]), s2, [RULE_COV])
+    check("a long-standing failure produces no change", len(v["firing"]), 0)
+    check("...so the rule is clear", len(v["clear"]), 1)
+    check("...but clear carries the standing failures",
+          v["clear"][0]["stillFailing"], ["checkpoint", "intune"])
+    check("...and says STILL failing in words",
+          "STILL" in v["clear"][0]["message"], True)
+    check("...naming them", "checkpoint" in v["clear"][0]["message"], True)
+    check("...and explaining the rule watches for change",
+          "watches for change" in v["clear"][0]["message"], True)
+    check("...so the rendered row cannot be read as healthy",
+          "STILL" in m.render_alerts(v), True)
+    # Genuinely nothing failing -- the only case allowed to say so.
+    h1 = _snap("2026-08-12", failing=(), metrics=[mt("kev-exposed", 1198)])
+    h2 = _snap("2026-08-13", failing=(), metrics=[mt("kev-exposed", 1197)])
+    v = m.evaluate_alerts(m.compute_trend([h1, h2]), h2, [RULE_COV])
+    check("with nothing failing, clear may say so",
+          "none are failing now" in v["clear"][0]["message"], True)
+    check("...and lists no standing failures", v["clear"][0]["stillFailing"], [])
+    # A firing verdict carries the standing total too: "1 newly failed" and "9 failing" are different
+    # facts and the second is the one that sizes the problem.
+    s3 = _snap("2026-08-13", failing=("intune", "checkpoint", "okta"),
+               metrics=[mt("kev-exposed", 1197)])
+    v = m.evaluate_alerts(m.compute_trend([s1, s3]), s3, [RULE_COV])
+    check("a firing verdict states the standing total too",
+          "3 connectors are failing in total" in v["firing"][0]["message"], True)
+    # If the standing count is unreadable, clear must not assert that none are failing.
+    v = m.evaluate_alerts(m.compute_trend([h1, h2]), {"stackDate": "2026-08-13"}, [RULE_COV])
+    # Check the AFFIRMATIVE phrasing, not the bare substring: "none are failing" also occurs inside
+    # the disclaimer ("...not a statement that none are failing"), so matching it alone proves nothing.
+    check("an unreadable standing count is not reported as none failing",
+          "and none are failing now" in v["clear"][0]["message"], False)
+    check("...saying so explicitly", "not a statement" in v["clear"][0]["message"], True)
+
+    # --- above / below ---------------------------------------------------------------------------
+    # These read the LATEST snapshot, so they answer from the first snapshot on -- history is only
+    # needed for comparisons. Making a known present value unevaluable would be wrong.
+    v = m.evaluate_alerts(one, _snap("2026-08-05", metrics=[mt("kev-exposed", 1600)]), [RULE_KEV])
+    check("an absolute threshold works with only one snapshot", len(v["firing"]), 1)
+    check("...reporting the observed value", v["firing"][0]["observed"], 1600)
+    v = m.evaluate_alerts(t, b, [RULE_KEV])
+    check("under the threshold is clear", len(v["clear"]), 1)
+    check("...and a clear row still carries a message", bool(v["clear"][0].get("message")), True)
+    check("below fires when under",
+          len(m.evaluate_alerts(t, b, [{"name": "floor", "condition": "below",
+                                        "metric": "kev-exposed", "value": 1500}])["firing"]), 1)
+
+    # A metric that stopped resolving is UNKNOWN, never 0. A zero would clear an `above` rule and
+    # fire a `below` one -- both confidently wrong, and the `above` case reads as good news.
+    broke = _snap("2026-08-12", metrics=[mt("kev-exposed", ok=False, error="HTTP 403")])
+    v = m.evaluate_alerts(m.compute_trend([a, broke]), broke, [RULE_KEV])
+    check("a metric that stopped resolving is unevaluable", len(v["unevaluable"]), 1)
+    check("...not treated as zero", len(v["clear"]) + len(v["firing"]), 0)
+    check("...and the reason names it as unknown rather than zero",
+          "unknown rather than zero" in v["unevaluable"][0]["reason"], True)
+    v = m.evaluate_alerts(m.compute_trend([a, broke]), broke,
+                          [{"name": "floor", "condition": "below",
+                            "metric": "kev-exposed", "value": 1500}])
+    check("...and a `below` rule does not fire on the same absence", len(v["firing"]), 0)
+
+    # A metric never captured at all is unevaluable, for the same reason: no backfill exists.
+    nom = _snap("2026-08-12", metrics=[mt("kev-exposed", 1198)])
+    v = m.evaluate_alerts(m.compute_trend([a, nom]), nom,
+                         [{"name": "crit", "condition": "above",
+                           "metric": "kev-critical", "value": 25}])
+    check("a metric absent from the snapshot is unevaluable", len(v["unevaluable"]), 1)
+    check("...and says there is no backfill",
+          "backfill" in v["unevaluable"][0]["reason"], True)
+
+    # --- exit-code matrix ------------------------------------------------------------------------
+    both = m.evaluate_alerts(m.compute_trend([a, b]), broke, [RULE_COV, RULE_KEV])
+    check("firing + unevaluable ORs both bits", both["exitCode"],
+          m.ALERT_EXIT_FIRING | m.ALERT_EXIT_UNEVALUABLE)
+    check("...which is 12, distinct from die()'s 1 and 2", both["exitCode"], 12)
+    allclear = m.evaluate_alerts(m.compute_trend([b, _snap("2026-08-19", failing=("intune",),
+                                                          metrics=[mt("kev-exposed", 1100)])]),
+                                _snap("2026-08-19", metrics=[mt("kev-exposed", 1100)]),
+                                [RULE_COV, RULE_KEV])
+    check("everything evaluated and nothing firing exits 0", allclear["exitCode"], 0)
+    check("...and only then does the headline say all clear",
+          "all clear" in m.render_alerts(allclear).lower(), True)
+
+    # --- rule validation ------------------------------------------------------------------------
+    check("a rule on an untracked metric is refused at add time",
+          m.add_alert("x", "above", metric="nope", value=1)[1] is not None, True)
+    check("...explaining it could never fire",
+          "never fire" in (m.add_alert("x", "above", metric="nope", value=1)[1] or ""), True)
+    check("above with no threshold is refused",
+          m.add_alert("x", "above", metric="kev-exposed")[1] is not None, True)
+    check("an unknown condition is refused",
+          m.add_alert("x", "sideways", metric="kev-exposed", value=1)[1] is not None, True)
+    rec, problem = m.add_alert("conn", "coverage-regressed")
+    check("a valid rule saves", (problem, rec["condition"]), (None, "coverage-regressed"))
+    check("...and round-trips through the file", [r["name"] for r in m.load_alerts()], ["conn"])
+    # A rule stored against a metric that is later deleted must report, not silently never fire.
+    m.save_alerts([{"name": "orphan", "condition": "above", "metric": "deleted-metric", "value": 5}])
+    v = m.evaluate_alerts(m.compute_trend([a, b]), b, m.load_alerts())
+    check("a rule orphaned by a deleted metric is unevaluable", len(v["unevaluable"]), 1)
+    check("...never clear", len(v["clear"]), 0)
+
+    # An unreadable rules file is NOT "no rules configured" -- the operator would go define rules
+    # that already exist while the real fault went unmentioned.
+    with open(m._alerts_path(), "w", encoding="utf-8") as f:
+        f.write("{ this is not json")
+    raised = ""
     try:
-        def mt(name, count=None, ok=True, error=None, label=None):
-            r = {"name": name, "ok": ok, "label": label or name}
-            if count is not None:
-                r["count"] = count
-            if error:
-                r["error"] = error
-            return r
+        m.load_alerts()
+    except RuntimeError as e:
+        raised = str(e)
+    check("a corrupt rules file raises rather than reporting zero rules", bool(raised), True)
+    check("...saying no rule was evaluated", "No rule was evaluated" in raised, True)
+    os.remove(m._alerts_path())
+    check("...while a genuinely absent file is simply no rules", m.load_alerts(), [])
 
-        RULE_COV = {"name": "conn", "condition": "coverage-regressed"}
-        RULE_KEV = {"name": "kev", "condition": "above", "metric": "kev-exposed", "value": 1500}
-
-        # --- THE load-bearing test -------------------------------------------------------------------
-        # One snapshot: no comparison is possible, so a coverage rule cannot be answered. If this ever
-        # returns exit 0, the feature is actively lying to a scheduler and everything else here is moot.
-        one = m.compute_trend([_snap("2026-08-05", metrics=[mt("kev-exposed", 1201)])])
-        v = m.evaluate_alerts(one, _snap("2026-08-05", metrics=[mt("kev-exposed", 1201)]), [RULE_COV])
-        check("a single snapshot cannot answer a coverage rule", len(v["unevaluable"]), 1)
-        check("...and it is NOT reported as clear", len(v["clear"]), 0)
-        check("...and the run does not exit 0", v["exitCode"] != 0, True)
-        check("...it exits with the unevaluable bit", v["exitCode"], m.ALERT_EXIT_UNEVALUABLE)
-        check("...saying the rule did not pass",
-              "did NOT pass" in v["unevaluable"][0]["note"], True)
-
-        # An empty rule set is the whole-run version of the same failure: nothing was checked, which is
-        # not an all-clear. It must not exit 0 and must not render a green headline.
-        v = m.evaluate_alerts(one, _snap("2026-08-05"), [])
-        check("no rules configured is not an all-clear", v.get("nothingChecked"), True)
-        check("...and does not exit 0", v["exitCode"] != 0, True)
-        check("...and the headline does not say all clear",
-              "all clear" in m.render_alerts(v).lower(), False)
-        check("...it says nothing was checked", "nothing checked" in m.render_alerts(v).lower(), True)
-
-        # --- coverage-regressed ----------------------------------------------------------------------
-        a = _snap("2026-08-05", failing=("intune",), metrics=[mt("kev-exposed", 1201)])
-        b = _snap("2026-08-12", failing=("intune", "checkpoint"), metrics=[mt("kev-exposed", 1198)])
-        t = m.compute_trend([a, b])
-        v = m.evaluate_alerts(t, b, [RULE_COV])
-        check("a connector entering the failing set fires", len(v["firing"]), 1)
-        check("...naming it", "checkpoint" in v["firing"][0]["failingAdded"], True)
-        check("...and exits with the firing bit", v["exitCode"], m.ALERT_EXIT_FIRING)
-        check("...and says what it means for the answers",
-              "stale" in v["firing"][0]["message"], True)
-        # A connector RESOLVING is not a regression.
-        t2 = m.compute_trend([b, _snap("2026-08-19", failing=("intune",),
-                                       metrics=[mt("kev-exposed", 1150)])])
-        v = m.evaluate_alerts(t2, _snap("2026-08-19", metrics=[mt("kev-exposed", 1150)]), [RULE_COV])
-        check("a connector recovering does not fire", len(v["firing"]), 0)
-        check("...and is genuinely clear, not unevaluable", len(v["clear"]), 1)
-        # degraded is opt-in, because connector churn is normal on a real stack.
-        c = _snap("2026-08-12", failing=("intune",), degraded=("tenable", "okta"),
-                  metrics=[mt("kev-exposed", 1198)])
-        t3 = m.compute_trend([a, c])
-        check("a new DEGRADED connector does not fire by default",
-              len(m.evaluate_alerts(t3, c, [RULE_COV])["firing"]), 0)
-        check("...but does with includeDegraded",
-              len(m.evaluate_alerts(t3, c, [dict(RULE_COV, includeDegraded=True)])["firing"]), 1)
-        # --- the degraded picture rides on EVERY coverage-regressed row ------------------------------
-        # Found by replaying this verb day-by-day over real snapshot history: 55 connectors entered the
-        # degraded set in one window and the row said "no connector entered the failing set ... and none
-        # are failing now". The verdict was right; the row read as an all-clear while a third of the
-        # fleet had just degraded. Informational only -- these assertions check the verdict does NOT move.
-        many = tuple("conn%02d" % i for i in range(8))
-        d0 = _snap("2026-08-05", failing=("intune",), degraded=(), metrics=[mt("kev-exposed", 1201)])
-        d1 = _snap("2026-08-06", failing=("intune",), degraded=many, metrics=[mt("kev-exposed", 1198)])
-        td = m.compute_trend([d0, d1])
-        v = m.evaluate_alerts(td, d1, [RULE_COV])
-        check("a fleet-wide degrade does not change the verdict", len(v["clear"]), 1)
-        check("...and still does not fire", len(v["firing"]), 0)
-        row = v["clear"][0]
-        check("...but the row names what entered the degraded set",
-              row.get("degradedEntered"), sorted(many))
-        check("...and carries the standing degraded count", row.get("stillDegradedCount"), len(many))
-        check("...and says so in the message", "DEGRADED" in row["message"], True)
-        check("...saying it did not affect the verdict",
-              "did not affect the verdict" in row["message"], True)
-        # The remainder is DISCLOSED, never silently dropped -- a shortened list that does not say it is
-        # shortened misstates the size of the event.
-        check("...capping the names with the remainder stated", "and 3 more" in row["message"], True)
-
-        # A rule that opted in already carries `degradedAdded` as the evidence that FIRED it; the same
-        # names must not appear twice under two keys meaning two different things.
-        v = m.evaluate_alerts(td, d1, [dict(RULE_COV, includeDegraded=True)])
-        check("includeDegraded fires on the same movement", len(v["firing"]), 1)
-        check("...without duplicating the names", v["firing"][0].get("degradedEntered"), None)
-        check("...and the firing row carries the standing count too",
-              v["firing"][0].get("stillDegradedCount"), len(many))
-
-        # Connectors LEAVING the degraded set is reported as well -- the mirror window of a flap.
-        td2 = m.compute_trend([d1, _snap("2026-08-07", failing=("intune",), degraded=(),
-                                         metrics=[mt("kev-exposed", 1195)])])
-        row = m.evaluate_alerts(td2, _snap("2026-08-07", failing=("intune",), degraded=()),
-                                [RULE_COV])["clear"][0]
-        check("connectors leaving the degraded set are reported",
-              row.get("degradedLeft"), sorted(many))
-
-        # ...and an UNRECORDED degraded set is unknown, never zero. A snapshot that carries no degraded
-        # figures is not saying none are degraded, and "0 degraded in total" would be the reassuring
-        # wrong answer this whole verb exists to refuse.
-        blind = _snap("2026-08-06", failing=("intune",), degraded=())
-        blind["coverage"].pop("degraded")
-        blind["coverage"].pop("degradedNames")
-        row = m.evaluate_alerts(m.compute_trend([d0, blind]), blind, [RULE_COV])["clear"][0]
-        check("an unrecorded degraded set is flagged unknown", row.get("stillDegradedUnknown"), True)
-        check("...and is never reported as zero", row.get("stillDegradedCount"), None)
-        check("...and the message refuses to claim none are degraded",
-              "not a statement that none are degraded" in row["message"], True)
-
-        # Unreadable coverage blocks the trend entirely, so the rule is unevaluable -- not clear.
-        t4 = m.compute_trend([_snap("2026-08-05", coverage=False), b])
-        v = m.evaluate_alerts(t4, b, [RULE_COV])
-        check("unreadable coverage makes the rule unevaluable", len(v["unevaluable"]), 1)
-        check("...never clear", len(v["clear"]), 0)
-
-        # --- the window: day-over-day by default -----------------------------------------------------
-        # The trend layer compares EARLIEST to latest. As an alert window that means a baseline receding
-        # a day further into the past on every run, so a one-off regression fires forever and the rule
-        # stops describing now.
-        ds = ["2026-08-05", "2026-08-06", "2026-08-12", "2026-08-13"]
-        # `since` is the SECOND-to-last date, not the last: compute_trend selects dates at or after it, so
-        # the window has to open on the earlier of the two endpoints to contain both.
-        check("daily window opens on the second-to-last date", m.alert_window_since(ds), "2026-08-12")
-        check("full window compares from the beginning", m.alert_window_since(ds, "full"), None)
-        check("an explicit --since overrides the default",
-              m.alert_window_since(ds, "daily", "2026-08-06"), "2026-08-06")
-        check("...and overrides full too", m.alert_window_since(ds, "full", "2026-08-06"), "2026-08-06")
-        check("one date cannot form a daily window", m.alert_window_since(["2026-08-05"]), None)
-        check("no dates at all is not an error", m.alert_window_since([]), None)
-
-        # The window's real span is stated, because "the last two snapshots" is day-over-day only if a
-        # snapshot was taken both days. A weekend asleep makes the same two records three days apart, and
-        # a 3-day movement read as a 1-day one is quiet wrongness.
-        far = _snap("2026-08-12", failing=("intune",), metrics=[mt("kev-exposed", 1198)])
-        v = m.evaluate_alerts(m.compute_trend([_snap("2026-08-05", failing=("intune",),
-                                                     metrics=[mt("kev-exposed", 1201)]), far]),
-                              far, [RULE_KEV])
-        check("a non-consecutive window reports its true span", v["window"]["days"], 7)
-        check("...and flags that it is not consecutive", v["window"]["consecutive"], False)
-        check("...saying no snapshot was taken between", "no snapshot" in v["window"]["note"], True)
-        check("...and the rendered header names the gap",
-              "7 days — no snapshot in between" in m.render_alerts(v), True)
-        adj = _snap("2026-08-06", failing=("intune",), metrics=[mt("kev-exposed", 1198)])
-        v = m.evaluate_alerts(m.compute_trend([_snap("2026-08-05", failing=("intune",),
-                                                    metrics=[mt("kev-exposed", 1201)]), adj]),
-                              adj, [RULE_KEV])
-        check("a genuine day-over-day window says so", v["window"]["days"], 1)
-        check("...and is not flagged as a gap", "consecutive" in v["window"], False)
-        check("...rendering as day over day", "(day over day)" in m.render_alerts(v), True)
-        # A multi-date window must NOT claim "no snapshot in between" -- there are intermediate ones.
-        wide = m.compute_trend([_snap("2026-08-05", failing=("intune",), metrics=[mt("kev-exposed", 1201)]),
-                                _snap("2026-08-08", failing=("intune",), metrics=[mt("kev-exposed", 1200)]),
-                                far])
-        v = m.evaluate_alerts(wide, far, [RULE_KEV])
-        check("a multi-snapshot window does not claim nothing is in between",
-              v["window"].get("consecutive"), None)
-        check("...and renders the snapshot count instead",
-              "3 snapshots" in m.render_alerts(v), True)
-
-        # --- `clear` must never be readable as "healthy" ---------------------------------------------
-        # Day-over-day makes this load-bearing: a connector failing for a fortnight produces NO CHANGE, so
-        # the rule is legitimately clear. If clear were reported bare, "nothing failed since yesterday"
-        # would read as "no connectors are failing" -- the same reassuring wrong answer, relocated from
-        # the unevaluable case to the clear one.
-        s1 = _snap("2026-08-12", failing=("intune", "checkpoint"), metrics=[mt("kev-exposed", 1198)])
-        s2 = _snap("2026-08-13", failing=("intune", "checkpoint"), metrics=[mt("kev-exposed", 1197)])
-        v = m.evaluate_alerts(m.compute_trend([s1, s2]), s2, [RULE_COV])
-        check("a long-standing failure produces no change", len(v["firing"]), 0)
-        check("...so the rule is clear", len(v["clear"]), 1)
-        check("...but clear carries the standing failures",
-              v["clear"][0]["stillFailing"], ["checkpoint", "intune"])
-        check("...and says STILL failing in words",
-              "STILL" in v["clear"][0]["message"], True)
-        check("...naming them", "checkpoint" in v["clear"][0]["message"], True)
-        check("...and explaining the rule watches for change",
-              "watches for change" in v["clear"][0]["message"], True)
-        check("...so the rendered row cannot be read as healthy",
-              "STILL" in m.render_alerts(v), True)
-        # Genuinely nothing failing -- the only case allowed to say so.
-        h1 = _snap("2026-08-12", failing=(), metrics=[mt("kev-exposed", 1198)])
-        h2 = _snap("2026-08-13", failing=(), metrics=[mt("kev-exposed", 1197)])
-        v = m.evaluate_alerts(m.compute_trend([h1, h2]), h2, [RULE_COV])
-        check("with nothing failing, clear may say so",
-              "none are failing now" in v["clear"][0]["message"], True)
-        check("...and lists no standing failures", v["clear"][0]["stillFailing"], [])
-        # A firing verdict carries the standing total too: "1 newly failed" and "9 failing" are different
-        # facts and the second is the one that sizes the problem.
-        s3 = _snap("2026-08-13", failing=("intune", "checkpoint", "okta"),
-                   metrics=[mt("kev-exposed", 1197)])
-        v = m.evaluate_alerts(m.compute_trend([s1, s3]), s3, [RULE_COV])
-        check("a firing verdict states the standing total too",
-              "3 connectors are failing in total" in v["firing"][0]["message"], True)
-        # If the standing count is unreadable, clear must not assert that none are failing.
-        v = m.evaluate_alerts(m.compute_trend([h1, h2]), {"stackDate": "2026-08-13"}, [RULE_COV])
-        # Check the AFFIRMATIVE phrasing, not the bare substring: "none are failing" also occurs inside
-        # the disclaimer ("...not a statement that none are failing"), so matching it alone proves nothing.
-        check("an unreadable standing count is not reported as none failing",
-              "and none are failing now" in v["clear"][0]["message"], False)
-        check("...saying so explicitly", "not a statement" in v["clear"][0]["message"], True)
-
-        # --- above / below ---------------------------------------------------------------------------
-        # These read the LATEST snapshot, so they answer from the first snapshot on -- history is only
-        # needed for comparisons. Making a known present value unevaluable would be wrong.
-        v = m.evaluate_alerts(one, _snap("2026-08-05", metrics=[mt("kev-exposed", 1600)]), [RULE_KEV])
-        check("an absolute threshold works with only one snapshot", len(v["firing"]), 1)
-        check("...reporting the observed value", v["firing"][0]["observed"], 1600)
-        v = m.evaluate_alerts(t, b, [RULE_KEV])
-        check("under the threshold is clear", len(v["clear"]), 1)
-        check("...and a clear row still carries a message", bool(v["clear"][0].get("message")), True)
-        check("below fires when under",
-              len(m.evaluate_alerts(t, b, [{"name": "floor", "condition": "below",
-                                            "metric": "kev-exposed", "value": 1500}])["firing"]), 1)
-
-        # A metric that stopped resolving is UNKNOWN, never 0. A zero would clear an `above` rule and
-        # fire a `below` one -- both confidently wrong, and the `above` case reads as good news.
-        broke = _snap("2026-08-12", metrics=[mt("kev-exposed", ok=False, error="HTTP 403")])
-        v = m.evaluate_alerts(m.compute_trend([a, broke]), broke, [RULE_KEV])
-        check("a metric that stopped resolving is unevaluable", len(v["unevaluable"]), 1)
-        check("...not treated as zero", len(v["clear"]) + len(v["firing"]), 0)
-        check("...and the reason names it as unknown rather than zero",
-              "unknown rather than zero" in v["unevaluable"][0]["reason"], True)
-        v = m.evaluate_alerts(m.compute_trend([a, broke]), broke,
-                              [{"name": "floor", "condition": "below",
-                                "metric": "kev-exposed", "value": 1500}])
-        check("...and a `below` rule does not fire on the same absence", len(v["firing"]), 0)
-
-        # A metric never captured at all is unevaluable, for the same reason: no backfill exists.
-        nom = _snap("2026-08-12", metrics=[mt("kev-exposed", 1198)])
-        v = m.evaluate_alerts(m.compute_trend([a, nom]), nom,
-                             [{"name": "crit", "condition": "above",
-                               "metric": "kev-critical", "value": 25}])
-        check("a metric absent from the snapshot is unevaluable", len(v["unevaluable"]), 1)
-        check("...and says there is no backfill",
-              "backfill" in v["unevaluable"][0]["reason"], True)
-
-        # --- exit-code matrix ------------------------------------------------------------------------
-        both = m.evaluate_alerts(m.compute_trend([a, b]), broke, [RULE_COV, RULE_KEV])
-        check("firing + unevaluable ORs both bits", both["exitCode"],
-              m.ALERT_EXIT_FIRING | m.ALERT_EXIT_UNEVALUABLE)
-        check("...which is 12, distinct from die()'s 1 and 2", both["exitCode"], 12)
-        allclear = m.evaluate_alerts(m.compute_trend([b, _snap("2026-08-19", failing=("intune",),
-                                                              metrics=[mt("kev-exposed", 1100)])]),
-                                    _snap("2026-08-19", metrics=[mt("kev-exposed", 1100)]),
-                                    [RULE_COV, RULE_KEV])
-        check("everything evaluated and nothing firing exits 0", allclear["exitCode"], 0)
-        check("...and only then does the headline say all clear",
-              "all clear" in m.render_alerts(allclear).lower(), True)
-
-        # --- rule validation ------------------------------------------------------------------------
-        check("a rule on an untracked metric is refused at add time",
-              m.add_alert("x", "above", metric="nope", value=1)[1] is not None, True)
-        check("...explaining it could never fire",
-              "never fire" in (m.add_alert("x", "above", metric="nope", value=1)[1] or ""), True)
-        check("above with no threshold is refused",
-              m.add_alert("x", "above", metric="kev-exposed")[1] is not None, True)
-        check("an unknown condition is refused",
-              m.add_alert("x", "sideways", metric="kev-exposed", value=1)[1] is not None, True)
-        rec, problem = m.add_alert("conn", "coverage-regressed")
-        check("a valid rule saves", (problem, rec["condition"]), (None, "coverage-regressed"))
-        check("...and round-trips through the file", [r["name"] for r in m.load_alerts()], ["conn"])
-        # A rule stored against a metric that is later deleted must report, not silently never fire.
-        m.save_alerts([{"name": "orphan", "condition": "above", "metric": "deleted-metric", "value": 5}])
-        v = m.evaluate_alerts(m.compute_trend([a, b]), b, m.load_alerts())
-        check("a rule orphaned by a deleted metric is unevaluable", len(v["unevaluable"]), 1)
-        check("...never clear", len(v["clear"]), 0)
-
-        # An unreadable rules file is NOT "no rules configured" -- the operator would go define rules
-        # that already exist while the real fault went unmentioned.
-        with open(m._alerts_path(), "w", encoding="utf-8") as f:
-            f.write("{ this is not json")
-        raised = ""
-        try:
-            m.load_alerts()
-        except RuntimeError as e:
-            raised = str(e)
-        check("a corrupt rules file raises rather than reporting zero rules", bool(raised), True)
-        check("...saying no rule was evaluated", "No rule was evaluated" in raised, True)
-        os.remove(m._alerts_path())
-        check("...while a genuinely absent file is simply no rules", m.load_alerts(), [])
-
-        # `alerts eval` (everything above this point) must never touch the state file -- only
-        # `alerts notify` (below) reads and writes it, so evaluation semantics can't be changed by
-        # whether delivery happens to be configured.
-        check("the alert state file path is reserved",
-              m._alertstate_path().endswith("alertstate.s.example.json"), True)
-        check("...and `eval` alone does not write it", os.path.exists(m._alertstate_path()), False)
-    finally:
-        (m.CFG_DIR, m.load_config, m.load_metrics) = real
+    # `alerts eval` (everything above this point) must never touch the state file -- only
+    # `alerts notify` (below) reads and writes it, so evaluation semantics can't be changed by
+    # whether delivery happens to be configured.
+    check("the alert state file path is reserved",
+          m._alertstate_path().endswith("alertstate.s.example.json"), True)
+    check("...and `eval` alone does not write it", os.path.exists(m._alertstate_path()), False)
 
 
-def test_alerts_notify(m):
+def test_alerts_notify(m, monkeypatch, tmp_path):
     """Alert delivery (Slack/Teams/email), still dormant/CLI-only.
 
     The load-bearing property here is the same shape as the MVP's: on-change delivery must not become
     suppression. `render_alerts_*` always lists every current rule; `update_alertstate` only decides
     whether that message is worth sending. And the transport calls must stay structurally independent
     of `call()` -- no Authorization header, no Meridian token anywhere near a third-party webhook."""
-    print("[23] alert delivery: Slack/Teams/email (offline)")
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.load_config)
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("s.example", "tok", None)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
 
     def mkv(firing=(), clear=(), unevaluable=(), stack_date="2026-08-19"):
         return {"summary": {"rules": len(firing) + len(clear) + len(unevaluable),
@@ -4472,249 +4242,223 @@ def test_alerts_notify(m):
                "exitCode": (4 if firing else 0) | (8 if unevaluable else 0),
                "stack": "s.example", "stackDate": stack_date}
 
+    # --- change detection -----------------------------------------------------------------------
+    v1 = mkv(firing=["kev"], clear=["conn"])
+    state1, changes1 = m.update_alertstate(None, v1, "2026-08-17")
+    check("a first-ever run treats every current rule as a change", len(changes1), 2)
+    check("...recording where each came from", {c["from"] for c in changes1}, {None})
+    check("...and where each landed",
+          {c["rule"]: c["to"] for c in changes1}, {"kev": "firing", "conn": "clear"})
+    check("...and the state records both rules' verdicts",
+          {n: r["lastVerdict"] for n, r in state1["rules"].items()}, {"kev": "firing", "conn": "clear"})
+
+    # Same verdicts again: no change.
+    v2 = mkv(firing=["kev"], clear=["conn"])
+    state2, changes2 = m.update_alertstate(state1, v2, "2026-08-18")
+    check("an unchanged verdict is not a change", changes2, [])
+    check("...but lastSeen still advances", state2["rules"]["kev"]["lastSeen"], "2026-08-18")
+    check("...while firstSeen does not, since the verdict didn't change",
+          state2["rules"]["kev"]["firstSeen"], "2026-08-17")
+
+    # A rule resolving (firing -> clear) IS a change, and so is one going unevaluable.
+    v3 = mkv(clear=["kev", "conn"])
+    _, changes3 = m.update_alertstate(state2, v3, "2026-08-19")
+    check("a rule resolving is a change", {c["rule"] for c in changes3}, {"kev"})
+    check("...reporting the transition", changes3[0], {"rule": "kev", "from": "firing", "to": "clear"})
+    v4 = mkv(unevaluable=["kev"], clear=["conn"])
+    _, changes4 = m.update_alertstate(state2, v4, "2026-08-19")
+    check("a rule going unevaluable is a change", {c["rule"] for c in changes4}, {"kev"})
+
+    # A rule removed entirely (renamed or `alerts rm`) is also surfaced, not silently dropped.
+    v5 = mkv(clear=["conn"])
+    _, changes5 = m.update_alertstate(state2, v5, "2026-08-19")
+    check("a removed rule is reported, not silently dropped",
+          [c for c in changes5 if c["rule"] == "kev" and c["to"] is None], changes5)
+
+    # --- state file round trip -------------------------------------------------------------------
+    check("no state file yet", m.load_alertstate(), None)
+    m.save_alertstate(state1)
+    check("it round-trips", m.load_alertstate()["rules"]["kev"]["lastVerdict"], "firing")
+    with open(m._alertstate_path(), "w", encoding="utf-8") as f:
+        f.write("{ not json")
+    raised = ""
     try:
-        # --- change detection -----------------------------------------------------------------------
-        v1 = mkv(firing=["kev"], clear=["conn"])
-        state1, changes1 = m.update_alertstate(None, v1, "2026-08-17")
-        check("a first-ever run treats every current rule as a change", len(changes1), 2)
-        check("...recording where each came from", {c["from"] for c in changes1}, {None})
-        check("...and where each landed",
-              {c["rule"]: c["to"] for c in changes1}, {"kev": "firing", "conn": "clear"})
-        check("...and the state records both rules' verdicts",
-              {n: r["lastVerdict"] for n, r in state1["rules"].items()}, {"kev": "firing", "conn": "clear"})
+        m.load_alertstate()
+    except RuntimeError as e:
+        raised = str(e)
+    check("a corrupt state file raises rather than silently resetting", bool(raised), True)
+    os.remove(m._alertstate_path())
 
-        # Same verdicts again: no change.
-        v2 = mkv(firing=["kev"], clear=["conn"])
-        state2, changes2 = m.update_alertstate(state1, v2, "2026-08-18")
-        check("an unchanged verdict is not a change", changes2, [])
-        check("...but lastSeen still advances", state2["rules"]["kev"]["lastSeen"], "2026-08-18")
-        check("...while firstSeen does not, since the verdict didn't change",
-              state2["rules"]["kev"]["firstSeen"], "2026-08-17")
+    # --- renderers: escaping and shape -----------------------------------------------------------
+    # Rule/message text can carry customer environment data (a connector name), so the HTML target
+    # must escape it -- this file has already shipped the unescaped-customer-data bug once.
+    nasty = mkv(firing=["<script>alert(1)</script> & Co"])
+    subject, text, html = m.render_alerts_email(nasty)
+    check("email HTML escapes a hostile rule name", "<script>" in html, False)
+    check("...but the plain-text body is untouched (it isn't rendered as markup)",
+          "<script>" in text, True)
+    check("the subject names the stack", "s.example" in subject, True)
+    slack_payload = m.render_alerts_slack(nasty)
+    check("slack payload is a single text field", set(slack_payload), {"text"})
+    # The Workflows template posts each entry of `attachments` as a card; a body without them is
+    # accepted with HTTP 202 and posts nothing, which is what the old {title, text} shape did.
+    teams_payload = m.render_alerts_teams(nasty)
+    att = (teams_payload.get("attachments") or [{}])[0]
+    card = att.get("content") or {}
+    check("teams payload is a message with one Adaptive Card attachment",
+          (teams_payload.get("type"), len(teams_payload.get("attachments") or []),
+           att.get("contentType"), card.get("type")),
+          ("message", 1, "application/vnd.microsoft.card.adaptive", "AdaptiveCard"))
+    card_text = " ".join(b.get("text", "") for b in card.get("body") or [])
+    check("...whose card carries the rule", "&amp; Co" in card_text or "& Co" in card_text, True)
+    check("...with a top-level text fallback for a flow that reads that field",
+          "& Co" in teams_payload.get("text", ""), True)
+    linky = m.render_alerts_teams(mkv(firing=["[Reset your password](https://evil.example/x)"]))
+    check("a markdown link in customer text does not form a link",
+          "](" in json.dumps(linky["attachments"][0]["content"]), False)
+    check("...and the payload fits Teams' 28 KB message limit", len(json.dumps(teams_payload)) < 28000, True)
 
-        # A rule resolving (firing -> clear) IS a change, and so is one going unevaluable.
-        v3 = mkv(clear=["kev", "conn"])
-        _, changes3 = m.update_alertstate(state2, v3, "2026-08-19")
-        check("a rule resolving is a change", {c["rule"] for c in changes3}, {"kev"})
-        check("...reporting the transition", changes3[0], {"rule": "kev", "from": "firing", "to": "clear"})
-        v4 = mkv(unevaluable=["kev"], clear=["conn"])
-        _, changes4 = m.update_alertstate(state2, v4, "2026-08-19")
-        check("a rule going unevaluable is a change", {c["rule"] for c in changes4}, {"kev"})
-
-        # A rule removed entirely (renamed or `alerts rm`) is also surfaced, not silently dropped.
-        v5 = mkv(clear=["conn"])
-        _, changes5 = m.update_alertstate(state2, v5, "2026-08-19")
-        check("a removed rule is reported, not silently dropped",
-              [c for c in changes5 if c["rule"] == "kev" and c["to"] is None], changes5)
-
-        # --- state file round trip -------------------------------------------------------------------
-        check("no state file yet", m.load_alertstate(), None)
-        m.save_alertstate(state1)
-        check("it round-trips", m.load_alertstate()["rules"]["kev"]["lastVerdict"], "firing")
-        with open(m._alertstate_path(), "w", encoding="utf-8") as f:
-            f.write("{ not json")
-        raised = ""
-        try:
-            m.load_alertstate()
-        except RuntimeError as e:
-            raised = str(e)
-        check("a corrupt state file raises rather than silently resetting", bool(raised), True)
-        os.remove(m._alertstate_path())
-
-        # --- renderers: escaping and shape -----------------------------------------------------------
-        # Rule/message text can carry customer environment data (a connector name), so the HTML target
-        # must escape it -- this file has already shipped the unescaped-customer-data bug once.
-        nasty = mkv(firing=["<script>alert(1)</script> & Co"])
-        subject, text, html = m.render_alerts_email(nasty)
-        check("email HTML escapes a hostile rule name", "<script>" in html, False)
-        check("...but the plain-text body is untouched (it isn't rendered as markup)",
-              "<script>" in text, True)
-        check("the subject names the stack", "s.example" in subject, True)
-        slack_payload = m.render_alerts_slack(nasty)
-        check("slack payload is a single text field", set(slack_payload), {"text"})
-        # The Workflows template posts each entry of `attachments` as a card; a body without them is
-        # accepted with HTTP 202 and posts nothing, which is what the old {title, text} shape did.
-        teams_payload = m.render_alerts_teams(nasty)
-        att = (teams_payload.get("attachments") or [{}])[0]
-        card = att.get("content") or {}
-        check("teams payload is a message with one Adaptive Card attachment",
-              (teams_payload.get("type"), len(teams_payload.get("attachments") or []),
-               att.get("contentType"), card.get("type")),
-              ("message", 1, "application/vnd.microsoft.card.adaptive", "AdaptiveCard"))
-        card_text = " ".join(b.get("text", "") for b in card.get("body") or [])
-        check("...whose card carries the rule", "&amp; Co" in card_text or "& Co" in card_text, True)
-        check("...with a top-level text fallback for a flow that reads that field",
-              "& Co" in teams_payload.get("text", ""), True)
-        linky = m.render_alerts_teams(mkv(firing=["[Reset your password](https://evil.example/x)"]))
-        check("a markdown link in customer text does not form a link",
-              "](" in json.dumps(linky["attachments"][0]["content"]), False)
-        check("...and the payload fits Teams' 28 KB message limit", len(json.dumps(teams_payload)) < 28000, True)
-
-        # --- env-var-only config resolution -----------------------------------------------------------
-        real_env = dict(os.environ)
+    # --- env-var-only config resolution -----------------------------------------------------------
+    with monkeypatch.context() as mp:
         for k in list(os.environ):
             if k.startswith("MERIDIAN_ALERT_"):
-                del os.environ[k]
-        try:
-            check("no env vars means nothing configured",
-                  m.notify_configs(), {"slack": None, "teams": None, "email": None})
-            os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"] = "https://hooks.example/slack"
-            check("slack resolves from its one env var",
-                  m._notify_target_config("slack"), {"webhook": "https://hooks.example/slack"})
-            os.environ["MERIDIAN_ALERT_EMAIL_SMTP_HOST"] = "smtp.example"
-            check("email needs BOTH host and to", m._notify_target_config("email"), None)
-            os.environ["MERIDIAN_ALERT_EMAIL_TO"] = "soc@example.com"
-            cfg = m._notify_target_config("email")
-            check("email resolves once both are set", cfg["host"], "smtp.example")
-            check("...defaulting from to the first recipient", cfg["from"], "soc@example.com")
-            check("...defaulting the port to 587", cfg["port"], 587)
-            check("...defaulting starttls to on", cfg["starttls"], True)
-            os.environ["MERIDIAN_ALERT_EMAIL_STARTTLS"] = "0"
-            check("...unless explicitly disabled",
-                  m._notify_target_config("email")["starttls"], False)
-        finally:
-            for k in list(os.environ):
-                if k.startswith("MERIDIAN_ALERT_"):
-                    del os.environ[k]
-            os.environ.update(real_env)
+                mp.delenv(k)
+        check("no env vars means nothing configured",
+              m.notify_configs(), {"slack": None, "teams": None, "email": None})
+        mp.setenv("MERIDIAN_ALERT_SLACK_WEBHOOK", "https://hooks.example/slack")
+        check("slack resolves from its one env var",
+              m._notify_target_config("slack"), {"webhook": "https://hooks.example/slack"})
+        mp.setenv("MERIDIAN_ALERT_EMAIL_SMTP_HOST", "smtp.example")
+        check("email needs BOTH host and to", m._notify_target_config("email"), None)
+        mp.setenv("MERIDIAN_ALERT_EMAIL_TO", "soc@example.com")
+        cfg = m._notify_target_config("email")
+        check("email resolves once both are set", cfg["host"], "smtp.example")
+        check("...defaulting from to the first recipient", cfg["from"], "soc@example.com")
+        check("...defaulting the port to 587", cfg["port"], 587)
+        check("...defaulting starttls to on", cfg["starttls"], True)
+        mp.setenv("MERIDIAN_ALERT_EMAIL_STARTTLS", "0")
+        check("...unless explicitly disabled",
+              m._notify_target_config("email")["starttls"], False)
 
-        # --- transport: structurally independent of call() --------------------------------------------
-        import urllib.request
-        real_urlopen = urllib.request.urlopen
-        captured = {}
+    # --- transport: structurally independent of call() --------------------------------------------
+    import urllib.request
+    captured = {}
 
-        class FakeResp:
-            status = 200
-            def read(self): return b"ok"
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
+    class FakeResp:
+        status = 200
+        def read(self): return b"ok"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
 
-        def fake_urlopen(req, timeout=None):
-            captured["url"] = req.full_url
-            captured["headers"] = dict(req.header_items())
-            captured["body"] = req.data
-            return FakeResp()
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.header_items())
+        captured["body"] = req.data
+        return FakeResp()
 
-        urllib.request.urlopen = fake_urlopen
-        try:
-            status, body = m._post_webhook("https://hooks.example/slack", {"text": "hi"})
-            check("webhook post reaches the given url", captured["url"], "https://hooks.example/slack")
-            check("...as JSON", json.loads(captured["body"]), {"text": "hi"})
-            check("...with no Authorization header (never the Meridian token)",
-                  "Authorization" in captured["headers"], False)
-            check("...and returns the response", (status, body), (200, "ok"))
-        finally:
-            urllib.request.urlopen = real_urlopen
+    with monkeypatch.context() as mp:
+        mp.setattr(urllib.request, "urlopen", fake_urlopen)
+        status, body = m._post_webhook("https://hooks.example/slack", {"text": "hi"})
+    check("webhook post reaches the given url", captured["url"], "https://hooks.example/slack")
+    check("...as JSON", json.loads(captured["body"]), {"text": "hi"})
+    check("...with no Authorization header (never the Meridian token)",
+          "Authorization" in captured["headers"], False)
+    check("...and returns the response", (status, body), (200, "ok"))
 
-        class FakeSMTP:
-            sent = []
-            def __init__(self, host, port, timeout=None):
-                self.host, self.port = host, port
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def starttls(self, context=None): FakeSMTP.sent.append("starttls")
-            def login(self, user, password): FakeSMTP.sent.append(("login", user, password))
-            def send_message(self, msg): FakeSMTP.sent.append(("sent", str(msg["To"]), str(msg["Subject"])))
+    class FakeSMTP:
+        sent = []
+        def __init__(self, host, port, timeout=None):
+            self.host, self.port = host, port
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def starttls(self, context=None): FakeSMTP.sent.append("starttls")
+        def login(self, user, password): FakeSMTP.sent.append(("login", user, password))
+        def send_message(self, msg): FakeSMTP.sent.append(("sent", str(msg["To"]), str(msg["Subject"])))
 
-        m._SMTP_CLIENT = FakeSMTP
-        try:
-            m._send_email({"host": "smtp.example", "port": 587, "from": "a@example.com",
-                          "to": ["b@example.com"], "user": None, "password": None, "starttls": True},
-                         "subj", "text body", "<p>html body</p>")
-            check("email goes out over the injected SMTP client",
-                  ("sent", "b@example.com", "subj") in FakeSMTP.sent, True)
-            check("...using starttls by default", "starttls" in FakeSMTP.sent, True)
-            check("...and skips login when no user is configured",
-                  any(isinstance(x, tuple) and x[0] == "login" for x in FakeSMTP.sent), False)
-        finally:
-            m._SMTP_CLIENT = None
+    monkeypatch.setattr(m, "_SMTP_CLIENT", FakeSMTP)
+    m._send_email({"host": "smtp.example", "port": 587, "from": "a@example.com",
+                  "to": ["b@example.com"], "user": None, "password": None, "starttls": True},
+                 "subj", "text body", "<p>html body</p>")
+    check("email goes out over the injected SMTP client",
+          ("sent", "b@example.com", "subj") in FakeSMTP.sent, True)
+    check("...using starttls by default", "starttls" in FakeSMTP.sent, True)
+    check("...and skips login when no user is configured",
+          any(isinstance(x, tuple) and x[0] == "login" for x in FakeSMTP.sent), False)
 
-        # --- deliver_alerts: the on-change gate, end to end --------------------------------------------
-        sent_log = []
+    # --- deliver_alerts: the on-change gate, end to end --------------------------------------------
+    sent_log = []
 
-        def fake_post(url, payload, timeout=10):
-            sent_log.append((url, payload))
-            return 200, "ok"
+    def fake_post(url, payload, timeout=10):
+        sent_log.append((url, payload))
+        return 200, "ok"
 
-        real_post = m._post_webhook
-        m._post_webhook = fake_post
-        os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"] = "https://hooks.example/slack"
-        try:
-            v1 = mkv(firing=["kev"], stack_date="2026-08-17")
-            r1 = m.deliver_alerts(v1, targets=("slack", "teams", "email"), stack_date="2026-08-17")
-            check("first run sends (nothing to compare against)", len(sent_log), 1)
-            check("...and reports what's configured vs skipped",
-                  (r1["configured"]["slack"], "teams" in r1["skipped"], "email" in r1["skipped"]),
-                  (True, True, True))
-            sent_log.clear()
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "_post_webhook", fake_post)
+        mp.setenv("MERIDIAN_ALERT_SLACK_WEBHOOK", "https://hooks.example/slack")
+        v1 = mkv(firing=["kev"], stack_date="2026-08-17")
+        r1 = m.deliver_alerts(v1, targets=("slack", "teams", "email"), stack_date="2026-08-17")
+        check("first run sends (nothing to compare against)", len(sent_log), 1)
+        check("...and reports what's configured vs skipped",
+              (r1["configured"]["slack"], "teams" in r1["skipped"], "email" in r1["skipped"]),
+              (True, True, True))
+        sent_log.clear()
 
-            v2 = mkv(firing=["kev"], stack_date="2026-08-18")
-            r2 = m.deliver_alerts(v2, targets=("slack",), stack_date="2026-08-18")
-            check("an unchanged verdict does not re-send", len(sent_log), 0)
-            check("...and says why", "note" in r2 and "nothing sent" in r2["note"], True)
+        v2 = mkv(firing=["kev"], stack_date="2026-08-18")
+        r2 = m.deliver_alerts(v2, targets=("slack",), stack_date="2026-08-18")
+        check("an unchanged verdict does not re-send", len(sent_log), 0)
+        check("...and says why", "note" in r2 and "nothing sent" in r2["note"], True)
 
-            m.deliver_alerts(v2, targets=("slack",), force=True, stack_date="2026-08-18")
-            check("--force resends regardless", len(sent_log), 1)
-            sent_log.clear()
+        m.deliver_alerts(v2, targets=("slack",), force=True, stack_date="2026-08-18")
+        check("--force resends regardless", len(sent_log), 1)
+        sent_log.clear()
 
-            v3 = mkv(clear=["kev"], stack_date="2026-08-19")
-            m.deliver_alerts(v3, targets=("slack",), stack_date="2026-08-19")
-            check("a resolved rule triggers a real send, not just --force", len(sent_log), 1)
-        finally:
-            m._post_webhook = real_post
-            del os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"]
+        v3 = mkv(clear=["kev"], stack_date="2026-08-19")
+        m.deliver_alerts(v3, targets=("slack",), stack_date="2026-08-19")
+        check("a resolved rule triggers a real send, not just --force", len(sent_log), 1)
 
-        # One target failing must not cancel or hide the others.
-        def raising_post(url, payload, timeout=10):
-            if "slack" in url:
-                raise RuntimeError("HTTP 500: boom")
-            return 200, "ok"
+    # One target failing must not cancel or hide the others.
+    def raising_post(url, payload, timeout=10):
+        if "slack" in url:
+            raise RuntimeError("HTTP 500: boom")
+        return 200, "ok"
 
-        m._post_webhook = raising_post
-        os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"] = "https://hooks.example/slack"
-        os.environ["MERIDIAN_ALERT_TEAMS_WEBHOOK"] = "https://hooks.example/teams"
-        try:
-            v4 = mkv(firing=["new-rule"], stack_date="2026-08-20")
-            r4 = m.deliver_alerts(v4, targets=("slack", "teams"), stack_date="2026-08-20")
-            check("a broken target reports its own error", "boom" in r4["sent"]["slack"]["error"], True)
-            check("...without cancelling a working target", r4["sent"]["teams"]["status"], 200)
-            check("...and one delivery is enough to record the change", r4["stateSaved"], True)
-        finally:
-            m._post_webhook = real_post
-            del os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"]
-            del os.environ["MERIDIAN_ALERT_TEAMS_WEBHOOK"]
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "_post_webhook", raising_post)
+        mp.setenv("MERIDIAN_ALERT_SLACK_WEBHOOK", "https://hooks.example/slack")
+        mp.setenv("MERIDIAN_ALERT_TEAMS_WEBHOOK", "https://hooks.example/teams")
+        v4 = mkv(firing=["new-rule"], stack_date="2026-08-20")
+        r4 = m.deliver_alerts(v4, targets=("slack", "teams"), stack_date="2026-08-20")
+        check("a broken target reports its own error", "boom" in r4["sent"]["slack"]["error"], True)
+        check("...without cancelling a working target", r4["sent"]["teams"]["status"], 200)
+        check("...and one delivery is enough to record the change", r4["stateSaved"], True)
 
-        # A change that reached nobody stays pending (it used to be saved first and never re-sent).
-        attempts = []
+    # A change that reached nobody stays pending (it used to be saved first and never re-sent).
+    attempts = []
 
-        def down_post(url, payload, timeout=10):
-            attempts.append(url)
-            raise RuntimeError("HTTP 503: down")
+    def down_post(url, payload, timeout=10):
+        attempts.append(url)
+        raise RuntimeError("HTTP 503: down")
 
-        m._post_webhook = down_post
-        os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"] = "https://hooks.example/slack"
-        try:
-            v5 = mkv(firing=["outage-rule"], stack_date="2026-08-21")
-            r5 = m.deliver_alerts(v5, targets=("slack",), stack_date="2026-08-21")
-            check("an undelivered change is not recorded", r5["stateSaved"], False)
-            check("...and says it stays pending", "stays pending" in r5.get("note", ""), True)
-            m._post_webhook = fake_post
-            sent_log.clear()
-            r6 = m.deliver_alerts(v5, targets=("slack",), stack_date="2026-08-21")
-            check("...so the next notify sends it", (len(sent_log), r6["changed"], r6["stateSaved"]),
-                  (1, True, True))
-        finally:
-            m._post_webhook = real_post
-            del os.environ["MERIDIAN_ALERT_SLACK_WEBHOOK"]
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "_post_webhook", down_post)
+        mp.setenv("MERIDIAN_ALERT_SLACK_WEBHOOK", "https://hooks.example/slack")
+        v5 = mkv(firing=["outage-rule"], stack_date="2026-08-21")
+        r5 = m.deliver_alerts(v5, targets=("slack",), stack_date="2026-08-21")
+        check("an undelivered change is not recorded", r5["stateSaved"], False)
+        check("...and says it stays pending", "stays pending" in r5.get("note", ""), True)
+        mp.setattr(m, "_post_webhook", fake_post)
+        sent_log.clear()
+        r6 = m.deliver_alerts(v5, targets=("slack",), stack_date="2026-08-21")
+        check("...so the next notify sends it", (len(sent_log), r6["changed"], r6["stateSaved"]),
+              (1, True, True))
 
-        v7 = mkv(firing=["unconfigured-rule"], stack_date="2026-08-22")
-        r7 = m.deliver_alerts(v7, targets=("slack",), stack_date="2026-08-22")
-        check("with nothing configured the change stays pending too", r7["stateSaved"], False)
+    v7 = mkv(firing=["unconfigured-rule"], stack_date="2026-08-22")
+    r7 = m.deliver_alerts(v7, targets=("slack",), stack_date="2026-08-22")
+    check("with nothing configured the change stays pending too", r7["stateSaved"], False)
 
-        teams = m.render_alerts_teams(mkv(firing=["<a href=https://x.example>click</a>"]))
-        check("Teams top-level text is HTML-escaped",
-              ("<a href" in teams["text"], "&lt;a href" in teams["text"]), (False, True))
-    finally:
-        (m.CFG_DIR, m.load_config) = real
+    teams = m.render_alerts_teams(mkv(firing=["<a href=https://x.example>click</a>"]))
+    check("Teams top-level text is HTML-escaped",
+          ("<a href" in teams["text"], "&lt;a href" in teams["text"]), (False, True))
 
 
 def test_vuln_detail(m):
@@ -4728,7 +4472,6 @@ def test_vuln_detail(m):
     it are capped, because a cap that silently shrinks a finding is the same class of bug as a
     truncated result set reported as complete.
     """
-    print("[24] asset vulnerability detail (offline)")
 
     # --- _to_float: unknown must stay distinct from zero ------------------------------------------
     check("a parseable score becomes a float", m._to_float("8.8"), 8.8)
@@ -4877,14 +4620,13 @@ def test_vuln_detail(m):
           any("No critical exposure signals" in x for x in f), True)
 
 
-def test_linked_assets_cap(m):
+def test_linked_assets_cap(m, monkeypatch):
     """A user profile's `linkedAssets` is unbounded -- measured live, one identity with 30 linked
     assets was 46% of a 13,040-char profile. Same shape of fix as `_vuln_summary` above: counts and
     findings come from the FULL fetched list, only the serialized array is capped, and the cap is
     disclosed rather than silent. Also covers a pre-existing gap found alongside it: the fetch itself
     is capped at PROFILE_LINKED_ASSETS_FETCH_CAP with no signal when a busier identity exceeds it.
     """
-    print("[38] user profile linked-asset cap (offline)")
 
     def asset(i, encrypted="1"):
         return {"Asset_Name": "ASSET%02d" % i, "Risk_Score": float(i), "Risk_Level": "3-high" if i >= 41 else "1-low",
@@ -4906,13 +4648,9 @@ def test_linked_assets_cap(m):
             return {"totalRecords": 55, "data": fetched_assets}
         return {"totalRecords": 1, "data": [user]}
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        out = m.build_profile("SVC", "user")
-        detailed = m.build_profile("SVC", "user", linked_detail=True)
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    out = m.build_profile("SVC", "user")
+    detailed = m.build_profile("SVC", "user", linked_detail=True)
 
     check("linkedAssetsTotal is the true count, not what was fetched", out["linkedAssetsTotal"], 55)
     check("linkedAssetsShown is capped to the default", out["linkedAssetsShown"], m.PROFILE_LINKED_ASSETS_SHOW)
@@ -4943,11 +4681,8 @@ def test_linked_assets_cap(m):
             return {"totalRecords": 2, "data": [asset(1), asset(2)]}
         return {"totalRecords": 1, "data": [dict(user, Asset_Name=["ASSET01", "ASSET02"])]}
 
-    m.call = fake_call_small
-    try:
-        small = m.build_profile("SVC", "user")
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call_small)
+    small = m.build_profile("SVC", "user")
     check("under the cap: nothing is truncated", small["linkedAssetsTruncated"], False)
     check("...and there is nothing to say about it", "note" in small, False)
     check("...the total matches what's shown", (small["linkedAssetsTotal"], small["linkedAssetsShown"]), (2, 2))
@@ -4958,11 +4693,8 @@ def test_linked_assets_cap(m):
             return []
         return {"totalRecords": 1, "data": [dict(user, Asset_Name=[])]}
 
-    m.call = fake_call_zero
-    try:
-        zero = m.build_profile("SVC", "user")
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call_zero)
+    zero = m.build_profile("SVC", "user")
     check("no linked assets is zero, not an error", (zero["linkedAssetsTotal"], zero["linkedAssetsShown"]), (0, 0))
     check("...and not flagged as truncated", zero["linkedAssetsTruncated"], False)
 
@@ -4991,7 +4723,6 @@ def test_skill_frontmatter():
     A description over the 1024-character cap makes Claude reject the skill at import, so every user
     on that version loses the skill entirely -- and because SKILL.md is a behaviour contract rather
     than code, no existing test looked at it. It went over one capability sentence at a time."""
-    print("[19] SKILL.md frontmatter limits (offline)")
     fm = _skill_frontmatter()
     n = len(fm["description"])
     check("description is present", n > 0, True)
@@ -5024,7 +4755,6 @@ def test_hr_routing():
     both directions: the question reaches the verb, AND the rules that keep it from being answered
     wrongly travel with it.
     """
-    print("[50] SKILL.md routes HR questions to `hr`, and only its state may say 'no HR data'")
     body = open(SKILL_MD, encoding="utf-8").read()
     flat = " ".join(body.split())
     check("the verb table routes HR questions to `hr`",
@@ -5060,7 +4790,6 @@ def test_alert_routing():
 
     So this asserts the contract in both directions: the routing exists, AND the rules that stop it
     being answered wrongly exist alongside it."""
-    print("[40] SKILL.md routes alerts, with the three-verdict rule attached")
     body = open(SKILL_MD, encoding="utf-8").read()
 
     # Routing: a question has to be able to reach the verb at all.
@@ -5116,7 +4845,6 @@ def test_skill_rule_survival():
     Both directions, as with test_alert_routing: the imperative is in SKILL.md, AND the reference it
     defers to actually carries the reasoning. A pointer at a doc that does not explain the rule is
     worse than no pointer -- it reads as though the justification was checked."""
-    print("[41] SKILL.md keeps every rule that prevents a confident wrong answer")
     raw = open(SKILL_MD, encoding="utf-8").read()
     # Matched against a whitespace-normalised copy on purpose. These are rules, not display
     # templates, so where a sentence happens to wrap is noise -- unlike references/welcome.md, which
@@ -5227,7 +4955,6 @@ def test_launch_greeting():
     improvises a greeting, and an improvised greeting still looks like a greeting. Nobody reports
     that as a bug. Same reason SKILL.md's frontmatter got a test -- a behaviour contract is not
     covered by tests that only read behaviour."""
-    print("[39] launch greeting (offline)")
     path = os.path.join(os.path.dirname(HERE), "references", "welcome.md")
     check("references/welcome.md exists", os.path.isfile(path), True)
     body = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
@@ -5281,153 +5008,74 @@ def test_launch_greeting():
           "Welcome to Meridian for Claude" in skill, False)
 
 
-def test_doc_output_guard():
-    """`docout.resolve_out` -- the guard on the three documentation generators' output path.
-
-    Snyk reports 18 LOW Path Traversal findings where `sys.argv[1]` reaches `open`/`os.replace`/
-    `os.remove` in the generators. That framing is wrong: the operator running the script names the
-    file, so there is no trust boundary to cross. But nothing validated the target at all, and
-    Chrome's `--print-to-pdf` overwrites whatever is there and still exits 0 -- so
-    `make-brief.py SKILL.md` replaced SKILL.md with a 134KB PDF, silently. Verified against the
-    unguarded scripts before the guard was written.
-
-    The suffix check is the one that matters; the directory and missing-parent checks only turn a
-    traceback into a sentence. All three refusals must exit non-zero, because these run from
-    release steps where a zero exit reads as a regenerated document."""
-    import contextlib, io, shutil
-    print("[37] documentation output-path guard (offline)")
-    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "scripts"))
-    import docout
-
-    tmp = tempfile.mkdtemp()
-    default = os.path.join(tmp, "Default-Doc.pdf")
-
-    def resolve(arg):
-        """resolve_out reads argv and exits on refusal; capture both."""
-        argv, err = sys.argv, io.StringIO()
-        sys.argv = ["make-brief.py"] + ([arg] if arg is not None else [])
-        try:
-            with contextlib.redirect_stderr(err):
-                return ("ok", docout.resolve_out(default))
-        except SystemExit as e:
-            return ("exit%s" % e.code, err.getvalue())
-        finally:
-            sys.argv = argv
-
-    # The default path must survive untouched -- every documented invocation passes no argument.
-    check("no argument resolves to the committed default", resolve(None), ("ok", default))
-
-    # The destructive case. A source file is the plausible mistake, not `../../etc/passwd`.
-    source = os.path.join(tmp, "SKILL.md")
-    open(source, "w").write("behaviour contract" + chr(10))
-    status, msg = resolve(source)
-    check("a non-.pdf target is refused", status, "exit2")
-    check("...and the refusal names the file", source in msg, True)
-    check("...and says why it would be destructive", "destroy" in msg, True)
-    check("...and the file is untouched", open(source).read(), "behaviour contract" + chr(10))
-
-    # A directory: the "forgot the filename" mistake.
-    check("a directory target is refused", resolve(tmp)[0], "exit2")
-    check("...and a missing parent is refused too",
-          resolve(os.path.join(tmp, "nope", "doc.pdf"))[0], "exit2")
-
-    # A .pdf under an existing directory is the normal regenerate case and must still work,
-    # whether or not it already exists -- refusing to overwrite would break every release.
-    fresh = os.path.join(tmp, "New-Doc.pdf")
-    check("a new .pdf is accepted", resolve(fresh), ("ok", fresh))
-    open(fresh, "w").write("old pdf")
-    check("...and regenerating over an existing .pdf still works", resolve(fresh), ("ok", fresh))
-    check("...and .PDF is accepted case-insensitively",
-          resolve(os.path.join(tmp, "Doc.PDF"))[0], "ok")
-
-    # Relative paths must come back absolute: the generators hand OUT to Chrome, which does not
-    # share the script's working directory.
-    rel = resolve("relative-doc.pdf")
-    check("a relative path is made absolute", os.path.isabs(rel[1]), True)
-
-    shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_retention(m):
+def test_retention(m, monkeypatch, capsys, tmp_path):
     """`snapshots list | prune` (design/trends.md phase 5). Pruning is never silent: a history that
     quietly loses its early end changes what a long trend MEANS, and the output looks identical."""
-    print("[20] snapshot retention (offline)")
-    import contextlib, io
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.load_config, m.build_digest)
-    m.CFG_DIR = tmp
-    m.load_config = lambda: ("s.example", "tok", None)
-    try:
-        path = m._snapshots_path()
-        s = m.snapshots_summary()
-        check("an empty history reports zero, not an error", s["records"], 0)
-        check("...and says there is no backfill", "no way to backfill" in s["note"], True)
-        for i in range(1, 13):
-            m.append_snapshot(_snap("2026-06-%02d" % i))
-        s = m.snapshots_summary()
-        check("list counts the records", s["records"], 12)
-        check("...reports oldest and newest", (s["oldest"], s["newest"]), ("2026-06-01", "2026-06-12"))
-        check("...the file size", s["bytes"] > 0, True)
-        check("...the cap", s["cap"], 400)
-        check("...and the distinct stack dates a trend can actually use", s["distinctStackDates"], 12)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    path = m._snapshots_path()
+    s = m.snapshots_summary()
+    check("an empty history reports zero, not an error", s["records"], 0)
+    check("...and says there is no backfill", "no way to backfill" in s["note"], True)
+    for i in range(1, 13):
+        m.append_snapshot(_snap("2026-06-%02d" % i))
+    s = m.snapshots_summary()
+    check("list counts the records", s["records"], 12)
+    check("...reports oldest and newest", (s["oldest"], s["newest"]), ("2026-06-01", "2026-06-12"))
+    check("...the file size", s["bytes"] > 0, True)
+    check("...the cap", s["cap"], 400)
+    check("...and the distinct stack dates a trend can actually use", s["distinctStackDates"], 12)
 
-        p = m.prune_snapshots(keep=5)
-        check("prune keeps the newest N", p["kept"], 5)
-        check("...and reports how many it dropped", p["dropped"], 7)
-        check("...naming the range that is gone", p["droppedRange"],
-              {"from": "2026-06-01", "to": "2026-06-07"})
-        check("...and warning what that does to a trend", "unavailable rather than unchanged" in p["note"], True)
-        recs, _ = m.load_snapshots()
-        check("the newest N are what survived", [r["stackDate"] for r in recs],
-              ["2026-06-%02d" % i for i in range(8, 13)])
-        check("...and no temp file is left behind", os.path.exists(path + ".tmp"), False)
-        p = m.prune_snapshots(keep=5)
-        check("pruning an already-short history changes nothing", p["pruned"], False)
-        check("...and says so rather than reporting a drop", "Nothing to prune" in p["note"], True)
-        check("a keep of zero is refused", m.prune_snapshots(keep=0)["pruned"], False)
+    p = m.prune_snapshots(keep=5)
+    check("prune keeps the newest N", p["kept"], 5)
+    check("...and reports how many it dropped", p["dropped"], 7)
+    check("...naming the range that is gone", p["droppedRange"],
+          {"from": "2026-06-01", "to": "2026-06-07"})
+    check("...and warning what that does to a trend", "unavailable rather than unchanged" in p["note"], True)
+    recs, _ = m.load_snapshots()
+    check("the newest N are what survived", [r["stackDate"] for r in recs],
+          ["2026-06-%02d" % i for i in range(8, 13)])
+    check("...and no temp file is left behind", os.path.exists(path + ".tmp"), False)
+    p = m.prune_snapshots(keep=5)
+    check("pruning an already-short history changes nothing", p["pruned"], False)
+    check("...and says so rather than reporting a drop", "Nothing to prune" in p["note"], True)
+    check("a keep of zero is refused", m.prune_snapshots(keep=0)["pruned"], False)
 
-        # An unreadable line is dropped by the rewrite, so it is reported rather than vanishing.
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("{ broken\n")
-        p = m.prune_snapshots(keep=2)
-        check("unreadable lines are named when the rewrite drops them",
-              p["droppedUnreadable"][0]["reason"], "line is not valid JSON")
-        check("...and the readable ones still prune correctly", p["kept"], 2)
+    # An unreadable line is dropped by the rewrite, so it is reported rather than vanishing.
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("{ broken\n")
+    p = m.prune_snapshots(keep=2)
+    check("unreadable lines are named when the rewrite drops them",
+          p["droppedUnreadable"][0]["reason"], "line is not valid JSON")
+    check("...and the readable ones still prune correctly", p["kept"], 2)
 
-        # The cap is enforced on capture too, and reported there.
-        m.build_digest = lambda *a, **k: _snap_digest()
-        m.SNAPSHOT_MAX_RECORDS = 4
-        try:
-            for i in range(6):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        info = m.take_snapshot()
-            check("an unattended cadence cannot grow the file forever", info["pruned"]["pruned"], True)
-            check("...reporting the drop rather than trimming silently", info["pruned"]["dropped"] >= 1, True)
-            check("...and the history holds the cap", info["historyRecords"], 4)
-        finally:
-            m.SNAPSHOT_MAX_RECORDS = 400
+    # The cap is enforced on capture too, and reported there.
+    monkeypatch.setattr(m, "build_digest", lambda *a, **k: _snap_digest())
+    monkeypatch.setattr(m, "SNAPSHOT_MAX_RECORDS", 4)
+    for i in range(6):
+        info = m.take_snapshot()
+    check("an unattended cadence cannot grow the file forever", info["pruned"]["pruned"], True)
+    check("...reporting the drop rather than trimming silently", info["pruned"]["dropped"] >= 1, True)
+    check("...and the history holds the cap", info["historyRecords"], 4)
 
-        # `snapshots list` flags a history that holds customer identifiers.
-        rec = _snap("2026-07-01")
-        rec["entities"] = {"scope": "top500:asset:Risk_Score", "namesStored": True, "saltId": "x",
-                           "scores": {"PROD-DB-04": 1.0}}
-        m.append_snapshot(rec)
-        s = m.snapshots_summary()
-        check("list counts entity records", s["withEntities"], 1)
-        check("...and flags the ones holding identifiers", s["storingNames"], 1)
-        check("...pointing at the permissions.deny protection",
-              "permissions.deny" in s["privacyNote"], True)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_snapshots(argparse.Namespace(snapshots_cmd="list"))
-        check("the CLI prints the summary", json.loads(buf.getvalue())["records"], s["records"])
-    finally:
-        m.CFG_DIR, m.load_config, m.build_digest = real
+    # `snapshots list` flags a history that holds customer identifiers.
+    rec = _snap("2026-07-01")
+    rec["entities"] = {"scope": "top500:asset:Risk_Score", "namesStored": True, "saltId": "x",
+                       "scores": {"PROD-DB-04": 1.0}}
+    m.append_snapshot(rec)
+    s = m.snapshots_summary()
+    check("list counts entity records", s["withEntities"], 1)
+    check("...and flags the ones holding identifiers", s["storingNames"], 1)
+    check("...pointing at the permissions.deny protection",
+          "permissions.deny" in s["privacyNote"], True)
+    m.cmd_snapshots(argparse.Namespace(snapshots_cmd="list"))
+    buf = capsys.readouterr().out
+    check("the CLI prints the summary", json.loads(buf)["records"], s["records"])
 
 
+@pytest.mark.live
 def test_live():
-    print("[21] live connect (needs a configured, reachable stack)")
     proc = subprocess.run([sys.executable, MERIDIAN_PY, "connect"],
                           capture_output=True, text=True, timeout=60)
     out = json.loads(proc.stdout)
@@ -5441,7 +5089,8 @@ def test_live():
     check("'api_token' key not leaked", "api_token" in blob, False)
 
 
-def test_live_entities(m):
+@pytest.mark.live
+def test_live_entities(m, monkeypatch, tmp_path):
     """The same no-identifiers-on-disk grep as offline, but against real customer data.
 
     A fixture can only prove the code hashes what the fixture gave it. This proves it against the real
@@ -5450,39 +5099,34 @@ def test_live_entities(m):
 
     Writes to a temp directory, never the operator's real history: a test has no business appending to
     the trend data someone is accumulating, and `prune` does not exist until phase 5."""
-    print("[23] live entity capture / no identifiers on disk (needs a configured, reachable stack)")
     import tempfile as tf
-    tmp = tf.mkdtemp()
-    real_dir = m.CFG_DIR
-    m.CFG_DIR = tmp                      # history goes here; CFG_PATH is separate, so creds still resolve
+    tmp = tf.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
     SALT = "live-test-salt-" + "0" * 48   # explicit, so nothing is written to the real config.json
-    try:
-        spec, problem = m.parse_entity_scope("top50:asset:Risk_Score")
-        check("a live scope parses", problem, None)
-        # Once WITH names, in memory only, purely to learn what must not appear on disk.
-        named = m.capture_entities(spec, SALT, with_names=True)
-        identifiers = [k for k in named["scores"]]
-        check("the live stack returned identifiable assets", len(identifiers) > 0, True)
-        # Then the default path, which is what gets written.
-        ents = m.capture_entities(spec, SALT)
-        m.append_snapshot(m.snapshot_record({"stack": m.load_config()[0]}, None, ents))
-        blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
-        leaked = [i for i in identifiers if i and str(i) in blob]
-        check("NO real customer identifier is in the written history", leaked, [])
-        check("...nor the identity field name", "Asset_Name" in blob, False)
-        check("...nor the salt", SALT in blob, False)
-        check("the saltId IS recorded, so a diff can check compatibility", m.salt_id(SALT) in blob, True)
-        check("every id is a 16-char hash", all(len(k) == 16 for k in ents["scores"]), True)
-        # The hashes must be exactly the hash of the real identifiers -- same entity across time.
-        expected = {m.hash_entity(SALT, i) for i in identifiers}
-        check("...and each is the hash of a real identifier", set(ents["scores"]) <= expected, True)
-        check("counts agree between the two captures", ents["count"], named["count"])
-        check("a cutoff score was recorded", isinstance(ents.get("cutoffScore"), float), True)
-    finally:
-        m.CFG_DIR = real_dir
+    spec, problem = m.parse_entity_scope("top50:asset:Risk_Score")
+    check("a live scope parses", problem, None)
+    # Once WITH names, in memory only, purely to learn what must not appear on disk.
+    named = m.capture_entities(spec, SALT, with_names=True)
+    identifiers = [k for k in named["scores"]]
+    check("the live stack returned identifiable assets", len(identifiers) > 0, True)
+    # Then the default path, which is what gets written.
+    ents = m.capture_entities(spec, SALT)
+    m.append_snapshot(m.snapshot_record({"stack": m.load_config()[0]}, None, ents))
+    blob = open(m._snapshots_path(), encoding="utf-8-sig").read()
+    leaked = [i for i in identifiers if i and str(i) in blob]
+    check("NO real customer identifier is in the written history", leaked, [])
+    check("...nor the identity field name", "Asset_Name" in blob, False)
+    check("...nor the salt", SALT in blob, False)
+    check("the saltId IS recorded, so a diff can check compatibility", m.salt_id(SALT) in blob, True)
+    check("every id is a 16-char hash", all(len(k) == 16 for k in ents["scores"]), True)
+    # The hashes must be exactly the hash of the real identifiers -- same entity across time.
+    expected = {m.hash_entity(SALT, i) for i in identifiers}
+    check("...and each is the hash of a real identifier", set(ents["scores"]) <= expected, True)
+    check("counts agree between the two captures", ents["count"], named["count"])
+    check("a cutoff score was recorded", isinstance(ents.get("cutoffScore"), float), True)
 
 
-def test_data_currency(m):
+def test_data_currency(m, monkeypatch, tmp_path, capsys):
     """Every answer is tied to the LDG rebuild it came from (design/data-currency.md, phase 1).
 
     The LDG changes only when a merger run completes, so the stamp is the last completed, non-failed
@@ -5491,20 +5135,12 @@ def test_data_currency(m):
     than trusted, a renamed merger fails loudly and names itself, and a query that straddles a
     rebuild is not an answer.
     """
-    print("[51] data currency: rebuild stamps on every data verb (offline)")
-    import contextlib
-    import io
     import tempfile
-    names = ("_CFG_CACHE", "CFG_DIR", "CFG_PATH", "call", "load_config", "ldg_rebuild", "top_n", "list_records",
-             "rescache_scope_live", "summary_cache_put",
-             "summarize_by", "stack_metrics", "build_profile", "hr_sources", "summarize_connectors",
-             "diagnose_connection", "build_digest", "take_snapshot")
-    real = {n: getattr(m, n) for n in names}
-    real_env = os.environ.get("MERIDIAN_NO_CACHE")
-    tmp = tempfile.mkdtemp(prefix="currency-")
-    m.CFG_DIR = tmp
-    m._CFG_CACHE = ("s.example", "tok", None)   # configured, so ldg_rebuild reaches call()
-    m.load_config = lambda: ("s.example", "tok", None)
+    tmp = tempfile.mkdtemp(prefix="currency-", dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "_CFG_CACHE",
+                        ("s.example", "tok", None))  # configured, so ldg_rebuild reaches call()
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
 
     T0 = 1790244732                               # 2026-09-24T10:12:12Z, a real merger end_time
     ISO0 = "2026-09-24T10:12:12Z"
@@ -5549,387 +5185,373 @@ def test_data_currency(m):
                 return {"content": ordered[p * size:(p + 1) * size], "totalPages": -(-len(ordered) // size)}
             check_sort = "sort=_time%2Cdesc" in endpoint
             return {"content": pages[p] if p < len(pages) and check_sort else [], "totalPages": len(pages)}
-        m.call = fake
+        monkeypatch.setattr(m, "call", fake)
 
+    monkeypatch.setenv("MERIDIAN_NO_CACHE", "1")
+    check("the merger names are pinned exactly (a rename is a visible test change)",
+          m.LDG_MERGERS, (("asset", ASSET), ("user", USER)))
+
+    # --- found on page 0: one call, end_time as the stamp -----------------------------------
+    serve([filler(3, T0 + 50) + [run(ASSET, T0, dag="d1"), run(USER, T0, dag="d1")] + filler(5, T0)])
+    s = m.ldg_rebuild()
+    check("newest page holds both mergers: one call", (s["apiCalls"], served["calls"]), (1, 1))
+    check("...the platform-sorted read, 20 rows, both sort keys",
+          (s.get("runsSort"), "sortFallback" in s,
+           all(k in served["endpoints"][0] for k in ("size=20&", "sort=platform%2Casc&sort=_time%2Cdesc"))),
+          ("platform", False, True))
+    check("stamp is end_time, as ISO UTC", (s["asset"].get("rebuiltUtc"), s["user"].get("rebuiltUtc")), (ISO0, ISO0))
+    check("...carrying the pipeline run that produced it", s["asset"].get("dagRunId"), "d1")
+    check("a Warning merge is a rebuild, not a failure", "lastRebuildFailed" in s["asset"], False)
+
+    # --- found deeper: pages until both are seen ---------------------------------------------
+    time_pages = [filler(4, T0 + 90), filler(4, T0 + 80), [run(ASSET, T0), run(USER, T0)]]
+    serve(time_pages)
+    s = m.ldg_rebuild()
+    check("mergers three time-sorted pages deep: one platform-sorted call",
+          (s["apiCalls"], s["asset"].get("rebuiltUtc"), s["runsSort"]), (1, ISO0, "platform"))
+    serve(time_pages, sort="error")
+    s = m.ldg_rebuild()
+    check("a refused sort falls back: mergers on time page 2 are found on page 2",
+          (s["apiCalls"], s["asset"].get("rebuiltUtc"), s["runsSort"]), (3, ISO0, "time"))
+    check("...saying why the cheap read wasn't used", "failed" in s.get("sortFallback", ""), True)
+
+    # --- missing within the cap: unknown with a reason, never a timestamp -------------------
+    pages = [filler(4, T0 + 900 - 10 * i) for i in range(10)]
+    pages[0] = pages[0] + [run(ASSET, T0)]
+    serve(pages)
+    s = m.ldg_rebuild()
+    check("a merger absent from the newest pages stops at the cap (after the sorted read hands over)",
+          s["apiCalls"], 1 + m.LDG_REBUILD_MAX_PAGES)
+    check("...the sorted read never decides an unknown: it names the table it couldn't stamp",
+          (s["runsSort"], "no good run for user" in s.get("sortFallback", "")), ("time", True))
+    check("...its table is unknown, with a reason", ("unknown" in s["user"], "rebuiltUtc" in s["user"]), (True, False))
+    check("...naming the merger it looked for", USER in s["user"]["unknown"], True)
+    check("...while the table that WAS found keeps its stamp", s["asset"].get("rebuiltUtc"), ISO0)
+
+    # --- renamed: loud, and names what it found ----------------------------------------------
+    serve([[run("Meridian Asset Merger", T0), run(USER, T0)]])
+    s = m.ldg_rebuild()
+    check("a renamed merger is unknown, not absorbed", "rebuiltUtc" in s["asset"], False)
+    check("...and the reason names the unexpected bridge", "'Meridian Asset Merger'" in s["asset"]["unknown"], True)
+    check("...and says it may have been renamed", "renamed" in s["asset"]["unknown"], True)
+    check("...and the result lists it", s.get("unexpectedMergers"), ["Meridian Asset Merger"])
+    check("the unchanged merger still stamps", s["user"].get("rebuiltUtc"), ISO0)
+
+    # --- failed runs are skipped; the previous good one is the stamp -------------------------
+    for status in ("Error", "FAILED", "Warning&Error", ""):
+        pages = [[run(ASSET, T0 + DAY, status, dag="bad"), run(USER, T0 + DAY, dag="good-u")] + filler(3, T0 + DAY)]
+        pages += [filler(4, T0 + DAY - 100 * i) for i in range(1, 4)]
+        pages += [[run(ASSET, T0, "Success", dag="good-a")]]
+        for mode, calls in (("honour", 1), ("error", 5)):
+            serve(pages, sort=mode)
+            s = m.ldg_rebuild()
+            check("newest asset merge %r (%s): stamps the earlier good run" % (status, mode),
+                  s["asset"].get("rebuiltUtc"), ISO0)
+            check("...flags the failed one with its status %r (%s)" % (status, mode),
+                  (s["asset"].get("lastRebuildFailed") or {}).get("status"), status)
+            check("...in %d call(s) (%r, %s)" % (calls, status, mode), s["apiCalls"], calls)
+    check("a Warning newest run stamps itself",
+          (s["user"].get("rebuiltUtc"), "lastRebuildFailed" in s["user"]),
+          (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + DAY)), False))
+
+    # --- failed with no earlier success: unknown at the rate-limit backstop -----------------
+    pages = [[run(ASSET, T0 + DAY, "Error"), run(USER, T0 + DAY)]]
+    pages += [filler(2, T0 + DAY - 10 * i) for i in range(1, 40)]
+    serve(pages)
+    s = m.ldg_rebuild()
+    check("a failed newest run with no earlier success stops at the backstop",
+          s["apiCalls"], 1 + m.LDG_REBUILD_FAILED_MAX_PAGES)
+    check("...and is unknown, saying the newest run failed",
+          ("rebuiltUtc" in s["asset"], "failed" in s["asset"].get("unknown", "")), (False, True))
+
+    # --- the failed-run search is paid once per failed run -----------------------------------
+    monkeypatch.delenv("MERIDIAN_NO_CACHE", raising=False)
+    m.drop_rescache()
+    pages = [[run(ASSET, T0 + DAY, "Error", dag="bad1"), run(USER, T0 + DAY)]]
+    pages += [filler(3, T0 + DAY - 100 * i) for i in range(1, 6)] + [[run(ASSET, T0, "Success", dag="ok0")]]
+    serve(pages, sort="error")    # the cache serves the time-sorted search, which pages back
+    first = m.ldg_rebuild()
+    second = m.ldg_rebuild()
+    check("the backwards search runs once", first["apiCalls"] > 1, True)
+    check("...and the next check costs one call", second["apiCalls"], 1)
+    check("...with the same stamp and the failure still flagged",
+          (second["asset"].get("rebuiltUtc"), (second["asset"].get("lastRebuildFailed") or {}).get("dagRunId")),
+          (ISO0, "bad1"))
+    pages[0] = [run(ASSET, T0 + 2 * DAY, "Error", dag="bad2"), run(USER, T0 + 2 * DAY)]
+    serve(pages, sort="error")
+    third = m.ldg_rebuild()
+    check("a NEW failed run is a new key: the search runs again", third["apiCalls"] > 1, True)
+    monkeypatch.setenv("MERIDIAN_NO_CACHE", "1")
+
+    # --- the platform-sorted read is trusted only when its order checks out ---------------------
+    # Old good merges, a newer good one, and other platforms' runs in between. The right stamp is
+    # always the newest good merge (T0); each broken order must fall back and still find it.
+    mixed = [[run(ASSET, T0 - DAY * k, dag="d%d" % k), run(USER, T0 - DAY * k, dag="d%d" % k)]
+             + filler(3, T0 - DAY * k + 500) for k in range(3)]
+    mixed[0] += [run("x", T0 + 900, "Success", platform="action")]
+    for mode, why in (("oldest", "runs came back out of time order"),
+                      ("platform-only", "'ML-ENGINE' runs came back out of time order"),
+                      ("ignore", "platforms came back out of order"), ("error", "failed")):
+        serve(mixed, sort=mode)
+        s = m.ldg_rebuild()
+        check("sort %r: not trusted, falls back to the time read" % mode,
+              (s.get("runsSort"), why in s.get("sortFallback", "")), ("time", True))
+        check("...and still stamps the newest good merge, not an older one (%s)" % mode,
+              (s["asset"].get("rebuiltUtc"), s["user"].get("rebuiltUtc")), (ISO0, ISO0))
+    serve(mixed)
+    s = m.ldg_rebuild()
+    check("the same runs, honestly sorted: trusted, newest good merge, one call",
+          (s.get("runsSort"), s["asset"].get("rebuiltUtc"), s["apiCalls"]), ("platform", ISO0, 1))
+
+    # Oldest first, and built to pass both order checks: one old merge's two rows (equal times),
+    # then one row each of three other platforms, ascending. Nothing on it shows a time sort was
+    # applied, so it must not answer -- trusted, it would stamp the merge a day before the latest.
+    liar = [run(ASSET, T0 - DAY, dag="old"), run(USER, T0 - DAY, dag="old")]
+    liar += [run("x", T0 - DAY + 60 * i, "Success", platform=p) for i, p in enumerate(("b", "c", "d"), 1)]
+    serve([[run(ASSET, T0, dag="new"), run(USER, T0, dag="new")] + filler(3, T0 - 10)], sort=liar)
+    s = m.ldg_rebuild()
+    check("an oldest-first page that passes both order checks: not trusted without a descending pair",
+          (s.get("runsSort"), "no sign" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")),
+          ("time", True, ISO0))
+
+    # Merger rows rising in time, with a descending pair elsewhere so the evidence rule is met, and
+    # the real newest merge off the page. Only the within-platform time check stands between this
+    # and a stamp two days old.
+    rising = [run(ASSET, T0 - 2 * DAY), run(USER, T0 - 2 * DAY), run(ASSET, T0 - DAY), run(USER, T0 - DAY)]
+    rising += [run("x", T0 + 3, "Success", platform="api"), run("x", T0 + 2, "Success", platform="api")]
+    serve([[run(ASSET, T0), run(USER, T0)] + filler(3, T0 - 10)], sort=rising)
+    s = m.ldg_rebuild()
+    check("merger runs rising in time: not trusted, and the newest merge is still the stamp",
+          ("'ML-ENGINE' runs came back out of time order" in s.get("sortFallback", ""),
+           s["asset"].get("rebuiltUtc")), (True, ISO0))
+
+    # A row with no platform sorts last; one appearing before a platform means the order is wrong.
+    serve([[{"bridge_name": "y", "_time": T0 * 1000 + 5}] + [run(ASSET, T0), run(USER, T0)]], sort="ignore")
+    s = m.ldg_rebuild()
+    check("a platform-less row ahead of the mergers: not trusted",
+          ("out of order" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")), (True, ISO0))
+
+    # A merger with no _time can't be checked against the sort, so it can't vouch for the order.
+    bare = run(ASSET, T0)
+    bare.pop("_time")
+    serve([[bare, run(USER, T0)]], sort="ignore")
+    s = m.ldg_rebuild()
+    check("a merger run with no _time: not trusted, still stamped by the time read",
+          ("no _time" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")), (True, ISO0))
+
+    # A 4-hour stack with a run of failed asset merges: the ML-ENGINE group spans sorted pages,
+    # and the sorted read pages through it to the last good one.
+    runs = [run(ASSET, T0 + 3600 * k, "Error", dag="bad%d" % k) for k in range(1, 26)]
+    runs += [run(USER, T0 + 3600 * k, dag="u%d" % k) for k in range(1, 26)]
+    runs += [run(ASSET, T0, "Success", dag="ok")] + filler(5, T0 - 10)
+    runs.sort(key=lambda r: -r["_time"])
+    serve([runs])
+    s = m.ldg_rebuild()
+    check("the ML-ENGINE group spans pages: the sorted read pages to the last good merge",
+          (s.get("runsSort"), s["asset"].get("rebuiltUtc"), s["apiCalls"],
+           (s["asset"].get("lastRebuildFailed") or {}).get("dagRunId")),
+          ("platform", ISO0, 3, "bad25"))
+
+    # --- summary --by's scope index: what makes a guaranteed miss knowable before the stamp ------
+    monkeypatch.delenv("MERIDIAN_NO_CACHE", raising=False)
+    m.drop_rescache()
+    sc = m._summary_scope("asset", "Risk_Level", [])
+    check("scope index: no entry is a guaranteed miss", m.rescache_scope_live("summary_by", 900, sc), False)
+    m.summary_cache_put({"complete": True, "groups": []}, "asset", "Risk_Level", [], ISO0)
+    check("...an entry for the scope, under any rebuild, may hit", m.rescache_scope_live("summary_by", 900, sc), True)
+    check("...but not for another scope",
+          m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "OS", [])), False)
+    check("...nor once it has expired", m.rescache_scope_live("summary_by", 0, sc), False)
+    check("...and it is the entry summarize_by reads under that stamp",
+          m.rescache_get("summary_by", 900, table="asset", by="Risk_Level", where=[], rebuilt=ISO0)[0],
+          {"complete": True, "groups": []})
+    m.summary_cache_put({"groups": []}, "asset", "Owner", [], ISO0)
+    check("...an unanswered coverage check is still not cached",
+          m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "Owner", [])), False)
+    m.rescache_put("summary_by", {"groups": []}, table="asset", by="OS", where=[], rebuilt=ISO0)
+    check("...an entry written before scopes existed might be the one, so it may hit",
+          m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "OS", [])), True)
+    m.drop_rescache()
+    monkeypatch.setenv("MERIDIAN_NO_CACHE", "1")
+    check("...and a disabled cache is always a guaranteed miss", m.rescache_scope_live("summary_by", 900, sc), False)
+
+    # --- never raises; unconfigured makes no call ---------------------------------------------
+    serve([], fail="HTTP 403: Forbidden")
+    s = m.ldg_rebuild()
+    check("an unreadable endpoint is unknown for both tables, not an exception",
+          ("could not read" in s["asset"].get("unknown", ""), "rebuiltUtc" in s["user"]), (True, False))
+    serve([[run(ASSET, T0), run(USER, T0)]])
+    # Isolated from THIS machine: with only _CFG_CACHE cleared, an operator's real
+    # ~/.meridian/config.json made the stack "configured" and this passed in CI only.
+    monkeypatch.setattr(m, "_CFG_CACHE", None)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "no-such-config.json"))
+    s = m.ldg_rebuild()
+    check("unconfigured: unknown, and no network call",
+          (s["asset"].get("unknown"), served["calls"]), ("no stack is configured", 0))
+    monkeypatch.setattr(m, "_CFG_CACHE", ("s.example", "tok", None))
+
+    # --- _merger_end ----------------------------------------------------------------------------
+    r = run(ASSET, T0)
+    r["_utc"] = "2026-09-24T10:30:00.000+00:00"
+    check("end_time wins over _utc when they disagree", m._merger_end(r)[1], ISO0)
+    r.pop("end_time")
+    check("_utc is the fallback without end_time", m._merger_end(r)[1], "2026-09-24T10:30:00Z")
+    check("milliseconds are tolerated", m._merger_end({"end_time": T0 * 1000})[1], ISO0)
+    check("an undatable run is None, not now", m._merger_end({"_utc": "yesterday"}), (None, None))
+
+    # --- data_currency -------------------------------------------------------------------------
+    a = {"rebuiltUtc": ISO0, "dagRunId": "d1"}
+    u = {"rebuiltUtc": ISO0, "dagRunId": "d1"}
+    cur = m.data_currency({"asset": a, "user": u}, ["asset", "user"])
+    check("both known: current, both stamped",
+          (cur["class"], cur.get("ldgRebuiltUtc")), ("current", {"asset": ISO0, "user": ISO0}))
+    check("...with the query time beside it, not instead of it", bool(cur.get("queriedUtc")), True)
+    check("...and no split", "mergersSplit" in cur, False)
+    split = m.data_currency({"asset": a, "user": dict(u, dagRunId="d0")}, ["asset", "user"])
+    check("two pipeline runs: mergersSplit", split.get("mergersSplit"), True)
+    unk = m.data_currency({"asset": a, "user": {"unknown": "no run"}}, ["asset", "user"])
+    check("one table unknown: the answer is unknown, never current",
+          (unk["class"], "ldgRebuiltUtc" in unk, "no run" in unk.get("reason", "")), ("unknown", False, True))
+    check("a table the answer doesn't use doesn't taint it",
+          m.data_currency({"asset": a, "user": {"unknown": "x"}}, ["asset"])["class"], "current")
+    check("an empty stamp is unknown", m.data_currency({}, ["asset"])["class"], "unknown")
+    same = m.data_currency({"asset": a}, ["asset"], after={"asset": dict(a)})
+    check("re-read unchanged: current", same["class"], "current")
+    moved = m.data_currency({"asset": a}, ["asset"], after={"asset": {"rebuiltUtc": "2026-09-24T14:05:00Z"}})
+    check("rebuilt mid-query: unknown with rebuildDuringQuery",
+          (moved["class"], moved.get("rebuildDuringQuery"), "Re-run" in moved.get("reason", "")),
+          ("unknown", True, True))
+    unread = m.data_currency({"asset": a}, ["asset"], after={"asset": {"unknown": "HTTP 500"}})
+    check("re-read failed: unknown (a mid-query rebuild can't be ruled out)", unread["class"], "unknown")
+    check("unexpected mergers travel into the block",
+          m.data_currency({"asset": a, "unexpectedMergers": ["X"]}, ["asset"]).get("unexpectedMergers"), ["X"])
+    check("label form: absolute, 24-hour, UTC spelled out",
+          m.currency_label_utc(ISO0), "2026-09-24 10:12 UTC")
+
+    # --- with_currency ---------------------------------------------------------------------
+    reads = []
+    stamp = {"asset": dict(a), "user": dict(u)}
+    monkeypatch.setattr(m, "ldg_rebuild", lambda: reads.append(1) or stamp)
+    got = m.with_currency(["asset"], lambda: {"rows": []})
+    check("with_currency stamps the result, one read", (got["dataCurrency"]["class"], len(reads)), ("current", 1))
+    reads.clear()
+    m.with_currency(["asset"], lambda: {"rows": []}, straddle=True)
+    check("straddle re-reads after the query", len(reads), 2)
     try:
-        os.environ["MERIDIAN_NO_CACHE"] = "1"
-        check("the merger names are pinned exactly (a rename is a visible test change)",
-              m.LDG_MERGERS, (("asset", ASSET), ("user", USER)))
+        m.with_currency(["asset"], lambda: (_ for _ in ()).throw(ValueError("boom")))
+        raised = False
+    except ValueError:
+        raised = True
+    check("a failing verb still fails (not swallowed into a stamped non-answer)", raised, True)
 
-        # --- found on page 0: one call, end_time as the stamp -----------------------------------
-        serve([filler(3, T0 + 50) + [run(ASSET, T0, dag="d1"), run(USER, T0, dag="d1")] + filler(5, T0)])
-        s = m.ldg_rebuild()
-        check("newest page holds both mergers: one call", (s["apiCalls"], served["calls"]), (1, 1))
-        check("...the platform-sorted read, 20 rows, both sort keys",
-              (s.get("runsSort"), "sortFallback" in s,
-               all(k in served["endpoints"][0] for k in ("size=20&", "sort=platform%2Casc&sort=_time%2Cdesc"))),
-              ("platform", False, True))
-        check("stamp is end_time, as ISO UTC", (s["asset"].get("rebuiltUtc"), s["user"].get("rebuiltUtc")), (ISO0, ISO0))
-        check("...carrying the pipeline run that produced it", s["asset"].get("dagRunId"), "d1")
-        check("a Warning merge is a rebuild, not a failure", "lastRebuildFailed" in s["asset"], False)
+    # --- every data verb emits dataCurrency ---------------------------------------------------
+    monkeypatch.setattr(m, "top_n", lambda *a_, **k: {"top": []})
+    monkeypatch.setattr(m, "list_records", lambda a_: {"rows": [], "totalRecords": 0})
+    monkeypatch.setattr(m, "summarize_by", lambda *a_, **k: {"groups": [], "rebuiltSeen": k.get("rebuilt")})
+    monkeypatch.setattr(m, "stack_metrics", lambda: {"metrics": {"assetCount": 1, "avg30DaysAssetCount": 1}})
+    monkeypatch.setattr(m, "build_profile", lambda *a_, **k: {"type": "user", "stability": {}})
+    monkeypatch.setattr(m, "hr_sources", lambda **k: {"state": "has_data"})
+    monkeypatch.setattr(m, "summarize_connectors", lambda *a_, **k: {"summary": {}})
+    monkeypatch.setattr(m, "diagnose_connection", lambda: {"state": "connected"})
+    monkeypatch.setattr(m, "take_snapshot", lambda **k: {"written": True})
 
-        # --- found deeper: pages until both are seen ---------------------------------------------
-        time_pages = [filler(4, T0 + 90), filler(4, T0 + 80), [run(ASSET, T0), run(USER, T0)]]
-        serve(time_pages)
-        s = m.ldg_rebuild()
-        check("mergers three time-sorted pages deep: one platform-sorted call",
-              (s["apiCalls"], s["asset"].get("rebuiltUtc"), s["runsSort"]), (1, ISO0, "platform"))
-        serve(time_pages, sort="error")
-        s = m.ldg_rebuild()
-        check("a refused sort falls back: mergers on time page 2 are found on page 2",
-              (s["apiCalls"], s["asset"].get("rebuiltUtc"), s["runsSort"]), (3, ISO0, "time"))
-        check("...saying why the cheap read wasn't used", "failed" in s.get("sortFallback", ""), True)
+    class NS:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
 
-        # --- missing within the cap: unknown with a reason, never a timestamp -------------------
-        pages = [filler(4, T0 + 900 - 10 * i) for i in range(10)]
-        pages[0] = pages[0] + [run(ASSET, T0)]
-        serve(pages)
-        s = m.ldg_rebuild()
-        check("a merger absent from the newest pages stops at the cap (after the sorted read hands over)",
-              s["apiCalls"], 1 + m.LDG_REBUILD_MAX_PAGES)
-        check("...the sorted read never decides an unknown: it names the table it couldn't stamp",
-              (s["runsSort"], "no good run for user" in s.get("sortFallback", "")), ("time", True))
-        check("...its table is unknown, with a reason", ("unknown" in s["user"], "rebuiltUtc" in s["user"]), (True, False))
-        check("...naming the merger it looked for", USER in s["user"]["unknown"], True)
-        check("...while the table that WAS found keeps its stamp", s["asset"].get("rebuiltUtc"), ISO0)
+    def out_of(fn, ns):
+        fn(ns)
+        buf = capsys.readouterr().out
+        return json.loads(buf)
 
-        # --- renamed: loud, and names what it found ----------------------------------------------
-        serve([[run("Meridian Asset Merger", T0), run(USER, T0)]])
-        s = m.ldg_rebuild()
-        check("a renamed merger is unknown, not absorbed", "rebuiltUtc" in s["asset"], False)
-        check("...and the reason names the unexpected bridge", "'Meridian Asset Merger'" in s["asset"]["unknown"], True)
-        check("...and says it may have been renamed", "renamed" in s["asset"]["unknown"], True)
-        check("...and the result lists it", s.get("unexpectedMergers"), ["Meridian Asset Merger"])
-        check("the unchanged merger still stamps", s["user"].get("rebuiltUtc"), ISO0)
+    verbs = {
+        "top": (m.cmd_top, NS(table="asset", field="Risk_Score", top=5, where=None, select=None)),
+        "list": (m.cmd_list, NS(table="asset", where=None, select=None, all=False, limit=50, count_only=False)),
+        "list --count-only": (m.cmd_list, NS(table="user", where=None, select=None, all=False, limit=50, count_only=True)),
+        "summary --by": (m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None)),
+        "summary --metrics": (m.cmd_summary, NS(metrics=True, by=None, table="asset", where=None)),
+        "profile": (m.cmd_profile, NS(name="x", type="user")),
+        "compare": (m.cmd_compare, NS(name1="x", name2="y", type="user")),
+        "hr": (m.cmd_hr, NS(refresh=False)),
+        "connectors": (m.cmd_connectors, NS(max_failures=12, max_other=15, full=False, max_warnings=12,
+                                            max_detail=10, refresh=False)),
+        "connect": (m.cmd_connect, NS(with_connectors=False)),
+        "connect --with-connectors": (m.cmd_connect, NS(with_connectors=True, refresh=False, coverage_full=True)),
+        "digest": (m.cmd_digest, NS(table="asset", by=None, field="Risk_Score", top=5, snapshot=False)),
+        "asof": (m.cmd_asof, NS()),
+    }
+    outs = {}
+    # A cache entry MIGHT answer summary --by, so it takes the serial path: stamp first, as the key.
+    monkeypatch.setattr(m, "rescache_scope_live", lambda *a_, **k: True)
+    for label, (fn, ns) in verbs.items():
+        outs[label] = out_of(fn, ns)
+        check("%s carries dataCurrency, current" % label,
+              (outs[label].get("dataCurrency") or {}).get("class"), "current")
+    check("summary --by keys its cache on the stamp", outs["summary --by"].get("rebuiltSeen"), ISO0)
+    check("summary --metrics labels the 30-day averages historical",
+          (outs["summary --metrics"]["dataCurrency"].get("sections") or {})
+          .get("metrics.avg30DaysAssetCount", {}).get("class"), "historical")
+    check("a user profile labels its change-log verdict historical",
+          outs["profile"]["dataCurrency"].get("sections", {}).get("stability", {}).get("class"), "historical")
+    check("compare labels both sides' change-log verdicts",
+          sorted(outs["compare"]["dataCurrency"].get("sections", {})),
+          ["profileA.stability", "profileB.stability"])
+    check("digest labels its headline averages historical",
+          "headline.assets30DayAvg" in outs["digest"]["dataCurrency"].get("sections", {}), True)
+    check("asof speaks the label form",
+          outs["asof"].get("message"), "Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)")
+    monkeypatch.setattr(m, "diagnose_connection", lambda: {"state": "auth_error"})
+    check("a failed connect carries no currency claim",
+          "dataCurrency" in out_of(m.cmd_connect, NS(with_connectors=False)), False)
 
-        # --- failed runs are skipped; the previous good one is the stamp -------------------------
-        for status in ("Error", "FAILED", "Warning&Error", ""):
-            pages = [[run(ASSET, T0 + DAY, status, dag="bad"), run(USER, T0 + DAY, dag="good-u")] + filler(3, T0 + DAY)]
-            pages += [filler(4, T0 + DAY - 100 * i) for i in range(1, 4)]
-            pages += [[run(ASSET, T0, "Success", dag="good-a")]]
-            for mode, calls in (("honour", 1), ("error", 5)):
-                serve(pages, sort=mode)
-                s = m.ldg_rebuild()
-                check("newest asset merge %r (%s): stamps the earlier good run" % (status, mode),
-                      s["asset"].get("rebuiltUtc"), ISO0)
-                check("...flags the failed one with its status %r (%s)" % (status, mode),
-                      (s["asset"].get("lastRebuildFailed") or {}).get("status"), status)
-                check("...in %d call(s) (%r, %s)" % (calls, status, mode), s["apiCalls"], calls)
-        check("a Warning newest run stamps itself",
-              (s["user"].get("rebuiltUtc"), "lastRebuildFailed" in s["user"]),
-              (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(T0 + DAY)), False))
+    # summary --by: a cache hit made no calls, so there is nothing to straddle
+    reads.clear()
+    monkeypatch.setattr(m, "summarize_by", lambda *a_, **k: {"groups": [], "fromCache": True})
+    out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+    check("a cached breakdown reads the stamp once", len(reads), 1)
+    reads.clear()
+    monkeypatch.setattr(m, "summarize_by", lambda *a_, **k: {"groups": []})
+    out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+    check("a computed breakdown re-reads it after", len(reads), 2)
 
-        # --- failed with no earlier success: unknown at the rate-limit backstop -----------------
-        pages = [[run(ASSET, T0 + DAY, "Error"), run(USER, T0 + DAY)]]
-        pages += [filler(2, T0 + DAY - 10 * i) for i in range(1, 40)]
-        serve(pages)
-        s = m.ldg_rebuild()
-        check("a failed newest run with no earlier success stops at the backstop",
-              s["apiCalls"], 1 + m.LDG_REBUILD_FAILED_MAX_PAGES)
-        check("...and is unknown, saying the newest run failed",
-              ("rebuiltUtc" in s["asset"], "failed" in s["asset"].get("unknown", "")), (False, True))
+    # summary --by with nothing cached for that scope: a guaranteed miss, so the stamp is read
+    # beside the work and the entry written after, under the stamp, only if no rebuild landed.
+    monkeypatch.setattr(m, "rescache_scope_live", lambda *a_, **k: False)
+    puts, seen = [], {}
+    monkeypatch.setattr(m, "summary_cache_put", lambda out, table, by, where, rebuilt: puts.append(rebuilt))
+    monkeypatch.setattr(m, "summarize_by", lambda *a_, **k: seen.update(k) or {"groups": []})
+    reads.clear()
+    o = out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+    check("no entry can answer: the breakdown runs unkeyed, bypassing the cache read",
+          (seen.get("refresh"), seen.get("rebuilt")), (True, None))
+    check("...the stamp is read beside it and re-read after", len(reads), 2)
+    check("...the answer is current", (o.get("dataCurrency") or {}).get("class"), "current")
+    check("...and cached under the stamp it was read with", puts, [ISO0])
+    moved = {"asset": dict(a, rebuiltUtc="2026-09-25T10:00:00Z"), "user": dict(u)}
+    seq = [stamp, moved]
+    monkeypatch.setattr(m, "ldg_rebuild", lambda: (reads.append(1), seq[min(len(reads) - 1, 1)])[1])
+    puts.clear()
+    reads.clear()
+    o = out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
+    check("a rebuild during it: flagged, and NOT cached",
+          ((o.get("dataCurrency") or {}).get("rebuildDuringQuery"), puts), (True, []))
+    monkeypatch.setattr(m, "ldg_rebuild", lambda: reads.append(1) or stamp)
 
-        # --- the failed-run search is paid once per failed run -----------------------------------
-        os.environ.pop("MERIDIAN_NO_CACHE", None)
-        m.drop_rescache()
-        pages = [[run(ASSET, T0 + DAY, "Error", dag="bad1"), run(USER, T0 + DAY)]]
-        pages += [filler(3, T0 + DAY - 100 * i) for i in range(1, 6)] + [[run(ASSET, T0, "Success", dag="ok0")]]
-        serve(pages, sort="error")    # the cache serves the time-sorted search, which pages back
-        first = m.ldg_rebuild()
-        second = m.ldg_rebuild()
-        check("the backwards search runs once", first["apiCalls"] > 1, True)
-        check("...and the next check costs one call", second["apiCalls"], 1)
-        check("...with the same stamp and the failure still flagged",
-              (second["asset"].get("rebuiltUtc"), (second["asset"].get("lastRebuildFailed") or {}).get("dagRunId")),
-              (ISO0, "bad1"))
-        pages[0] = [run(ASSET, T0 + 2 * DAY, "Error", dag="bad2"), run(USER, T0 + 2 * DAY)]
-        serve(pages, sort="error")
-        third = m.ldg_rebuild()
-        check("a NEW failed run is a new key: the search runs again", third["apiCalls"] > 1, True)
-        os.environ["MERIDIAN_NO_CACHE"] = "1"
-
-        # --- the platform-sorted read is trusted only when its order checks out ---------------------
-        # Old good merges, a newer good one, and other platforms' runs in between. The right stamp is
-        # always the newest good merge (T0); each broken order must fall back and still find it.
-        mixed = [[run(ASSET, T0 - DAY * k, dag="d%d" % k), run(USER, T0 - DAY * k, dag="d%d" % k)]
-                 + filler(3, T0 - DAY * k + 500) for k in range(3)]
-        mixed[0] += [run("x", T0 + 900, "Success", platform="action")]
-        for mode, why in (("oldest", "runs came back out of time order"),
-                          ("platform-only", "'ML-ENGINE' runs came back out of time order"),
-                          ("ignore", "platforms came back out of order"), ("error", "failed")):
-            serve(mixed, sort=mode)
-            s = m.ldg_rebuild()
-            check("sort %r: not trusted, falls back to the time read" % mode,
-                  (s.get("runsSort"), why in s.get("sortFallback", "")), ("time", True))
-            check("...and still stamps the newest good merge, not an older one (%s)" % mode,
-                  (s["asset"].get("rebuiltUtc"), s["user"].get("rebuiltUtc")), (ISO0, ISO0))
-        serve(mixed)
-        s = m.ldg_rebuild()
-        check("the same runs, honestly sorted: trusted, newest good merge, one call",
-              (s.get("runsSort"), s["asset"].get("rebuiltUtc"), s["apiCalls"]), ("platform", ISO0, 1))
-
-        # Oldest first, and built to pass both order checks: one old merge's two rows (equal times),
-        # then one row each of three other platforms, ascending. Nothing on it shows a time sort was
-        # applied, so it must not answer -- trusted, it would stamp the merge a day before the latest.
-        liar = [run(ASSET, T0 - DAY, dag="old"), run(USER, T0 - DAY, dag="old")]
-        liar += [run("x", T0 - DAY + 60 * i, "Success", platform=p) for i, p in enumerate(("b", "c", "d"), 1)]
-        serve([[run(ASSET, T0, dag="new"), run(USER, T0, dag="new")] + filler(3, T0 - 10)], sort=liar)
-        s = m.ldg_rebuild()
-        check("an oldest-first page that passes both order checks: not trusted without a descending pair",
-              (s.get("runsSort"), "no sign" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")),
-              ("time", True, ISO0))
-
-        # Merger rows rising in time, with a descending pair elsewhere so the evidence rule is met, and
-        # the real newest merge off the page. Only the within-platform time check stands between this
-        # and a stamp two days old.
-        rising = [run(ASSET, T0 - 2 * DAY), run(USER, T0 - 2 * DAY), run(ASSET, T0 - DAY), run(USER, T0 - DAY)]
-        rising += [run("x", T0 + 3, "Success", platform="api"), run("x", T0 + 2, "Success", platform="api")]
-        serve([[run(ASSET, T0), run(USER, T0)] + filler(3, T0 - 10)], sort=rising)
-        s = m.ldg_rebuild()
-        check("merger runs rising in time: not trusted, and the newest merge is still the stamp",
-              ("'ML-ENGINE' runs came back out of time order" in s.get("sortFallback", ""),
-               s["asset"].get("rebuiltUtc")), (True, ISO0))
-
-        # A row with no platform sorts last; one appearing before a platform means the order is wrong.
-        serve([[{"bridge_name": "y", "_time": T0 * 1000 + 5}] + [run(ASSET, T0), run(USER, T0)]], sort="ignore")
-        s = m.ldg_rebuild()
-        check("a platform-less row ahead of the mergers: not trusted",
-              ("out of order" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")), (True, ISO0))
-
-        # A merger with no _time can't be checked against the sort, so it can't vouch for the order.
-        bare = run(ASSET, T0)
-        bare.pop("_time")
-        serve([[bare, run(USER, T0)]], sort="ignore")
-        s = m.ldg_rebuild()
-        check("a merger run with no _time: not trusted, still stamped by the time read",
-              ("no _time" in s.get("sortFallback", ""), s["asset"].get("rebuiltUtc")), (True, ISO0))
-
-        # A 4-hour stack with a run of failed asset merges: the ML-ENGINE group spans sorted pages,
-        # and the sorted read pages through it to the last good one.
-        runs = [run(ASSET, T0 + 3600 * k, "Error", dag="bad%d" % k) for k in range(1, 26)]
-        runs += [run(USER, T0 + 3600 * k, dag="u%d" % k) for k in range(1, 26)]
-        runs += [run(ASSET, T0, "Success", dag="ok")] + filler(5, T0 - 10)
-        runs.sort(key=lambda r: -r["_time"])
-        serve([runs])
-        s = m.ldg_rebuild()
-        check("the ML-ENGINE group spans pages: the sorted read pages to the last good merge",
-              (s.get("runsSort"), s["asset"].get("rebuiltUtc"), s["apiCalls"],
-               (s["asset"].get("lastRebuildFailed") or {}).get("dagRunId")),
-              ("platform", ISO0, 3, "bad25"))
-
-        # --- summary --by's scope index: what makes a guaranteed miss knowable before the stamp ------
-        os.environ.pop("MERIDIAN_NO_CACHE", None)
-        m.drop_rescache()
-        sc = m._summary_scope("asset", "Risk_Level", [])
-        check("scope index: no entry is a guaranteed miss", m.rescache_scope_live("summary_by", 900, sc), False)
-        m.summary_cache_put({"complete": True, "groups": []}, "asset", "Risk_Level", [], ISO0)
-        check("...an entry for the scope, under any rebuild, may hit", m.rescache_scope_live("summary_by", 900, sc), True)
-        check("...but not for another scope",
-              m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "OS", [])), False)
-        check("...nor once it has expired", m.rescache_scope_live("summary_by", 0, sc), False)
-        check("...and it is the entry summarize_by reads under that stamp",
-              m.rescache_get("summary_by", 900, table="asset", by="Risk_Level", where=[], rebuilt=ISO0)[0],
-              {"complete": True, "groups": []})
-        m.summary_cache_put({"groups": []}, "asset", "Owner", [], ISO0)
-        check("...an unanswered coverage check is still not cached",
-              m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "Owner", [])), False)
-        m.rescache_put("summary_by", {"groups": []}, table="asset", by="OS", where=[], rebuilt=ISO0)
-        check("...an entry written before scopes existed might be the one, so it may hit",
-              m.rescache_scope_live("summary_by", 900, m._summary_scope("asset", "OS", [])), True)
-        m.drop_rescache()
-        os.environ["MERIDIAN_NO_CACHE"] = "1"
-        check("...and a disabled cache is always a guaranteed miss", m.rescache_scope_live("summary_by", 900, sc), False)
-
-        # --- never raises; unconfigured makes no call ---------------------------------------------
-        serve([], fail="HTTP 403: Forbidden")
-        s = m.ldg_rebuild()
-        check("an unreadable endpoint is unknown for both tables, not an exception",
-              ("could not read" in s["asset"].get("unknown", ""), "rebuiltUtc" in s["user"]), (True, False))
-        serve([[run(ASSET, T0), run(USER, T0)]])
-        # Isolated from THIS machine: with only _CFG_CACHE cleared, an operator's real
-        # ~/.meridian/config.json made the stack "configured" and this passed in CI only.
-        m._CFG_CACHE = None
-        m.CFG_PATH = os.path.join(tmp, "no-such-config.json")
-        saved_env = {k: os.environ.pop(k, None) for k in ("MERIDIAN_FQDN", "MERIDIAN_API_TOKEN")}
-        try:
-            s = m.ldg_rebuild()
-        finally:
-            os.environ.update({k: v for k, v in saved_env.items() if v is not None})
-            m.CFG_PATH = real["CFG_PATH"]
-        check("unconfigured: unknown, and no network call",
-              (s["asset"].get("unknown"), served["calls"]), ("no stack is configured", 0))
-        m._CFG_CACHE = ("s.example", "tok", None)
-
-        # --- _merger_end ----------------------------------------------------------------------------
-        r = run(ASSET, T0)
-        r["_utc"] = "2026-09-24T10:30:00.000+00:00"
-        check("end_time wins over _utc when they disagree", m._merger_end(r)[1], ISO0)
-        r.pop("end_time")
-        check("_utc is the fallback without end_time", m._merger_end(r)[1], "2026-09-24T10:30:00Z")
-        check("milliseconds are tolerated", m._merger_end({"end_time": T0 * 1000})[1], ISO0)
-        check("an undatable run is None, not now", m._merger_end({"_utc": "yesterday"}), (None, None))
-
-        # --- data_currency -------------------------------------------------------------------------
-        a = {"rebuiltUtc": ISO0, "dagRunId": "d1"}
-        u = {"rebuiltUtc": ISO0, "dagRunId": "d1"}
-        cur = m.data_currency({"asset": a, "user": u}, ["asset", "user"])
-        check("both known: current, both stamped",
-              (cur["class"], cur.get("ldgRebuiltUtc")), ("current", {"asset": ISO0, "user": ISO0}))
-        check("...with the query time beside it, not instead of it", bool(cur.get("queriedUtc")), True)
-        check("...and no split", "mergersSplit" in cur, False)
-        split = m.data_currency({"asset": a, "user": dict(u, dagRunId="d0")}, ["asset", "user"])
-        check("two pipeline runs: mergersSplit", split.get("mergersSplit"), True)
-        unk = m.data_currency({"asset": a, "user": {"unknown": "no run"}}, ["asset", "user"])
-        check("one table unknown: the answer is unknown, never current",
-              (unk["class"], "ldgRebuiltUtc" in unk, "no run" in unk.get("reason", "")), ("unknown", False, True))
-        check("a table the answer doesn't use doesn't taint it",
-              m.data_currency({"asset": a, "user": {"unknown": "x"}}, ["asset"])["class"], "current")
-        check("an empty stamp is unknown", m.data_currency({}, ["asset"])["class"], "unknown")
-        same = m.data_currency({"asset": a}, ["asset"], after={"asset": dict(a)})
-        check("re-read unchanged: current", same["class"], "current")
-        moved = m.data_currency({"asset": a}, ["asset"], after={"asset": {"rebuiltUtc": "2026-09-24T14:05:00Z"}})
-        check("rebuilt mid-query: unknown with rebuildDuringQuery",
-              (moved["class"], moved.get("rebuildDuringQuery"), "Re-run" in moved.get("reason", "")),
-              ("unknown", True, True))
-        unread = m.data_currency({"asset": a}, ["asset"], after={"asset": {"unknown": "HTTP 500"}})
-        check("re-read failed: unknown (a mid-query rebuild can't be ruled out)", unread["class"], "unknown")
-        check("unexpected mergers travel into the block",
-              m.data_currency({"asset": a, "unexpectedMergers": ["X"]}, ["asset"]).get("unexpectedMergers"), ["X"])
-        check("label form: absolute, 24-hour, UTC spelled out",
-              m.currency_label_utc(ISO0), "2026-09-24 10:12 UTC")
-
-        # --- with_currency ---------------------------------------------------------------------
-        reads = []
-        stamp = {"asset": dict(a), "user": dict(u)}
-        m.ldg_rebuild = lambda: reads.append(1) or stamp
-        got = m.with_currency(["asset"], lambda: {"rows": []})
-        check("with_currency stamps the result, one read", (got["dataCurrency"]["class"], len(reads)), ("current", 1))
-        reads.clear()
-        m.with_currency(["asset"], lambda: {"rows": []}, straddle=True)
-        check("straddle re-reads after the query", len(reads), 2)
-        try:
-            m.with_currency(["asset"], lambda: (_ for _ in ()).throw(ValueError("boom")))
-            raised = False
-        except ValueError:
-            raised = True
-        check("a failing verb still fails (not swallowed into a stamped non-answer)", raised, True)
-
-        # --- every data verb emits dataCurrency ---------------------------------------------------
-        m.top_n = lambda *a_, **k: {"top": []}
-        m.list_records = lambda a_: {"rows": [], "totalRecords": 0}
-        m.summarize_by = lambda *a_, **k: {"groups": [], "rebuiltSeen": k.get("rebuilt")}
-        m.stack_metrics = lambda: {"metrics": {"assetCount": 1, "avg30DaysAssetCount": 1}}
-        m.build_profile = lambda *a_, **k: {"type": "user", "stability": {}}
-        m.hr_sources = lambda **k: {"state": "has_data"}
-        m.summarize_connectors = lambda *a_, **k: {"summary": {}}
-        m.diagnose_connection = lambda: {"state": "connected"}
-        m.take_snapshot = lambda **k: {"written": True}
-
-        class NS:
-            def __init__(self, **kw):
-                self.__dict__.update(kw)
-
-        def out_of(fn, ns):
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                fn(ns)
-            return json.loads(buf.getvalue())
-
-        verbs = {
-            "top": (m.cmd_top, NS(table="asset", field="Risk_Score", top=5, where=None, select=None)),
-            "list": (m.cmd_list, NS(table="asset", where=None, select=None, all=False, limit=50, count_only=False)),
-            "list --count-only": (m.cmd_list, NS(table="user", where=None, select=None, all=False, limit=50, count_only=True)),
-            "summary --by": (m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None)),
-            "summary --metrics": (m.cmd_summary, NS(metrics=True, by=None, table="asset", where=None)),
-            "profile": (m.cmd_profile, NS(name="x", type="user")),
-            "compare": (m.cmd_compare, NS(name1="x", name2="y", type="user")),
-            "hr": (m.cmd_hr, NS(refresh=False)),
-            "connectors": (m.cmd_connectors, NS(max_failures=12, max_other=15, full=False, max_warnings=12,
-                                                max_detail=10, refresh=False)),
-            "connect": (m.cmd_connect, NS(with_connectors=False)),
-            "connect --with-connectors": (m.cmd_connect, NS(with_connectors=True, refresh=False, coverage_full=True)),
-            "digest": (m.cmd_digest, NS(table="asset", by=None, field="Risk_Score", top=5, snapshot=False)),
-            "asof": (m.cmd_asof, NS()),
-        }
-        outs = {}
-        # A cache entry MIGHT answer summary --by, so it takes the serial path: stamp first, as the key.
-        m.rescache_scope_live = lambda *a_, **k: True
-        for label, (fn, ns) in verbs.items():
-            outs[label] = out_of(fn, ns)
-            check("%s carries dataCurrency, current" % label,
-                  (outs[label].get("dataCurrency") or {}).get("class"), "current")
-        check("summary --by keys its cache on the stamp", outs["summary --by"].get("rebuiltSeen"), ISO0)
-        check("summary --metrics labels the 30-day averages historical",
-              (outs["summary --metrics"]["dataCurrency"].get("sections") or {})
-              .get("metrics.avg30DaysAssetCount", {}).get("class"), "historical")
-        check("a user profile labels its change-log verdict historical",
-              outs["profile"]["dataCurrency"].get("sections", {}).get("stability", {}).get("class"), "historical")
-        check("compare labels both sides' change-log verdicts",
-              sorted(outs["compare"]["dataCurrency"].get("sections", {})),
-              ["profileA.stability", "profileB.stability"])
-        check("digest labels its headline averages historical",
-              "headline.assets30DayAvg" in outs["digest"]["dataCurrency"].get("sections", {}), True)
-        check("asof speaks the label form",
-              outs["asof"].get("message"), "Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)")
-        m.diagnose_connection = lambda: {"state": "auth_error"}
-        check("a failed connect carries no currency claim",
-              "dataCurrency" in out_of(m.cmd_connect, NS(with_connectors=False)), False)
-
-        # summary --by: a cache hit made no calls, so there is nothing to straddle
-        reads.clear()
-        m.summarize_by = lambda *a_, **k: {"groups": [], "fromCache": True}
-        out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
-        check("a cached breakdown reads the stamp once", len(reads), 1)
-        reads.clear()
-        m.summarize_by = lambda *a_, **k: {"groups": []}
-        out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
-        check("a computed breakdown re-reads it after", len(reads), 2)
-
-        # summary --by with nothing cached for that scope: a guaranteed miss, so the stamp is read
-        # beside the work and the entry written after, under the stamp, only if no rebuild landed.
-        m.rescache_scope_live = lambda *a_, **k: False
-        puts, seen = [], {}
-        m.summary_cache_put = lambda out, table, by, where, rebuilt: puts.append(rebuilt)
-        m.summarize_by = lambda *a_, **k: seen.update(k) or {"groups": []}
-        reads.clear()
-        o = out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
-        check("no entry can answer: the breakdown runs unkeyed, bypassing the cache read",
-              (seen.get("refresh"), seen.get("rebuilt")), (True, None))
-        check("...the stamp is read beside it and re-read after", len(reads), 2)
-        check("...the answer is current", (o.get("dataCurrency") or {}).get("class"), "current")
-        check("...and cached under the stamp it was read with", puts, [ISO0])
-        moved = {"asset": dict(a, rebuiltUtc="2026-09-25T10:00:00Z"), "user": dict(u)}
-        seq = [stamp, moved]
-        m.ldg_rebuild = lambda: (reads.append(1), seq[min(len(reads) - 1, 1)])[1]
-        puts.clear()
-        reads.clear()
-        o = out_of(m.cmd_summary, NS(metrics=False, by="Risk_Level", table="asset", where=None))
-        check("a rebuild during it: flagged, and NOT cached",
-              ((o.get("dataCurrency") or {}).get("rebuildDuringQuery"), puts), (True, []))
-        m.ldg_rebuild = lambda: reads.append(1) or stamp
-
-        # Every top-level verb is classified, so a new one fails here until someone decides.
-        src = open(MERIDIAN_PY, encoding="utf-8").read()
-        declared = set(re.findall(r'\bsub\.add_parser\("([a-z-]+)"', src))
-        stamped = {"top", "list", "summary", "profile", "compare", "hr", "connectors", "connect", "digest", "asof"}
-        # Not LDG reads: config, metadata, diagnostics, updates, rendering of an input file, and the raw
-        # passthrough (SKILL.md treats `api` output as currency-unknown). The local-history verbs are
-        # historical by definition and get their own labels in phase 2 of design/data-currency.md.
-        not_ldg = {"api", "refresh-fields", "labels", "check", "selfupdate", "stacks", "report"}
-        history = {"snapshot", "snapshots", "trend", "metrics", "alerts"}
-        check("every verb is classified for data currency",
-              sorted(declared - stamped - not_ldg - history), [])
-        check("...and nothing classified has been removed", sorted((stamped | not_ldg | history) - declared), [])
-    finally:
-        for n, v in real.items():
-            setattr(m, n, v)
-        if real_env is None:
-            os.environ.pop("MERIDIAN_NO_CACHE", None)
-        else:
-            os.environ["MERIDIAN_NO_CACHE"] = real_env
-        shutil.rmtree(tmp, ignore_errors=True)
+    # Every top-level verb is classified, so a new one fails here until someone decides.
+    src = open(MERIDIAN_PY, encoding="utf-8").read()
+    declared = set(re.findall(r'\bsub\.add_parser\("([a-z-]+)"', src))
+    stamped = {"top", "list", "summary", "profile", "compare", "hr", "connectors", "connect", "digest", "asof"}
+    # Not LDG reads: config, metadata, diagnostics, updates, rendering of an input file, and the raw
+    # passthrough (SKILL.md treats `api` output as currency-unknown). The local-history verbs are
+    # historical by definition and get their own labels in phase 2 of design/data-currency.md.
+    not_ldg = {"api", "refresh-fields", "labels", "check", "selfupdate", "stacks", "report"}
+    history = {"snapshot", "snapshots", "trend", "metrics", "alerts"}
+    check("every verb is classified for data currency",
+          sorted(declared - stamped - not_ldg - history), [])
+    check("...and nothing classified has been removed", sorted((stamped | not_ldg | history) - declared), [])
 
 
+@pytest.mark.live
 def test_live_currency(m):
     """The facts design/data-currency.md rests on, re-checked on whichever stack the suite runs against.
 
@@ -5938,7 +5560,6 @@ def test_live_currency(m):
     Don't add a tolerance or a skip: this failing is the whole mechanism, and CLAUDE.md makes `--live`
     a required release step so a rename is caught before a release ships rather than by a user.
     """
-    print("[52] live data currency: merger names, rebuild = LDG (needs a configured, reachable stack)")
     proc = subprocess.run([sys.executable, MERIDIAN_PY, "asof"], capture_output=True, text=True, timeout=120)
     out = json.loads(proc.stdout)
     cur = out.get("dataCurrency") or {}
@@ -5978,7 +5599,7 @@ def test_live_currency(m):
               good[0].get("output_records") if good else None, metrics.get(key))
 
 
-def test_historical_labels(m):
+def test_historical_labels(m, monkeypatch, tmp_path):
     """History-reading verbs say they are historical, and a trend's data point is an LDG rebuild.
 
     Phase 2 of design/data-currency.md. The load-bearing claims: (1) a history with no rebuild stamps
@@ -5988,7 +5609,6 @@ def test_historical_labels(m):
     several points, and one rebuild seen on two dates is ONE point, not a flat segment; (4) nothing read
     back from local snapshots is ever labelled current.
     """
-    print("[53] historical labels + rebuild-keyed trend points (offline)")
     import contextlib
     import io
     import tempfile
@@ -6085,80 +5705,74 @@ def test_historical_labels(m):
     check("an empty history is still historical, not current",
           m.compute_trend([]).get("dataCurrency", {}).get("class"), "historical")
 
-    real = {n: getattr(m, n) for n in ("CFG_DIR", "load_config", "load_snapshots", "load_alerts",
-                                       "ldg_rebuild", "name_entities", "add_metric", "measure_metric",
-                                       "load_metrics")}
-    tmp = tempfile.mkdtemp(prefix="hist-")
-    try:
-        m.CFG_DIR = tmp
-        m.load_config = lambda: ("s.example", "tok", None)
-        path = os.path.join(tmp, "snaps.jsonl")
-        with open(path, "w", encoding="utf-8") as f:
-            for r in daily_st:
-                f.write(json.dumps(r) + "\n")
-        s = m.snapshots_summary(path)
-        check("snapshots list is historical, oldest to newest",
-              (s["dataCurrency"]["class"], s["dataCurrency"]["from"], s["dataCurrency"]["to"]),
-              ("historical", "2026-09-01", "2026-09-07"))
-        check("...and counts the records that carry a rebuild stamp", s["withRebuildStamp"], len(daily_st))
+    tmp = tempfile.mkdtemp(prefix="hist-", dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    path = os.path.join(tmp, "snaps.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for r in daily_st:
+            f.write(json.dumps(r) + "\n")
+    s = m.snapshots_summary(path)
+    check("snapshots list is historical, oldest to newest",
+          (s["dataCurrency"]["class"], s["dataCurrency"]["from"], s["dataCurrency"]["to"]),
+          ("historical", "2026-09-01", "2026-09-07"))
+    check("...and counts the records that carry a rebuild stamp", s["withRebuildStamp"], len(daily_st))
 
-        m.load_snapshots = lambda *a_, **k: (list(four), [])
-        m.load_alerts = lambda: []
-        v = m._current_alert_verdict()
-        check("an alert verdict is historical (the latest SNAPSHOT, not the stack now)",
-              v.get("dataCurrency", {}).get("class"), "historical")
-        check("...and its window counts points: two same-day rebuilds are a 0-day window",
-              (v["window"].get("dataPoints"), v["window"].get("days")), (2, 0))
+    monkeypatch.setattr(m, "load_snapshots", lambda *a_, **k: (list(four), []))
+    monkeypatch.setattr(m, "load_alerts", lambda: [])
+    v = m._current_alert_verdict()
+    check("an alert verdict is historical (the latest SNAPSHOT, not the stack now)",
+          v.get("dataCurrency", {}).get("class"), "historical")
+    check("...and its window counts points: two same-day rebuilds are a 0-day window",
+          (v["window"].get("dataPoints"), v["window"].get("days")), (2, 0))
 
-        # --- snapshot records carry the rebuild they measured -----------------------------------------
-        cur = {"class": "current", "ldgRebuiltUtc": {"asset": "2026-09-24T10:12:12Z", "user": "2026-09-24T10:12:12Z"}}
-        dig = {"generated": "digest", "stack": "s.example", "metrics": {"metrics": {"date": "2026-09-24"}}}
-        rec = m.snapshot_record(dict(dig, dataCurrency=cur))
-        check("a snapshot records its rebuild", rec.get("ldgRebuiltUtc"), cur["ldgRebuiltUtc"])
-        rec = m.snapshot_record(dict(dig, dataCurrency={"class": "unknown", "reason": "rebuilt mid-query"}))
-        check("an unknown stamp is recorded as unknown, never guessed",
-              ("ldgRebuiltUtc" in rec, rec.get("ldgRebuildUnknown")), (False, "rebuilt mid-query"))
-        check("a digest with no currency block writes neither key",
-              sorted(k for k in m.snapshot_record(dig) if k.startswith("ldgRebuil")), [])
+    # --- snapshot records carry the rebuild they measured -----------------------------------------
+    cur = {"class": "current", "ldgRebuiltUtc": {"asset": "2026-09-24T10:12:12Z", "user": "2026-09-24T10:12:12Z"}}
+    dig = {"generated": "digest", "stack": "s.example", "metrics": {"metrics": {"date": "2026-09-24"}}}
+    rec = m.snapshot_record(dict(dig, dataCurrency=cur))
+    check("a snapshot records its rebuild", rec.get("ldgRebuiltUtc"), cur["ldgRebuiltUtc"])
+    rec = m.snapshot_record(dict(dig, dataCurrency={"class": "unknown", "reason": "rebuilt mid-query"}))
+    check("an unknown stamp is recorded as unknown, never guessed",
+          ("ldgRebuiltUtc" in rec, rec.get("ldgRebuildUnknown")), (False, "rebuilt mid-query"))
+    check("a digest with no currency block writes neither key",
+          sorted(k for k in m.snapshot_record(dig) if k.startswith("ldgRebuil")), [])
 
-        # --- trend --name-entities: live names stamped like any LDG read --------------------------------
-        m.ldg_rebuild = lambda: {"asset": {"rebuiltUtc": "2026-09-24T10:12:12Z", "dagRunId": "d"},
-                                 "user": {"rebuiltUtc": "2026-09-24T10:12:12Z", "dagRunId": "d"}}
+    # --- trend --name-entities: live names stamped like any LDG read --------------------------------
+    monkeypatch.setattr(m, "ldg_rebuild",
+                        lambda: {"asset": {"rebuiltUtc": "2026-09-24T10:12:12Z", "dagRunId": "d"},
+                                 "user": {"rebuiltUtc": "2026-09-24T10:12:12Z", "dagRunId": "d"}})
 
-        def fake_name(diff, limit=None):
-            diff["names"] = {"abc": "HOST1"}
-        m.name_entities = fake_name
-        ent = {"comparable": True, "scope": "asset:Risk_Score:top:5"}
-        m.load_snapshots = lambda *a_, **k: ([dict(daily_st[0], entities=ent), dict(daily_st[-1], entities=ent)], [])
+    def fake_name(diff, limit=None):
+        diff["names"] = {"abc": "HOST1"}
+    monkeypatch.setattr(m, "name_entities", fake_name)
+    ent = {"comparable": True, "scope": "asset:Risk_Score:top:5"}
+    monkeypatch.setattr(m, "load_snapshots",
+                        lambda *a_, **k: ([dict(daily_st[0], entities=ent), dict(daily_st[-1], entities=ent)], []))
 
-        class TA:
-            since = metric = table = by = format = out = None
-            name_entities = True
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_trend(TA())
-        tout = json.loads(buf.getvalue())
-        sec = (tout.get("dataCurrency", {}).get("sections") or {}).get("entities.names") or {}
-        check("trend --name-entities stays historical overall", tout["dataCurrency"]["class"], "historical")
-        check("...while the live names are stamped current", (sec.get("class"), bool(sec.get("ldgRebuiltUtc"))),
-              ("current", True))
+    class TA:
+        since = metric = table = by = format = out = None
+        name_entities = True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_trend(TA())
+    tout = json.loads(buf.getvalue())
+    sec = (tout.get("dataCurrency", {}).get("sections") or {}).get("entities.names") or {}
+    check("trend --name-entities stays historical overall", tout["dataCurrency"]["class"], "historical")
+    check("...while the live names are stamped current", (sec.get("class"), bool(sec.get("ldgRebuiltUtc"))),
+          ("current", True))
 
-        # --- metrics add --derived: the baseline is a live measurement ---------------------------------------
-        m.add_metric = lambda *a_, **k: ({"name": "kev", "table": "asset"}, None)
-        m.measure_metric = lambda rec_: {"name": "kev", "ok": True, "count": 455}
-        m.load_metrics = lambda: [{"name": "kev"}]
+    # --- metrics add --derived: the baseline is a live measurement ---------------------------------------
+    monkeypatch.setattr(m, "add_metric", lambda *a_, **k: ({"name": "kev", "table": "asset"}, None))
+    monkeypatch.setattr(m, "measure_metric", lambda rec_: {"name": "kev", "ok": True, "count": 455})
+    monkeypatch.setattr(m, "load_metrics", lambda: [{"name": "kev"}])
 
-        class MA:
-            metrics_cmd, name, label, table, where, smart_label, derived = "add", "kev", "KEV", "asset", None, None, True
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            m.cmd_metrics(MA())
-        check("a derived metric's baseline is stamped current",
-              json.loads(buf.getvalue()).get("dataCurrency", {}).get("class"), "current")
-    finally:
-        for n_, v_ in real.items():
-            setattr(m, n_, v_)
-        shutil.rmtree(tmp, ignore_errors=True)
+    class MA:
+        metrics_cmd, name, label, table, where, smart_label, derived = "add", "kev", "KEV", "asset", None, None, True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        m.cmd_metrics(MA())
+    check("a derived metric's baseline is stamped current",
+          json.loads(buf.getvalue()).get("dataCurrency", {}).get("class"), "current")
 
     # --- reports say which kind of data they show -----------------------------------------------------------
     one = "2026-09-24T10:12:12Z"
@@ -6178,28 +5792,20 @@ def test_historical_labels(m):
     sub, _, _ = m._trend_html({"generated": "trend", "insufficientHistory": True, "snapshotsRead": 1})
     check("a trend report's subtitle leads with Historical", sub.startswith("Historical"), True)
 
-    tmp = tempfile.mkdtemp(prefix="hist-report-")
-    try:
-        inp = os.path.join(tmp, "in.json")
-        with open(inp, "w", encoding="utf-8") as f:
-            json.dump({"table": "asset", "field": "Risk_Score", "matchedAtThreshold": 1, "totalInTail": 1,
-                       "top": [{"Asset_Name": "X"}],
-                       "dataCurrency": {"class": "current", "ldgRebuiltUtc": {"asset": one}}}, f)
+    tmp = tempfile.mkdtemp(prefix="hist-report-", dir=tmp_path)
+    inp = os.path.join(tmp, "in.json")
+    with open(inp, "w", encoding="utf-8") as f:
+        json.dump({"table": "asset", "field": "Risk_Score", "matchedAtThreshold": 1, "totalInTail": 1,
+                   "top": [{"Asset_Name": "X"}],
+                   "dataCurrency": {"class": "current", "ldgRebuiltUtc": {"asset": one}}}, f)
 
-        class R:
-            input, out, title, date, html = [inp], os.path.join(tmp, "r.html"), "T", "2026-09-24", True
-        real_lc = m.load_config
-        m.load_config = lambda: ("s.example", "tok", None)
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                m.cmd_report(R())
-        finally:
-            m.load_config = real_lc
-        html = open(os.path.join(tmp, "r.html"), encoding="utf-8").read()
-        check("the rendered report carries the currency line",
-              "Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)" in html, True)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    class R:
+        input, out, title, date, html = [inp], os.path.join(tmp, "r.html"), "T", "2026-09-24", True
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    m.cmd_report(R())
+    html = open(os.path.join(tmp, "r.html"), encoding="utf-8").read()
+    check("the rendered report carries the currency line",
+          "Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild)" in html, True)
 
 
 CURRENCY_RULES = (
@@ -6250,7 +5856,6 @@ def test_currency_routing(m):
     The label cross-check is the other half: if SKILL.md told the model to write one form and the
     report or `asof` printed another, a user would see two "as of" lines disagree about the same data.
     """
-    print("[54] SKILL.md carries the data-currency rules, in the labels the code prints")
     flat = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
     check("SKILL.md has the data-currency section", "### 4.1 Current or historical: say which, every time" in flat, True)
     for what, text in CURRENCY_RULES:
@@ -6269,8 +5874,8 @@ def test_currency_routing(m):
           "`asof` — **when the LDG was last rebuilt" in ref and "carries `dataCurrency`" in ref, True)
 
 
+@pytest.mark.live
 def test_live_connectors():
-    print("[22] live connectors / data coverage (needs a configured, reachable stack)")
     proc = subprocess.run([sys.executable, MERIDIAN_PY, "connectors"],
                           capture_output=True, text=True, timeout=120)
     out = json.loads(proc.stdout)
@@ -6290,12 +5895,91 @@ def test_live_connectors():
         check("no %r in live output" % leak, leak in blob, False)
 
 
-def _su_package(root, version, entry_body=None, extra=None, prefix="meridiancs/"):
+# --- Test-only release signing ------------------------------------------------------------------
+#
+# Fixtures are signed with `cryptography`'s Ed25519, a reference implementation that shares nothing
+# with meridian.py's hand-written verifier, so a shared arithmetic mistake cannot make both agree on
+# a wrong answer. The seeds are public constants, so these keys sign NOTHING real:
+# test_release_signing asserts no shipped key is one of them.
+_TEST_SEEDS = {"a": bytes(range(32)), "b": bytes(range(32, 64)), "c": bytes(range(64, 96))}
+
+
+def _t_sign(seed, msg):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    key = Ed25519PrivateKey.from_private_bytes(seed)
+    return key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw), key.sign(msg)
+
+
+def _t_verifies(public_key, msg, signature):
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, msg)
+        return True
+    except InvalidSignature:
+        return False
+
+
+def _t_str(b):
+    return len(b).to_bytes(4, "big") + b
+
+
+def _t_pub_blob(seed):
+    return _t_str(b"ssh-ed25519") + _t_str(_t_sign(seed, b"")[0])
+
+
+def _t_pub_line(name):
+    import base64
+    return "ssh-ed25519 %s meridiancs-TEST-key-%s" % (
+        base64.b64encode(_t_pub_blob(_TEST_SEEDS[name])).decode("ascii"), name)
+
+
+def _t_sshsig(name, message, namespace="meridiancs-release", hash_alg="sha512", sig_type=b"ssh-ed25519",
+              version=1, tamper_sig=False):
+    """An armored SSHSIG block signed by test key `name`, written from PROTOCOL.sshsig directly."""
+    import base64
+    seed = _TEST_SEEDS[name]
+    signed = (b"SSHSIG" + _t_str(namespace.encode()) + _t_str(b"") + _t_str(hash_alg.encode())
+              + _t_str(hashlib.new(hash_alg, message).digest()))
+    raw = _t_sign(seed, signed)[1]
+    if tamper_sig:
+        raw = raw[:10] + bytes([raw[10] ^ 1]) + raw[11:]
+    body = (b"SSHSIG" + version.to_bytes(4, "big") + _t_str(_t_pub_blob(seed))
+            + _t_str(namespace.encode()) + _t_str(b"") + _t_str(hash_alg.encode())
+            + _t_str(_t_str(sig_type) + _t_str(raw)))
+    b64 = base64.b64encode(body).decode("ascii")
+    return ("-----BEGIN SSH SIGNATURE-----\n%s\n-----END SSH SIGNATURE-----\n"
+            % "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70)))
+
+
+def _su_sign(path, key="a"):
+    """Write `path`.sig, signed by test key `key` (None: remove any signature)."""
+    if key is None:
+        if os.path.exists(path + ".sig"):
+            os.remove(path + ".sig")
+        return
+    with open(path, "rb") as f:
+        block = _t_sshsig(key, f.read())
+    with open(path + ".sig", "w", encoding="ascii", newline="\n") as f:
+        f.write(block)
+
+
+def _su_fetch(pkg):
+    """A stand-in for _download_asset serving `pkg`, and `pkg`.sig for the signature URL."""
+    def _f(url, dest):
+        shutil.copyfile(pkg + ".sig" if url.endswith(".sig") else pkg, dest)
+        return os.path.getsize(dest)
+    return _f
+
+
+def _su_package(root, version, entry_body=None, extra=None, prefix="meridiancs/", sign="a"):
     """Build a minimal but REAL skill package zip at `root`, and return its path.
 
     Minimal on purpose: the tests here are about the update machinery, and building the actual
     package would need a clean tree. `scripts/meridian.py` is a stub that answers --help, because
-    that is precisely what apply_update's smoke test runs.
+    that is precisely what apply_update's smoke test runs. It is signed by test key `sign` (the one
+    _su_env makes the module trust) into `<path>.sig`; None leaves it unsigned.
     """
     import zipfile
     body = entry_body if entry_body is not None else (
@@ -6313,6 +5997,7 @@ def _su_package(root, version, entry_body=None, extra=None, prefix="meridiancs/"
     with zipfile.ZipFile(path, "w") as z:
         for name, content in members.items():
             z.writestr(name, content)
+    _su_sign(path, sign)
     return path
 
 
@@ -6329,32 +6014,24 @@ def _su_install(root, version):
     return d
 
 
-class _SUEnv(object):
-    """Point the module's install/config globals at a temp tree, and restore them afterwards.
+def _su_env(monkeypatch, m, install_dir, tmp):
+    """Point the module's install/config globals at a temp tree.
 
     Everything here is a module global read at call time, so patching them is enough -- and it is
     mandatory: without it these tests would rewrite the operator's own ~/.meridian/.updatecheck and,
     far worse, run install_markers() against the real working tree.
     """
-    NAMES = ("INSTALL_DIR", "INSTALL_REAL", "VERSION_PATH", "UPDATE_CHECK_PATH", "CFG_DIR", "CFG_PATH")
-
-    def __init__(self, m, install_dir, tmp):
-        self.m, self.saved = m, {n: getattr(m, n) for n in self.NAMES}
-        cfg = os.path.join(tmp, "dot-meridian")
-        m.INSTALL_DIR = install_dir
-        m.INSTALL_REAL = os.path.realpath(install_dir)
-        m.VERSION_PATH = os.path.join(m.INSTALL_REAL, "VERSION.json")
-        m.CFG_DIR = cfg
-        m.CFG_PATH = os.path.join(cfg, "config.json")
-        m.UPDATE_CHECK_PATH = os.path.join(cfg, ".updatecheck")
-
-    def restore(self):
-        for n, v in self.saved.items():
-            setattr(self.m, n, v)
+    cfg = os.path.join(tmp, "dot-meridian")
+    real = os.path.realpath(install_dir)
+    # Trust test key "a" only. The real keys sign real releases; nothing here may depend on them.
+    for name, value in (("RELEASE_SIGNING_KEYS", (_t_pub_line("a"),)), ("INSTALL_DIR", install_dir),
+                        ("INSTALL_REAL", real), ("VERSION_PATH", os.path.join(real, "VERSION.json")),
+                        ("CFG_DIR", cfg), ("CFG_PATH", os.path.join(cfg, "config.json")),
+                        ("UPDATE_CHECK_PATH", os.path.join(cfg, ".updatecheck"))):
+        monkeypatch.setattr(m, name, value)
 
 
-def test_selfupdate(m):
-    print("[26] self-update: version compare, dev guards, host allowlist, staged apply + rollback")
+def test_selfupdate(m, monkeypatch):
 
     # --- version parsing: never a guess -------------------------------------------------------
     for s, want in [("2.16.1", (2, 16, 1)), ("v2.16.1", (2, 16, 1)), (" 2.0.0 ", (2, 0, 0)),
@@ -6367,9 +6044,9 @@ def test_selfupdate(m):
                       ("owner", None), ("a/b/c", None), ("../evil", None),
                       ("https://evil.example/x", None), ("owner/name?x=1", None),
                       ("owner name/repo", None), ("/leading", None)]:
-        os.environ["MERIDIAN_UPDATE_REPO"] = val
+        monkeypatch.setenv("MERIDIAN_UPDATE_REPO", val)
         check("update_repo(%r)" % val, m.update_repo(), want)
-    os.environ.pop("MERIDIAN_UPDATE_REPO", None)
+    monkeypatch.delenv("MERIDIAN_UPDATE_REPO", raising=False)
 
     # The CONSTANT is what ships, and an empty one is a build that can never update itself:
     # self-update only works from a copy that already knows where to look, so shipping it blank
@@ -6381,9 +6058,9 @@ def test_selfupdate(m):
     check("... which update_repo() returns with no override", m.update_repo(), m.UPDATE_REPO)
     # An EMPTY override is not an override: it falls through to the constant rather than switching
     # the feature off. MERIDIAN_NO_AUTOUPDATE is the off switch; this variable only redirects.
-    os.environ["MERIDIAN_UPDATE_REPO"] = ""
+    monkeypatch.setenv("MERIDIAN_UPDATE_REPO", "")
     check("an empty override falls back to the constant", m.update_repo(), m.UPDATE_REPO)
-    os.environ.pop("MERIDIAN_UPDATE_REPO", None)
+    monkeypatch.delenv("MERIDIAN_UPDATE_REPO", raising=False)
 
     # --- host allowlist: the one gate between a release URL and executing its contents --------
     for url, ok in [("https://api.github.com/repos/a/b/releases/latest", True),
@@ -6399,205 +6076,193 @@ def test_selfupdate(m):
 
     with tempfile.TemporaryDirectory() as tmp:
         install = _su_install(tmp, "2.16.1")
-        env = _SUEnv(m, install, tmp)
-        os.environ["MERIDIAN_UPDATE_REPO"] = "jwood25/meridiancs-public"
-        os.environ.pop("MERIDIAN_NO_AUTOUPDATE", None)
-        saved_latest = m.latest_release
+        _su_env(monkeypatch, m, install, tmp)
+        monkeypatch.setenv("MERIDIAN_UPDATE_REPO", "jwood25/meridiancs-public")
+        monkeypatch.delenv("MERIDIAN_NO_AUTOUPDATE", raising=False)
+        # --- opt-out -------------------------------------------------------------------
+        check("no config file is not an opt-out", m.autoupdate_disabled(), None)
+        os.makedirs(m.CFG_DIR, exist_ok=True)
+        with open(m.CFG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"fqdn": "x.example", "api_token": "t", "autoupdate": False}, f)
+        check("config autoupdate:false opts out", bool(m.autoupdate_disabled()), True)
+        check("... and check_update reports disabled", m.check_update()["state"], "disabled")
+        with open(m.CFG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"fqdn": "x.example", "api_token": "t"}, f)
+        monkeypatch.setenv("MERIDIAN_NO_AUTOUPDATE", "1")
+        check("env kill switch opts out", bool(m.autoupdate_disabled()), True)
+        monkeypatch.setenv("MERIDIAN_NO_AUTOUPDATE", "0")
+        check("MERIDIAN_NO_AUTOUPDATE=0 does not", m.autoupdate_disabled(), None)
+        monkeypatch.delenv("MERIDIAN_NO_AUTOUPDATE", raising=False)
+
+        # --- install markers: any ONE of them vetoes an apply --------------------------
+        check("a stamped package has no markers", m.install_markers(), [])
+        for marker, mk in (("CLAUDE.md", lambda: open(os.path.join(install, "CLAUDE.md"), "w").close()),
+                           (".git", lambda: os.makedirs(os.path.join(install, ".git")))):
+            mk()
+            check("%s alone blocks an update" % marker,
+                  any(marker in r for r in m.install_markers()), True)
+            p = os.path.join(install, marker)
+            (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
+        check("markers clear again", m.install_markers(), [])
+        os.rename(m.VERSION_PATH, m.VERSION_PATH + ".hidden")
+        check("an unstamped copy is never updated",
+              any("VERSION.json" in r for r in m.install_markers()), True)
+        check("... and check_update calls it dev", m.check_update()["state"], "dev")
+        os.rename(m.VERSION_PATH + ".hidden", m.VERSION_PATH)
+        with open(m.VERSION_PATH, "w", encoding="utf-8") as f:
+            json.dump({"schema": 1, "version": "latest"}, f)   # unusable stamp
+        check("an uncomparable version is not usable",
+              any("no usable version" in r for r in m.install_markers()), True)
+        with open(m.VERSION_PATH, "w", encoding="utf-8") as f:
+            json.dump({"schema": 1, "version": "2.16.1", "commit": "cafe1234"}, f)
+
+        # --- states -------------------------------------------------------------------
+        def fake(version, url="https://github.com/o/r/releases/download/v%s/meridiancs.v%s.skill.zip"):
+            def _f(repo):
+                asset = url % (version, version) if "%s" in url else url
+                return {"version": version, "tag": "v" + version,
+                        "assetName": "meridiancs.v%s.skill.zip" % version,
+                        "assetUrl": asset, "assetSize": 1234, "sigUrl": asset + ".sig"}
+            return _f
+
+        monkeypatch.setattr(m, "latest_release", fake("2.17.0"))
+        r = m.check_update(force=True)
+        check("newer release -> outdated", r["state"], "outdated")
+        check("... names both versions", (r["installedVersion"], r["latestVersion"]), ("2.16.1", "2.17.0"))
+        monkeypatch.setattr(m, "latest_release", fake("2.16.1"))
+        check("same version -> current", m.check_update(force=True)["state"], "current")
+        monkeypatch.setattr(m, "latest_release", fake("2.15.0"))
+        r = m.check_update(force=True)
+        check("older release -> ahead, never a downgrade", r["state"], "ahead")
+
+        # The rule this whole feature rests on: a failed check is `unknown`, NOT `current`.
+        def boom(repo):
+            raise OSError("[Errno 11001] getaddrinfo failed")
+        monkeypatch.setattr(m, "latest_release", boom)
+        r = m.check_update(force=True)
+        check("an unreachable check is unknown", r["state"], "unknown")
+        check("... and never claims to be up to date", "up to date" in r["message"].lower(), False)
+        check("... and carries the reason", "getaddrinfo" in r.get("detail", ""), True)
+
+        # --- cache: cheap at launch, but a failure re-checks sooner --------------------
+        monkeypatch.setattr(m, "latest_release", fake("2.17.0"))
+        m.check_update(force=True)
+        calls = []
+        def counted(repo):
+            calls.append(repo)
+            return fake("2.17.0")(repo)
+        monkeypatch.setattr(m, "latest_release", counted)
+        r = m.check_update()
+        check("a warm cache makes no network call", (r["checkedVia"], len(calls)), ("cache", 0))
+        check("... and still reports outdated", r["state"], "outdated")
+        check("force bypasses the cache", m.check_update(force=True)["checkedVia"], "network")
+        calls[:] = []
+        r = m.check_update(now=time.time() + m.UPDATE_CHECK_INTERVAL + 1)
+        check("a stale cache re-checks", (r["checkedVia"], len(calls)), ("network", 1))
+        # A cached `unknown` must not suppress the check for a day.
+        monkeypatch.setattr(m, "latest_release", boom)
+        m.check_update(force=True)
+        monkeypatch.setattr(m, "latest_release", counted)
+        calls[:] = []
+        r = m.check_update(now=time.time() + m.UPDATE_RETRY_INTERVAL + 1)
+        check("a cached failure retries within the day", (r["checkedVia"], r["state"]),
+              ("network", "outdated"))
+        check("... having actually asked", len(calls), 1)
+
+        # --- package validation: refuse anything that is not this skill ----------------
+        import zipfile
+        good = _su_package(tmp, "2.17.0")
+        with zipfile.ZipFile(good) as zf:
+            check("a well-formed package validates",
+                  m._validate_package(zf, "2.17.0").get("version"), "2.17.0")
+
+        def refuses(label, path, want_version="2.17.0", fragment=None):
+            with zipfile.ZipFile(path) as zf:
+                try:
+                    m._validate_package(zf, want_version)
+                    check(label, "accepted", "refused")
+                except ValueError as e:
+                    check(label, "refused", "refused")
+                    if fragment:
+                        check("  ... says why (%s)" % fragment, fragment in str(e), True)
+
+        refuses("a version-mismatched package is refused", good, "2.18.0", "refusing the mismatch")
+        refuses("a zip-slip member is refused",
+                _su_package(tmp, "9.0.1", extra={"meridiancs/../../evil.py": "x"}), "9.0.1",
+                "not a safe relative path")
+        refuses("a backslash-escaping member is refused",
+                _su_package(tmp, "9.0.2", extra={"meridiancs/..\\..\\evil.py": "x"}), "9.0.2",
+                "not a safe relative path")
+        refuses("a member outside the prefix is refused",
+                _su_package(tmp, "9.0.3", extra={"elsewhere/evil.py": "x"}), "9.0.3", "is outside")
+        # Missing required members: built by hand so the required file is genuinely absent.
+        for miss in ("SKILL.md", "scripts/meridian.py", "VERSION.json"):
+            path = os.path.join(tmp, "missing-%s.skill.zip" % miss.replace("/", "-"))
+            with zipfile.ZipFile(path, "w") as z:
+                for name, content in (("SKILL.md", "#"), ("scripts/meridian.py", "pass"),
+                                      ("VERSION.json", '{"schema":1,"version":"9.0.4"}')):
+                    if name != miss:
+                        z.writestr("meridiancs/" + name, content)
+            refuses("a package with no %s is refused" % miss, path, "9.0.4")
+
+        # --- apply: staged, smoke-tested, swapped -------------------------------------
+        def local_download(url, dest, src=None):
+            return _su_fetch(src)(url, dest)
+
+        monkeypatch.setattr(m, "latest_release", fake("2.17.0"))
+        monkeypatch.setattr(m, "_download_asset", lambda url, dest: local_download(url, dest, good))
+        res = m.apply_update(m.check_update(force=True))
+        check("apply reports the new version", (res["applied"], res["toVersion"]),
+              (True, "2.17.0"))
+        check("... and the version it replaced", res["fromVersion"], "2.16.1")
+        check("... and warns the instructions lag the scripts",
+              "new session" in res["note"], True)
+        check("the stamp on disk is the new version",
+              m.installed_version().get("version"), "2.17.0")
+        check("the new SKILL.md landed",
+              "stub skill 2.17.0" in open(os.path.join(install, "SKILL.md"), encoding="utf-8").read(),
+              True)
+        check("the old tree is not left behind",
+              os.path.exists(m.INSTALL_REAL + ".previous"), False)
+        check("no staging directory is left behind",
+              [d for d in os.listdir(os.path.dirname(m.INSTALL_REAL))
+               if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
+        check("the next check reads current from cache",
+              m.check_update()["state"], "current")
+
+        # --- rollback: a package that cannot run must not replace a working one ----
+        broken = _su_package(tmp, "2.18.0", entry_body="def (:\n")   # syntax error
+        monkeypatch.setattr(m, "latest_release", fake("2.18.0"))
+        monkeypatch.setattr(m, "_download_asset", lambda url, dest: local_download(url, dest, broken))
+        r = m.check_update(force=True)
         try:
-            # --- opt-out -------------------------------------------------------------------
-            check("no config file is not an opt-out", m.autoupdate_disabled(), None)
-            os.makedirs(m.CFG_DIR, exist_ok=True)
-            with open(m.CFG_PATH, "w", encoding="utf-8") as f:
-                json.dump({"fqdn": "x.example", "api_token": "t", "autoupdate": False}, f)
-            check("config autoupdate:false opts out", bool(m.autoupdate_disabled()), True)
-            check("... and check_update reports disabled", m.check_update()["state"], "disabled")
-            with open(m.CFG_PATH, "w", encoding="utf-8") as f:
-                json.dump({"fqdn": "x.example", "api_token": "t"}, f)
-            os.environ["MERIDIAN_NO_AUTOUPDATE"] = "1"
-            check("env kill switch opts out", bool(m.autoupdate_disabled()), True)
-            os.environ["MERIDIAN_NO_AUTOUPDATE"] = "0"
-            check("MERIDIAN_NO_AUTOUPDATE=0 does not", m.autoupdate_disabled(), None)
-            os.environ.pop("MERIDIAN_NO_AUTOUPDATE", None)
+            m.apply_update(r)
+            check("a package that fails --help is refused", "applied", "refused")
+        except ValueError as e:
+            check("a package that fails --help is refused", "refused", "refused")
+            check("... naming the smoke test", "--help" in str(e), True)
+        check("the working install survives a rejected package",
+              m.installed_version().get("version"), "2.17.0")
+        check("... intact, not half-written",
+              "stub skill 2.17.0" in open(os.path.join(install, "SKILL.md"), encoding="utf-8").read(),
+              True)
+        check("... with no leftover backup", os.path.exists(m.INSTALL_REAL + ".previous"), False)
+        check("... and no leftover staging dir",
+              [d for d in os.listdir(os.path.dirname(m.INSTALL_REAL))
+               if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
 
-            # --- install markers: any ONE of them vetoes an apply --------------------------
-            check("a stamped package has no markers", m.install_markers(), [])
-            for marker, mk in (("CLAUDE.md", lambda: open(os.path.join(install, "CLAUDE.md"), "w").close()),
-                               (".git", lambda: os.makedirs(os.path.join(install, ".git")))):
-                mk()
-                check("%s alone blocks an update" % marker,
-                      any(marker in r for r in m.install_markers()), True)
-                p = os.path.join(install, marker)
-                (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
-            check("markers clear again", m.install_markers(), [])
-            os.rename(m.VERSION_PATH, m.VERSION_PATH + ".hidden")
-            check("an unstamped copy is never updated",
-                  any("VERSION.json" in r for r in m.install_markers()), True)
-            check("... and check_update calls it dev", m.check_update()["state"], "dev")
-            os.rename(m.VERSION_PATH + ".hidden", m.VERSION_PATH)
-            with open(m.VERSION_PATH, "w", encoding="utf-8") as f:
-                json.dump({"schema": 1, "version": "latest"}, f)   # unusable stamp
-            check("an uncomparable version is not usable",
-                  any("no usable version" in r for r in m.install_markers()), True)
-            with open(m.VERSION_PATH, "w", encoding="utf-8") as f:
-                json.dump({"schema": 1, "version": "2.16.1", "commit": "cafe1234"}, f)
-
-            # --- states -------------------------------------------------------------------
-            def fake(version, url="https://github.com/o/r/releases/download/v%s/meridiancs.v%s.skill.zip"):
-                def _f(repo):
-                    return {"version": version, "tag": "v" + version,
-                            "assetName": "meridiancs.v%s.skill.zip" % version,
-                            "assetUrl": url % (version, version) if "%s" in url else url,
-                            "assetSize": 1234}
-                return _f
-
-            m.latest_release = fake("2.17.0")
-            r = m.check_update(force=True)
-            check("newer release -> outdated", r["state"], "outdated")
-            check("... names both versions", (r["installedVersion"], r["latestVersion"]), ("2.16.1", "2.17.0"))
-            m.latest_release = fake("2.16.1")
-            check("same version -> current", m.check_update(force=True)["state"], "current")
-            m.latest_release = fake("2.15.0")
-            r = m.check_update(force=True)
-            check("older release -> ahead, never a downgrade", r["state"], "ahead")
-
-            # The rule this whole feature rests on: a failed check is `unknown`, NOT `current`.
-            def boom(repo):
-                raise OSError("[Errno 11001] getaddrinfo failed")
-            m.latest_release = boom
-            r = m.check_update(force=True)
-            check("an unreachable check is unknown", r["state"], "unknown")
-            check("... and never claims to be up to date", "up to date" in r["message"].lower(), False)
-            check("... and carries the reason", "getaddrinfo" in r.get("detail", ""), True)
-
-            # --- cache: cheap at launch, but a failure re-checks sooner --------------------
-            m.latest_release = fake("2.17.0")
-            m.check_update(force=True)
-            calls = []
-            def counted(repo):
-                calls.append(repo)
-                return fake("2.17.0")(repo)
-            m.latest_release = counted
-            r = m.check_update()
-            check("a warm cache makes no network call", (r["checkedVia"], len(calls)), ("cache", 0))
-            check("... and still reports outdated", r["state"], "outdated")
-            check("force bypasses the cache", m.check_update(force=True)["checkedVia"], "network")
-            calls[:] = []
-            r = m.check_update(now=time.time() + m.UPDATE_CHECK_INTERVAL + 1)
-            check("a stale cache re-checks", (r["checkedVia"], len(calls)), ("network", 1))
-            # A cached `unknown` must not suppress the check for a day.
-            m.latest_release = boom
-            m.check_update(force=True)
-            m.latest_release = counted
-            calls[:] = []
-            r = m.check_update(now=time.time() + m.UPDATE_RETRY_INTERVAL + 1)
-            check("a cached failure retries within the day", (r["checkedVia"], r["state"]),
-                  ("network", "outdated"))
-            check("... having actually asked", len(calls), 1)
-
-            # --- package validation: refuse anything that is not this skill ----------------
-            import zipfile
-            good = _su_package(tmp, "2.17.0")
-            with zipfile.ZipFile(good) as zf:
-                check("a well-formed package validates",
-                      m._validate_package(zf, "2.17.0").get("version"), "2.17.0")
-
-            def refuses(label, path, want_version="2.17.0", fragment=None):
-                with zipfile.ZipFile(path) as zf:
-                    try:
-                        m._validate_package(zf, want_version)
-                        check(label, "accepted", "refused")
-                    except ValueError as e:
-                        check(label, "refused", "refused")
-                        if fragment:
-                            check("  ... says why (%s)" % fragment, fragment in str(e), True)
-
-            refuses("a version-mismatched package is refused", good, "2.18.0", "refusing the mismatch")
-            refuses("a zip-slip member is refused",
-                    _su_package(tmp, "9.0.1", extra={"meridiancs/../../evil.py": "x"}), "9.0.1",
-                    "not a safe relative path")
-            refuses("a backslash-escaping member is refused",
-                    _su_package(tmp, "9.0.2", extra={"meridiancs/..\\..\\evil.py": "x"}), "9.0.2",
-                    "not a safe relative path")
-            refuses("a member outside the prefix is refused",
-                    _su_package(tmp, "9.0.3", extra={"elsewhere/evil.py": "x"}), "9.0.3", "is outside")
-            # Missing required members: built by hand so the required file is genuinely absent.
-            for miss in ("SKILL.md", "scripts/meridian.py", "VERSION.json"):
-                path = os.path.join(tmp, "missing-%s.skill.zip" % miss.replace("/", "-"))
-                with zipfile.ZipFile(path, "w") as z:
-                    for name, content in (("SKILL.md", "#"), ("scripts/meridian.py", "pass"),
-                                          ("VERSION.json", '{"schema":1,"version":"9.0.4"}')):
-                        if name != miss:
-                            z.writestr("meridiancs/" + name, content)
-                refuses("a package with no %s is refused" % miss, path, "9.0.4")
-
-            # --- apply: staged, smoke-tested, swapped -------------------------------------
-            def local_download(url, dest, src=None):
-                shutil.copyfile(src, dest)
-                return os.path.getsize(dest)
-
-            saved_dl = m._download_asset
-            try:
-                m.latest_release = fake("2.17.0")
-                m._download_asset = lambda url, dest: local_download(url, dest, good)
-                res = m.apply_update(m.check_update(force=True))
-                check("apply reports the new version", (res["applied"], res["toVersion"]),
-                      (True, "2.17.0"))
-                check("... and the version it replaced", res["fromVersion"], "2.16.1")
-                check("... and warns the instructions lag the scripts",
-                      "new session" in res["note"], True)
-                check("the stamp on disk is the new version",
-                      m.installed_version().get("version"), "2.17.0")
-                check("the new SKILL.md landed",
-                      "stub skill 2.17.0" in open(os.path.join(install, "SKILL.md"), encoding="utf-8").read(),
-                      True)
-                check("the old tree is not left behind",
-                      os.path.exists(m.INSTALL_REAL + ".previous"), False)
-                check("no staging directory is left behind",
-                      [d for d in os.listdir(os.path.dirname(m.INSTALL_REAL))
-                       if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
-                check("the next check reads current from cache",
-                      m.check_update()["state"], "current")
-
-                # --- rollback: a package that cannot run must not replace a working one ----
-                broken = _su_package(tmp, "2.18.0", entry_body="def (:\n")   # syntax error
-                m.latest_release = fake("2.18.0")
-                m._download_asset = lambda url, dest: local_download(url, dest, broken)
-                r = m.check_update(force=True)
-                try:
-                    m.apply_update(r)
-                    check("a package that fails --help is refused", "applied", "refused")
-                except ValueError as e:
-                    check("a package that fails --help is refused", "refused", "refused")
-                    check("... naming the smoke test", "--help" in str(e), True)
-                check("the working install survives a rejected package",
-                      m.installed_version().get("version"), "2.17.0")
-                check("... intact, not half-written",
-                      "stub skill 2.17.0" in open(os.path.join(install, "SKILL.md"), encoding="utf-8").read(),
-                      True)
-                check("... with no leftover backup", os.path.exists(m.INSTALL_REAL + ".previous"), False)
-                check("... and no leftover staging dir",
-                      [d for d in os.listdir(os.path.dirname(m.INSTALL_REAL))
-                       if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
-
-                # A dev tree is refused by apply_update itself, not merely by cmd_selfupdate.
-                with open(os.path.join(install, "CLAUDE.md"), "w") as f:
-                    f.write("x")
-                m.latest_release = fake("2.19.0")
-                try:
-                    m.apply_update(dict(m.check_update(force=True), state="outdated",
-                                        latestVersion="2.19.0", assetUrl="https://github.com/o/r/x.zip"))
-                    check("apply_update refuses a working tree", "applied", "refused")
-                except ValueError as e:
-                    check("apply_update refuses a working tree", "refused", "refused")
-                    check("... naming CLAUDE.md", "CLAUDE.md" in str(e), True)
-                os.remove(os.path.join(install, "CLAUDE.md"))
-            finally:
-                m._download_asset = saved_dl
-        finally:
-            m.latest_release = saved_latest
-            env.restore()
-            os.environ.pop("MERIDIAN_UPDATE_REPO", None)
-            os.environ.pop("MERIDIAN_NO_AUTOUPDATE", None)
+        # A dev tree is refused by apply_update itself, not merely by cmd_selfupdate.
+        with open(os.path.join(install, "CLAUDE.md"), "w") as f:
+            f.write("x")
+        monkeypatch.setattr(m, "latest_release", fake("2.19.0"))
+        try:
+            m.apply_update(dict(m.check_update(force=True), state="outdated",
+                                latestVersion="2.19.0", assetUrl="https://github.com/o/r/x.zip"))
+            check("apply_update refuses a working tree", "applied", "refused")
+        except ValueError as e:
+            check("apply_update refuses a working tree", "refused", "refused")
+            check("... naming CLAUDE.md", "CLAUDE.md" in str(e), True)
+        os.remove(os.path.join(install, "CLAUDE.md"))
 
     # --- the launch command never fails a session -----------------------------------------
     for args in (["selfupdate"], ["selfupdate", "--check"], ["selfupdate", "--apply"]):
@@ -6615,275 +6280,391 @@ def test_selfupdate(m):
             check("  ... and applies nothing", out.get("applied"), False)
 
 
-def test_package_stamp():
-    print("[27] package carries a version stamp (and only a real one)")
-    import zipfile
-    with tempfile.TemporaryDirectory() as tmp:
-        script = os.path.join(os.path.dirname(HERE), "scripts", "make-package.py")
-        out = os.path.join(tmp, "stamped.skill.zip")
-        r = subprocess.run([sys.executable, script, out, "--version", "9.9.9", "--allow-dirty"],
-                           capture_output=True, text=True, cwd=os.path.dirname(HERE))
-        check("build with --version succeeds", r.returncode, 0)
-        with zipfile.ZipFile(out) as z:
-            names = z.namelist()
-            check("VERSION.json is packaged", "meridiancs/VERSION.json" in names, True)
-            stamp = json.loads(z.read("meridiancs/VERSION.json").decode("utf-8"))
-            check("... stamped with the built version", stamp.get("version"), "9.9.9")
-            check("... and a commit", bool(stamp.get("commit")), True)
-            check("... schema matches the reader", stamp.get("schema"), 1)
-            # install_markers() treats CLAUDE.md as proof of a working tree, so a package containing
-            # it would make every install permanently un-updatable.
-            check("CLAUDE.md is still excluded", "meridiancs/CLAUDE.md" in names, False)
-            check("SKILL.md is packaged", "meridiancs/SKILL.md" in names, True)
-            # SKILL.md section 0 reads this at launch and echoes it verbatim, so a package
-            # without it ships a skill that improvises its own welcome.
-            check("the launch greeting is packaged",
-                  "meridiancs/references/welcome.md" in names, True)
-            # EXCLUDE_DIRS drops it: CI config is repo, not install.
-            check(".github is not packaged",
-                  [n for n in names if n.startswith("meridiancs/.github")], [])
-            # Same reasoning one directory up: the lint hooks run ON the skill, and an
-            # installed copy has no repo for them to check. They shipped in the first
-            # build of this branch because EXCLUDE is a filename list and nothing
-            # asserted the shape of what lands in a customer package.
-            check("repo tooling configs are not packaged",
-                  sorted(n for n in names if "pre-commit" in n or "markdownlint" in n), [])
-            # Maintenance scripts run ON the skill and need a repo an install does not have.
-            # Asserted as a FAMILY rather than one name at a time, because EXCLUDE is a filename
-            # list -- the next generator or release helper added beside these would otherwise
-            # ship in silence, which is how the lint configs and the .public.md variants both
-            # reached a customer package.
-            check("maintenance scripts are not packaged",
-                  sorted(n.split("/")[-1] for n in names
-                         if n.startswith("meridiancs/scripts/")
-                         and (n.split("/")[-1].startswith(("make-", "publish-", "check-"))
-                              or n.endswith("docout.py"))), [])
-            # make-public.py's substitution sources, and the stamp recording when each was last
-            # reviewed. A .public.md is a sanitised derivative of the reference doc beside it,
-            # carrying illustrative round numbers where the internal one carries measured ones,
-            # so packaging both puts a deliberately weaker near-duplicate next to the file
-            # SKILL.md actually routes to. All five shipped in every release through v2.23.0 for
-            # the reason directly above: EXCLUDE is a filename list, and until this assertion
-            # nothing checked the shape of what lands in a customer package.
-            check("public reference variants are not packaged",
-                  sorted(n for n in names if n.endswith(".public.md")), [])
-            check("... nor the review stamp that tracks them",
-                  [n for n in names if n.endswith(".public-sync.json")], [])
-            # GitHub reads these from the repository; in a skill folder they are dead weight.
-            check("repository community docs are not packaged",
-                  sorted(n for n in names if n.split("/")[-1] in ("SECURITY.md", "CONTRIBUTING.md")), [])
+def test_release_signing(m, monkeypatch, tmp_path):
+    """Releases install only with a valid signature by a shipped key, checked before the zip is read.
 
-        # An unversioned one-off is stamped null rather than guessed -- and a null stamp is exactly
-        # what install_markers() refuses to update from, so it cannot silently self-replace.
-        out2 = os.path.join(tmp, "unversioned.skill.zip")
-        r = subprocess.run([sys.executable, script, out2, "--allow-dirty"],
-                           capture_output=True, text=True, cwd=os.path.dirname(HERE))
-        check("an unversioned one-off still builds", r.returncode, 0)
-        with zipfile.ZipFile(out2) as z:
-            stamp = json.loads(z.read("meridiancs/VERSION.json").decode("utf-8"))
-        check("... stamped version=null, never guessed", stamp.get("version"), None)
-        m = load_meridian()
-        check("... which parse_version refuses", m.parse_version(stamp.get("version")), None)
+    Security finding M1 (2026-09-22): the updater validated a package's structure and its stamp, but
+    anyone able to create a release on the public repo could ship code that the smoke test would RUN
+    on every install. Signing closes that; this test is what makes the verifier trustworthy, since it
+    is hand-written crypto in a stdlib-only file. It is checked four independent ways -- RFC 8032's
+    vectors, agreement with a reference implementation (`cryptography`) on random and tampered
+    signatures, a fixture made by real ssh-keygen, and (where it is
+    installed) a live ssh-keygen round trip in both directions.
+    """
+    import base64
 
-        # Determinism, which CI asserts for the release build, must survive the generated member.
-        a = os.path.join(tmp, "det-a.skill.zip")
-        b = os.path.join(tmp, "det-b.skill.zip")
-        for path in (a, b):
-            subprocess.run([sys.executable, script, path, "--version", "9.9.9", "--allow-dirty"],
-                           capture_output=True, text=True, cwd=os.path.dirname(HERE))
-        check("two builds of one tree are byte-identical",
-              hashlib.sha256(open(a, "rb").read()).hexdigest()
-              == hashlib.sha256(open(b, "rb").read()).hexdigest(), True)
+    # --- 1. RFC 8032 section 7.1, tests 1-3 -------------------------------------------------------
+    vectors = [
+        ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bac"
+         "c61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+        ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+         "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e"
+         "458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+         "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290"
+         "ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+    ]
+    for i, (sk, pk, msg, sig) in enumerate(vectors, 1):
+        sk, pk, msg, sig = (bytes.fromhex(x) for x in (sk, pk, msg, sig))
+        check("RFC 8032 test %d: the test signer reproduces the RFC's key and signature" % i,
+              _t_sign(sk, msg), (pk, sig))
+        check("RFC 8032 test %d: verifies" % i, m.ed25519_verify(pk, msg, sig), True)
+        check("  ... and not with the message changed", m.ed25519_verify(pk, msg + b"\0", sig), False)
+        flipped = sig[:40] + bytes([sig[40] ^ 0x80]) + sig[41:]
+        check("  ... nor with one bit of S flipped", m.ed25519_verify(pk, msg, flipped), False)
+        check("  ... nor under another key",
+              m.ed25519_verify(bytes.fromhex(vectors[i % 3][1]), msg, sig), False)
+    pk, msg, sig = (bytes.fromhex(vectors[0][j]) for j in (1, 2, 3))
+    # S + L verifies under the bare group equation, so this is the malleability check doing its job.
+    s_plus_l = (int.from_bytes(sig[32:], "little") + m._ED_L).to_bytes(32, "little")
+    check("a non-canonical S (S + L) is refused", m.ed25519_verify(pk, msg, sig[:32] + s_plus_l), False)
+    non_canon_y = (m._ED_P + 1).to_bytes(32, "little")      # y >= p: RFC 8032 5.1.3 says reject
+    check("a non-canonical point encoding is refused",
+          m.ed25519_verify(pk, msg, non_canon_y + sig[32:]), False)
+    check("a short key is refused", m.ed25519_verify(pk[:31], msg, sig), False)
+    check("a short signature is refused", m.ed25519_verify(pk, msg, sig[:63]), False)
+
+    # --- 1b. differential: the verifier agrees with the reference on random and tampered input ----
+    import random
+    rng = random.Random(8032)
+    disagreements = []
+    for _ in range(100):
+        seed, message = rng.randbytes(32), rng.randbytes(rng.randrange(200))
+        public, signature = _t_sign(seed, message)
+        bit = rng.randrange(8 * len(signature))
+        tampered = bytearray(signature)
+        tampered[bit // 8] ^= 1 << (bit % 8)
+        for candidate in (signature, bytes(tampered)):
+            if m.ed25519_verify(public, message, candidate) != _t_verifies(public, message, candidate):
+                disagreements.append((seed.hex(), bit))
+    check("ed25519_verify agrees with the reference on 100 random signatures and 100 tampered ones",
+          disagreements, [])
+
+    # --- 2. SSHSIG: the format, and every way it must refuse ---------------------------------------
+    keys_a = [_t_pub_line("a")]
+    body = b"package bytes \x00\x01\x02"
+
+    def verdict(sig_text, message=body, keys=keys_a, namespace="meridiancs-release"):
+        try:
+            return ("ok", m.verify_release_signature(message, sig_text, keys=keys,
+                                                     namespace=namespace)["comment"])
+        except ValueError as e:
+            return ("refused", str(e))
+
+    check("a trusted key's signature verifies", verdict(_t_sshsig("a", body)),
+          ("ok", "meridiancs-TEST-key-a"))
+    check("... and a sha256 SSHSIG too", verdict(_t_sshsig("a", body, hash_alg="sha256"))[0], "ok")
+    check("the module's own armor matches the independent writer",
+          m.sshsig_armor(_t_pub_blob(_TEST_SEEDS["a"]),
+                         _t_sign(_TEST_SEEDS["a"], m.sshsig_signed_data(body))[1]),
+          _t_sshsig("a", body))
+    for label, text, fragment in [
+        ("a signature over another package", _t_sshsig("a", body + b"x"), "does not match"),
+        ("an untrusted key", _t_sshsig("b", body), "not a release key"),
+        ("another namespace (the key's other uses)", _t_sshsig("a", body, namespace="file"),
+         "namespace"),
+        ("an unsupported hash", _t_sshsig("a", body, hash_alg="sha384"), "unsupported hash"),
+        ("an unknown SSHSIG version", _t_sshsig("a", body, version=2), "version"),
+        ("a non-ed25519 signature type", _t_sshsig("a", body, sig_type=b"rsa-sha2-512"),
+         "not an ssh-ed25519 signature"),
+        ("a corrupted signature", _t_sshsig("a", body, tamper_sig=True), "does not match"),
+        ("a file with no signature block", "hello", "no SSH signature block"),
+        ("a block that is not base64", "-----BEGIN SSH SIGNATURE-----\n!!!\n-----END SSH SIGNATURE-----",
+         "no valid release signature"),
+    ]:
+        v = verdict(text)
+        check("SSHSIG refuses %s" % label, v[0], "refused")
+        check("  ... saying why (%s)" % fragment, fragment in v[1], True)
+    raw = base64.b64decode("".join(m._SSHSIG_BLOCK_RE.findall(_t_sshsig("a", body))[0].split()))
+    trailing = ("-----BEGIN SSH SIGNATURE-----\n%s\n-----END SSH SIGNATURE-----\n"
+                % base64.b64encode(raw + b"\0").decode("ascii"))
+    check("SSHSIG refuses trailing data after the signature", verdict(trailing)[0], "refused")
+    check("a co-signed file verifies if ANY block is by a trusted key",
+          verdict(_t_sshsig("b", body) + _t_sshsig("a", body)), ("ok", "meridiancs-TEST-key-a"))
+    check("... whichever order the blocks are in",
+          verdict(_t_sshsig("a", body) + _t_sshsig("b", body))[0], "ok")
+    check("more blocks than the cap are refused outright",
+          "refusing more than" in verdict(_t_sshsig("b", body) * (m.RELEASE_SIG_MAX_BLOCKS + 1))[1], True)
+    check("an empty key list verifies nothing", "trusts no release signing key" in
+          verdict(_t_sshsig("a", body), keys=[])[1], True)
+    check("the signed data is the namespace and a hash, never the message",
+          body in m.sshsig_signed_data(body), False)
+
+    # --- 3. a signature made by real ssh-keygen (OpenSSH 10.3, -Y sign -n meridiancs-release) ------
+    fixture_pub = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBCVZlzrAGLgS1bRflKlN1uVp78/oUZftI21ABr9QlPr "
+                   "interop-test")
+    fixture_sig = ("-----BEGIN SSH SIGNATURE-----\n"
+                   "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgEJVmXOsAYuBLVtF+UqU3W5Wnvz\n"
+                   "+hRl+0jbUAGv1CU+sAAAASbWVyaWRpYW5jcy1yZWxlYXNlAAAAAAAAAAZzaGE1MTIAAABT\n"
+                   "AAAAC3NzaC1lZDI1NTE5AAAAQFU5j8QSBWdqVMiRdmF8Ye8XTh+hPrte4/bjFe2DmR6pz+\n"
+                   "r71RA+pB08gHjGvBqHqh90a5S0CPi1UOoXk9OogQc=\n"
+                   "-----END SSH SIGNATURE-----\n")
+    check("a real ssh-keygen signature verifies",
+          verdict(fixture_sig, message=b"hello package\n", keys=[fixture_pub]),
+          ("ok", "interop-test"))
+    check("... and its fingerprint is the one ssh-keygen prints",
+          m.parse_ssh_pubkey(fixture_pub)["fingerprint"],
+          "SHA256:UfQT+wWjXlM0jgLVi6FAZ+SxUYLXVhSYomboJc1O99Q")
+    check("... and not over a different message",
+          verdict(fixture_sig, message=b"hello package!\n", keys=[fixture_pub])[0], "refused")
+
+    # --- 4. live ssh-keygen, both directions, wherever it is installed -----------------------------
+    exe = shutil.which("ssh-keygen")
+    if exe:
+        with tempfile.TemporaryDirectory() as t:
+            key = os.path.join(t, "k")
+            r = subprocess.run([exe, "-q", "-t", "ed25519", "-N", "", "-C", "live-interop", "-f", key],
+                               capture_output=True, text=True)
+            msgf = os.path.join(t, "pkg.zip")
+            with open(msgf, "wb") as f:
+                f.write(os.urandom(4096))
+            s = subprocess.run([exe, "-Y", "sign", "-n", "meridiancs-release", "-f", key, msgf],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and s.returncode == 0:
+                with open(key + ".pub") as f:
+                    pub = f.read()
+                with open(msgf, "rb") as f:
+                    data = f.read()
+                with open(msgf + ".sig") as f:
+                    check("live: ssh-keygen's signature verifies here",
+                          verdict(f.read(), message=data, keys=[pub]), ("ok", "live-interop"))
+                allowed = os.path.join(t, "allowed")
+                with open(allowed, "w", newline="\n") as f:
+                    f.write('meridiancs-release namespaces="meridiancs-release" %s' % pub)
+                ours = os.path.join(t, "ours.sig")
+                with open(ours, "w", newline="\n") as f:
+                    f.write(_t_sshsig("a", data))
+                with open(allowed, "a", newline="\n") as f:
+                    f.write('meridiancs-release namespaces="meridiancs-release" %s\n' % _t_pub_line("a"))
+                with open(msgf, "rb") as f:
+                    v = subprocess.run([exe, "-Y", "verify", "-f", allowed, "-I", "meridiancs-release",
+                                        "-n", "meridiancs-release", "-s", ours], stdin=f,
+                                       capture_output=True, text=True)
+                check("live: ssh-keygen -Y verify accepts a signature in this format", v.returncode, 0)
+            else:
+                print("      (ssh-keygen present but could not sign here: %s)"
+                      % (r.stderr or s.stderr).strip()[:120])
+    else:
+        print("      (ssh-keygen not installed: live interop skipped; the fixture above still ran)")
+
+    # --- 5. the SHIPPED keys: this is the gate that stops an unsigned-able build going out ---------
+    shipped = []
+    for line in m.RELEASE_SIGNING_KEYS:
+        try:
+            shipped.append(m.parse_ssh_pubkey(line))
+        except ValueError:
+            check("RELEASE_SIGNING_KEYS entry parses: %r" % line[:40], "malformed", "ok")
+    # Pinned, because an install judges a release by the keys it ALREADY has: shipping a different
+    # key without a release co-signed by this one would strand every install. Changing the pin is
+    # that rotation, and it is deliberately a failing test until someone plans one.
+    check("RELEASE_SIGNING_KEYS is the prod Vault Transit key, pinned",
+          [k["fingerprint"] for k in shipped], [RELEASE_KEY_FINGERPRINT])
+    test_keys = {_t_sign(s, b"")[0] for s in _TEST_SEEDS.values()}
+    check("... and not a public test key", [k["comment"] for k in shipped if k["key"] in test_keys], [])
+    src = open(MERIDIAN_PY, encoding="utf-8").read()
+    check("no environment variable or config key can add a trusted key",
+          [ln.strip() for ln in src.splitlines()
+           if "SIGN" in ln.upper() and ("os.environ" in ln or "load_config" in ln or "CFG_PATH" in ln)],
+          [])
+
+    with monkeypatch.context() as mp:
+        # --- 6. the updater: no signature asset, no update; a bad one stops before the zip is read ----
+        rel_json = {"tag_name": "v2.30.0", "assets": [
+            {"name": "meridiancs.v2.30.0.skill.zip", "size": 10,
+             "browser_download_url": "https://github.com/o/r/releases/download/v2.30.0/meridiancs.v2.30.0.skill.zip"}]}
+        def serve(doc):
+            mp.setattr(m, "_gh_get", lambda url, **kw: json.dumps(doc).encode("utf-8"))
+        serve(rel_json)
+        try:
+            m.latest_release("o/r")
+            check("a release with no signature asset is refused", "accepted", "refused")
+        except ValueError as e:
+            check("a release with no signature asset is refused", "no meridiancs.v2.30.0" in str(e), True)
+        sig_asset = {"name": "meridiancs.v2.30.0.skill.zip.sig", "size": 1,
+                     "browser_download_url": "https://github.com/o/r/releases/download/v2.30.0/x.sig"}
+        serve(dict(rel_json, assets=rel_json["assets"] + [sig_asset, dict(sig_asset)]))
+        try:
+            m.latest_release("o/r")
+            check("... and one with two", "accepted", "refused")
+        except ValueError:
+            check("... and one with two", "refused", "refused")
+        serve(dict(rel_json, assets=rel_json["assets"] + [sig_asset]))
+        check("exactly one signature asset is carried through",
+              m.latest_release("o/r").get("sigUrl"), sig_asset["browser_download_url"])
+
+        tmp = tempfile.mkdtemp(dir=tmp_path)
+        install = _su_install(tmp, "2.26.0")
+        _su_env(mp, m, install, tmp)
+        mp.setenv("MERIDIAN_UPDATE_REPO", "jwood25/meridiancs-public")
+        ran = []
+        real_smoke = m._smoke_test
+        mp.setattr(m, "_smoke_test", lambda staged: (ran.append(staged), real_smoke(staged))[1])
+
+        def leftovers():
+            return [d for d in os.listdir(os.path.dirname(m.INSTALL_REAL)) if d.startswith(".meridiancs-")]
+
+        def attempt(pkg, version):
+            mp.setattr(m, "latest_release",
+                       lambda repo: {
+        "version": version, "tag": "v" + version, "assetName": os.path.basename(pkg), "assetSize": 1,
+        "assetUrl": "https://github.com/o/r/releases/download/v%s/p.skill.zip" % version,
+        "sigUrl": "https://github.com/o/r/releases/download/v%s/p.skill.zip.sig" % version})
+            mp.setattr(m, "_download_asset", _su_fetch(pkg))
+            del ran[:]
+            try:
+                return ("applied", m.apply_update(m.check_update(force=True)))
+            except ValueError as e:
+                return ("refused", str(e))
+
+        def unsigned_release(repo):
+            raise ValueError("release v2.30.0 carries no meridiancs.v2.30.0.skill.zip.sig")
+        mp.setattr(m, "latest_release", unsigned_release)
+        check("a release with no signature reads as unknown, never outdated",
+              m.check_update(force=True)["state"], "unknown")
+        # A package that would FAIL the smoke test, unsigned: the refusal must name the signature,
+        # which proves the signature check ran first and the code never ran at all.
+        broken = _su_package(tmp, "2.27.0", entry_body="raise SystemExit(3)\n", sign=None)
+        with open(broken + ".sig", "w") as f:
+            f.write("not a signature")
+        v = attempt(broken, "2.27.0")
+        check("an unsigned package is refused", v[0], "refused")
+        check("... by the signature check, before the smoke test", "signature" in v[1], True)
+        check("... which never ran its code", ran, [])
+        check("... and nothing was extracted or left behind", leftovers(), [])
+        check("... and the install is untouched", m.installed_version().get("version"), "2.26.0")
+
+        slip = _su_package(tmp, "2.27.1", extra={"meridiancs/../../evil.py": "x"}, sign="b")
+        v = attempt(slip, "2.27.1")
+        check("a package signed by an unknown key is refused",
+              (v[0], "not a release key" in v[1]), ("refused", True))
+        check("... before the zip parser could see its hostile member", "safe relative path" in v[1], False)
+
+        good = _su_package(tmp, "2.27.2")
+        v = attempt(good, "2.27.2")
+        check("a package signed by a trusted key installs", (v[0], v[1].get("toVersion")),
+              ("applied", "2.27.2"))
+        check("... and says which key signed it", v[1].get("signedBy", {}).get("fingerprint"),
+              m.parse_ssh_pubkey(_t_pub_line("a"))["fingerprint"])
+
+        cosigned = _su_package(tmp, "2.27.3", sign="b")
+        with open(cosigned, "rb") as f:
+            data = f.read()
+        with open(cosigned + ".sig", "a", newline="\n") as f:
+            f.write(_t_sshsig("a", data))
+        check("a co-signed package installs on the key this install knows",
+              attempt(cosigned, "2.27.3")[0], "applied")
+
+        ns = _su_package(tmp, "2.27.4")
+        with open(ns, "rb") as f:
+            data = f.read()
+        with open(ns + ".sig", "w", newline="\n") as f:
+            f.write(_t_sshsig("a", data, namespace="file"))
+        check("a trusted key's signature for another purpose is refused",
+              attempt(ns, "2.27.4")[0], "refused")
+        with open(ns + ".sig", "w", newline="\n") as f:
+            f.write(_t_sshsig("a", data) + " " * (m.UPDATE_MAX_SIG_BYTES + 1))
+        v = attempt(ns, "2.27.4")
+        check("an oversized signature asset is refused", "exceeds" in v[1], True)
+        rel_nosig = dict(m.check_update(force=True), state="outdated", latestVersion="2.27.9", sigUrl=None,
+                         assetUrl="https://github.com/o/r/x.skill.zip")
+        try:
+            m.apply_update(rel_nosig)
+            check("apply_update refuses a result with no signature URL", "applied", "refused")
+        except ValueError as e:
+            check("apply_update refuses a result with no signature URL", "no signature" in str(e), True)
+
+    _test_published_signers(m)
+
+
+RELEASE_KEY_FINGERPRINT = "SHA256:azE/wO3CY8Ntkf0UGX7JeZLAgBl9u3YY61KUA/eM3vo"
+
+
+def _readme_signer_keys(text):
+    """The keys a README's allowed_signers block publishes, or None when it has no block."""
+    start, end = text.find("<!-- allowed-signers:begin -->"), text.find("<!-- allowed-signers:end -->")
+    if start < 0 or end < start:
+        return None
+    return sorted(line.split(" ", 2)[2].strip() for line in text[start:end].splitlines()
+                  if line.startswith('meridiancs-release namespaces="meridiancs-release" '))
+
+
+def _test_published_signers(m):
+    """Each README's allowed_signers block publishes exactly RELEASE_SIGNING_KEYS.
+
+    It is the only way a user can check a download independently, so a stale copy is worse than
+    none: a list missing the current key makes a genuine release look forged, and one still naming
+    a retired key vouches for whatever that key signs.
+    """
+    root = os.path.dirname(os.path.dirname(MERIDIAN_PY))
+    shipped = sorted(k.strip() for k in m.RELEASE_SIGNING_KEYS)
+    for name in ("README.md", "README.public.md"):
+        path = os.path.join(root, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        check("%s publishes exactly the shipped release keys" % name, _readme_signer_keys(text), shipped)
+        check("... and its verify command names the principal and namespace signatures carry",
+              "-I meridiancs-release -n meridiancs-release" in text, True)
 
 
 def test_licensing():
-    """The distributed package must be licence-compliant, not merely accompanied by a licence.
-
-    OFL 1.1 section 2 requires the copyright notice and the licence to travel with the font in
-    every copy. The fonts and their licence texts are separate files, so nothing else in this repo
-    would notice them drifting apart -- a font added without its text, or an EXCLUDE entry that
-    quietly drops one, both produce a package that ships fonts with no licence. That is the exact
-    shape of failure this asserts away.
-    """
-    print("[28] package is licence-compliant, SBOM current")
-    import zipfile
+    """OFL 1.1 section 2 requires the licence text with every copy of the fonts. verify-package.py
+    checks the files ship; this checks they are the real texts, not placeholders."""
     root = os.path.dirname(HERE)
-    with tempfile.TemporaryDirectory() as tmp:
-        script = os.path.join(root, "scripts", "make-package.py")
-        out = os.path.join(tmp, "lic.skill.zip")
-        r = subprocess.run([sys.executable, script, out, "--version", "9.9.9", "--allow-dirty"],
-                           capture_output=True, text=True, cwd=root)
-        check("package builds", r.returncode, 0)
-        with zipfile.ZipFile(out) as z:
-            names = set(z.namelist())
-            for member in ("LICENSE", "NOTICE", "sbom.cdx.json",
-                           "assets/fonts/SpaceGrotesk-OFL.txt",
-                           "assets/fonts/SpaceMono-OFL.txt"):
-                check("packaged: %s" % member, "meridiancs/" + member in names, True)
-            # A placeholder or truncated licence file satisfies "present" but not the OFL.
-            lic = z.read("meridiancs/LICENSE").decode("utf-8")
-            check("LICENSE is the Apache 2.0 text",
-                  "Apache License" in lic and "Version 2.0, January 2004" in lic, True)
-            check("... including the terms, not just the header",
-                  "END OF TERMS AND CONDITIONS" in lic, True)
-            for member in ("SpaceGrotesk", "SpaceMono"):
-                ofl = z.read("meridiancs/assets/fonts/%s-OFL.txt" % member).decode("utf-8")
-                check("%s ships the real OFL 1.1 text" % member,
-                      "SIL OPEN FONT LICENSE Version 1.1" in ofl
-                      and "PERMISSION & CONDITIONS" in ofl, True)
-            # Every packaged font must have a licence text alongside it.
-            fonts = [n for n in names if n.endswith(".ttf")]
-            check("all four fonts are packaged", len(fonts), 4)
 
-    # The SBOM is generated, so the committed copy can go stale silently. CI runs this too.
-    sbom_script = os.path.join(root, "scripts", "make-sbom.py")
-    r = subprocess.run([sys.executable, sbom_script, "--check"],
-                       capture_output=True, text=True, cwd=root)
-    check("committed sbom.cdx.json is current", r.returncode, 0)
+    def read(rel):
+        with open(os.path.join(root, *rel.split("/")), encoding="utf-8") as f:
+            return f.read()
 
-    with open(os.path.join(root, "sbom.cdx.json"), encoding="utf-8") as f:
-        sbom = json.load(f)
-    check("SBOM declares no timestamp (determinism)", "timestamp" in sbom.get("metadata", {}), False)
-    listed = {c["name"]: c for c in sbom["components"] if c["name"].endswith(".ttf")}
-    check("SBOM lists all four fonts", len(listed), 4)
-    for rel, comp in listed.items():
-        digest = hashlib.sha256(open(os.path.join(root, rel), "rb").read()).hexdigest()
-        recorded = [h["content"] for h in comp["hashes"] if h["alg"] == "SHA-256"]
-        check("SBOM hash matches %s" % os.path.basename(rel), recorded, [digest])
-        check("... declared OFL-1.1",
-              [l["license"]["id"] for l in comp["licenses"]], ["OFL-1.1"])
-
-    # design/oss-release.md has to NAME the identifiers it removed or the removal stops being
-    # auditable, so the repo sweep exempts it -- safe only because design/ never ships. The gate
-    # that matters is that make-public.py's audit reads SKIP_FILES and NOT the wider
-    # REPO_SWEEP_SKIP, so flipping PUBLISH_INTERNAL_DOCS cannot smuggle those identifiers into a
-    # public tree on an exemption written for a different purpose. Verified by hand: with the flag
-    # flipped, the audit reports 7 problems in that file and refuses to publish.
-    spec = importlib.util.spec_from_file_location(
-        "pii_gate", os.path.join(root, "scripts", "check-docs-pii.py"))
-    gate = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gate)
-    check("internal-only exemption is disjoint from SKIP_FILES",
-          bool(gate.INTERNAL_ONLY_FILES & gate.SKIP_FILES), False)
-    check("... repo sweep skips the union of both",
-          gate.REPO_SWEEP_SKIP, gate.SKIP_FILES | gate.INTERNAL_ONLY_FILES)
-    check("... and the publication audit does not inherit it",
-          bool(gate.INTERNAL_ONLY_FILES & gate.SKIP_FILES), False)
-
-    # The repo-wide sweep is only as good as its patterns, and a false positive gets "fixed" by
-    # exempting whatever tripped it -- which is how the sweep got narrow the first time. A
-    # GitHub Actions ref (`pre-commit/action@v3.0.1`) reads as local@domain, so the email
-    # pattern now requires an alphabetic TLD. Assert BOTH directions: silencing the noise must
-    # not have silenced a real address, which is the failure that leaves no trace.
-    import re as _re
-    _email = gate.PATTERNS["email address"]
-    for ref in ("pre-commit/action@v3.0.1", "actions/checkout@v4", "ruff-pre-commit@v0.16.4"):
-        check("a version ref is not an email address (%s)" % ref,
-              _re.findall(_email, ref), [])
-    for addr in ("someone@example.com", "first.last+tag@mail.example.org",
-                 "svc_account@corp.example"):
-        check("...but a real address is still caught (%s)" % addr,
-              bool(_re.findall(_email, addr)), True)
+    lic = read("LICENSE")
+    check("LICENSE is the Apache 2.0 text",
+          "Apache License" in lic and "Version 2.0, January 2004" in lic, True)
+    check("... including the terms, not just the header", "END OF TERMS AND CONDITIONS" in lic, True)
+    for family in ("SpaceGrotesk", "SpaceMono"):
+        ofl = read("assets/fonts/%s-OFL.txt" % family)
+        check("%s ships the real OFL 1.1 text" % family,
+              "SIL OPEN FONT LICENSE Version 1.1" in ofl and "PERMISSION & CONDITIONS" in ofl, True)
+    fonts = sorted(f for f in os.listdir(os.path.join(root, "assets", "fonts")) if f.endswith(".ttf"))
+    check("every font family has its licence text",
+          sorted({f.split("-")[0] for f in fonts}), ["SpaceGrotesk", "SpaceMono"])
 
 
-def test_brand_fallback(m):
+def test_brand_fallback(m, monkeypatch, tmp_path):
     """A build with no Cyderes brand assets must not assert the brand in text either.
 
-    This is what makes scripts/make-public.py's brand strip work by *absence* rather than by
+    This is what makes scripts/tools/make-public.py's brand strip work by *absence* rather than by
     patching source: the public tree simply has no brand files. The trap it guards is that the
     fallbacks used to be typographic -- `_logo_svg` returned the literal word "cyderes" and the
     report footer named Cyderes unconditionally -- so an unbranded build still stamped the wordmark
     into every masthead and footer. Removing the artwork and keeping the words is the same
     trademark use, minus the artwork.
     """
-    print("[29] report path degrades to unbranded with no brand assets")
     if not m._branded():
-        print("  SKIP  unbranded tree - this asserts the fallback FROM a branded install")
-        return
-    real = m._assets_dir
+        pytest.skip("unbranded tree - this asserts the fallback FROM a branded install")
     check("this repo IS branded", m._branded(), True)
     check("... so the footer names Cyderes", "Cyderes" in m._producer_note(), True)
     check("... and the wordmark is the real SVG", m._logo_svg().strip().startswith("<svg"), True)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        os.makedirs(os.path.join(tmp, "fonts"), exist_ok=True)
-        m._assets_dir = lambda: tmp
-        try:
-            check("no brand assets -> not branded", m._branded(), False)
-            check("... wordmark renders as nothing", m._logo_svg(), "")
-            note = m._producer_note()
-            check("... footer drops the brand name", "Cyderes" in note, False)
-            check("... and still attributes the tool", "meridiancs" in note, True)
-            css = m._load_css()
-            check("... stylesheet falls back, no brand colour",
-                  "#D4FC68" in css or "cybervolt" in css.lower(), False)
-            # Meridian is the queried product: naming it is nominative, and the masthead needs it.
-            check("... product slot still names Meridian", m._meridian_svg(), "Meridian")
-            check("... and no font faces without the font files", m._font_face_css(), "")
-        finally:
-            m._assets_dir = real
+    (tmp_path / "fonts").mkdir()
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "_assets_dir", lambda: str(tmp_path))
+        check("no brand assets -> not branded", m._branded(), False)
+        check("... wordmark renders as nothing", m._logo_svg(), "")
+        note = m._producer_note()
+        check("... footer drops the brand name", "Cyderes" in note, False)
+        check("... and still attributes the tool", "meridiancs" in note, True)
+        css = m._load_css()
+        check("... stylesheet falls back, no brand colour",
+              "#D4FC68" in css or "cybervolt" in css.lower(), False)
+        # Meridian is the queried product: naming it is nominative, and the masthead needs it.
+        check("... product slot still names Meridian", m._meridian_svg(), "Meridian")
+        check("... and no font faces without the font files", m._font_face_css(), "")
     check("restored to the branded install", m._branded(), True)
-
-
-def test_public_variants():
-    """The reviewed public reference docs exist, are in sync, and carry no tenant data.
-
-    Three separate failures are possible here and only the first is obvious:
-
-      * a variant missing entirely -- make-public.py already refuses, so this is belt and braces;
-      * a variant that has gone STALE because its internal source was edited. That one is silent by
-        nature: the internal doc gains a new measured figure, the public one keeps saying something
-        slightly false, and nothing looks broken. The sync stamp is what makes it loud, and CI is
-        what makes the stamp mean anything;
-      * a variant that still contains the measured figures it was written to replace.
-    """
-    print("[30] public reference variants exist, are in sync, and are sanitised")
-    if derived_tree():
-        print("  SKIP  derived public tree - the variants are its inputs, not its contents")
-        return
-    root = os.path.dirname(HERE)
-    spec = importlib.util.spec_from_file_location(
-        "mk_public", os.path.join(root, "scripts", "make-public.py"))
-    mp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mp)
-
-    for internal in sorted(mp.SUBSTITUTE_REQUIRED):
-        variant = internal[:-3] + ".public.md"
-        path = os.path.join(root, variant)
-        check("exists: %s" % variant, os.path.exists(path), True)
-        if not os.path.exists(path):
-            continue
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-        # A stub would satisfy "exists" while publishing nothing useful.
-        check("... is substantial, not a stub", len(text) > 1500, True)
-        for hit in mp.PII.known_identifiers(text):
-            check("... carries no removed identifier (%s)" % hit, False, True)
-        figures = [fig for fig, rx in mp.PII.FIGURE_PATTERNS if rx.search(text)]
-        check("... carries no measured tenant figure", figures, [])
-
-    # The stamp: every internal doc must match the digest its variant was reviewed against.
-    stale = mp.stale_variants()
-    check("all public variants are in sync with their source",
-          [internal for internal, _r, _a in stale], [])
-
-    # The data the guard depends on must actually be loadable, or every check above is vacuous.
-    check("regression guard data is loaded", mp.PII.KNOWN_AVAILABLE, True)
-    check("... with identifiers", len(mp.PII.KNOWN_REAL_IDENTIFIERS) > 0, True)
-    check("... and figures", len(mp.PII.FIGURE_PATTERNS) > 0, True)
-
-    # And it must not ship: design/ is dropped from the package and the public tree, which is the
-    # only reason it is safe for that file to name them.
-    keep, _subs, dropped, _missing = mp.plan(mp.tracked_files())
-    check("identifier data is dropped from the public tree",
-          "design/known-identifiers.json" in dropped, True)
-    check("... and is not in the kept set", "design/known-identifiers.json" in keep, False)
-    # Decided 2026-09-23, not defaulted: the internal record holds counsel's advice, and publishing
-    # privileged advice risks waiving the privilege. See design/oss-release.md.
-    check("PUBLISH_INTERNAL_DOCS stays False", mp.PUBLISH_INTERNAL_DOCS, False)
-    check("... so the legal record is dropped from the public tree",
-          sorted(f for f in ("design/oss-release.md", "design/legal-review-packet.md", "CLAUDE.md")
-                 if f in dropped), ["CLAUDE.md", "design/legal-review-packet.md", "design/oss-release.md"])
 
 
 def test_trademark_notice():
@@ -6899,7 +6680,6 @@ def test_trademark_notice():
     legal position. A well-meaning edit restoring the "independent API client" disclaimer would read
     as more careful and would in fact be a statement that the mark belongs to someone else.
     """
-    print("[31] NOTICE trademark position matches counsel's answer")
     root = os.path.dirname(HERE)
     with open(os.path.join(root, "NOTICE"), encoding="utf-8") as f:
         notice = f.read()
@@ -6959,68 +6739,6 @@ def test_trademark_notice():
         check("the history still carries the trailers the NOTICE describes", n > 0, True)
 
 
-def test_dangling_links():
-    """The derived public tree carries no dangling reference-doc links.
-
-    `references/nist-csf-mapping.md` and the `compliance` verb it documented were removed outright
-    (not merely held back from the public build), so there is no methodology gate left to test and
-    no dangling link from it either -- both were retired together rather than one being fixed and the
-    other left as a landmine. README was the remaining case and is now substituted too: it linked
-    two branded PDFs that every public build drops (`Cyderes-Meridian-Skill-Guide.pdf`,
-    `Cyderes-MeridianCS-Brief.pdf`), and `README.public.md` links neither. So the expectation is
-    an EMPTY set rather than a named allowance -- any dangling link is now a regression, which is
-    a stronger assertion than the old one and needs no list to be kept up to date.
-    """
-    print("[32] derived public tree carries no dangling links")
-    if derived_tree():
-        print("  SKIP  derived public tree - deriving again has no sources to substitute from")
-        return
-    root = os.path.dirname(HERE)
-    spec = importlib.util.spec_from_file_location(
-        "mk_public2", os.path.join(root, "scripts", "make-public.py"))
-    mp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mp)
-
-    keep, _subs, dropped, missing = mp.plan(mp.tracked_files())
-    check("no reference doc is missing its variant", missing, [])
-    check("the CSF mapping is gone, not just dropped from the public tree",
-          "references/nist-csf-mapping.md" in dropped, False)
-    # The review ledger is machinery of the derivation. It records digests of internal docs
-    # against variants the public tree has none of, so publishing it ships a ledger with nothing
-    # left to review -- the same class as the variants themselves riding into the package.
-    check("the sync stamp is dropped from the public tree", mp.SYNC_STAMP in dropped, True)
-    check("... and is not in the kept set", mp.SYNC_STAMP in keep, False)
-
-    # The audit must SAY what breaks. A derived tree is built for real: the check reads the output,
-    # not the plan, which is the whole point of auditing post-conditions.
-    import shutil as _shutil
-    tmp = tempfile.mkdtemp(prefix="pubtree-")
-    try:
-        target = os.path.join(tmp, "tree")
-        mp.copy_tree(keep, _subs, target)
-        problems = mp.audit(target)
-        dangling = [p for p in problems if "not in the public tree" in p]
-        check("the audit reports no dangling link at all",
-              sorted({p.split(" -> ")[-1] for p in dangling}), [])
-        # A link the tree DOES satisfy must not be reported, or the check is noise and gets muted.
-        # query-syntax.md is substituted from its .public.md variant, so it is present under its own
-        # name -- which also proves the check reads the derived tree and not the source repo.
-        resolves = os.path.join(target, "references", "query-syntax.md")
-        check("a substituted doc is present in the tree", os.path.exists(resolves), True)
-        # README ships from README.public.md under its own name. Checked by CONTENT, because
-        # "README.md exists" is true either way -- the internal one would satisfy it while
-        # carrying the brand prose and the two dead PDF links the substitution exists to remove.
-        with open(os.path.join(target, "README.md"), encoding="utf-8") as _f:
-            readme = _f.read()
-        check("README is the public variant, not the internal one",
-              "Cyderes-Meridian-Skill-Guide.pdf" in readme, False)
-        check("... and still documents the install", "~/.claude/skills/meridiancs" in readme, True)
-        check("... and is not reported as dangling",
-              any("query-syntax" in p for p in dangling), False)
-    finally:
-        _shutil.rmtree(tmp, ignore_errors=True)
-
-
 # Connector messages that echo exactly what the profile allow-list drops. The allow-list keeps
 # `message` verbatim, so before scrubbing every one of these values reached the preflight output.
 SCRUB_PROFILES = {"connectorProfiles": [
@@ -7057,11 +6775,10 @@ SCRUB_RUNS = {"content": [
 ]}
 
 
-def test_security_hardening(m):
+def test_security_hardening(m, monkeypatch, tmp_path):
     """Fixes from the 2026-09-22 security review. Every check here was run against the pre-fix
     meridian.py and failed there -- a guard written alongside its fix proves nothing otherwise."""
-    print("[33] security review fixes: message scrubbing, token channels, output paths (offline)")
-    import contextlib, io
+    import io
 
     # --- M3: connector messages are scrubbed of credential values ----------------------------------
     def fake_call(method, endpoint, body=None, retries=1):
@@ -7071,13 +6788,9 @@ def test_security_hardening(m):
             return SCRUB_RUNS
         raise AssertionError("unexpected endpoint %r" % endpoint)
 
-    real_call = m.call
-    m.call = fake_call
-    try:
-        brief = m.summarize_connectors()
-        full = m.summarize_connectors(brief=False)
-    finally:
-        m.call = real_call
+    monkeypatch.setattr(m, "call", fake_call)
+    brief = m.summarize_connectors()
+    full = m.summarize_connectors(brief=False)
     blob = json.dumps(brief) + json.dumps(full)
     for leak in ("svc_ldap", "10.20.30.40", "10.20.3", "proxy.scrub.invalid", "hunter22", "apiuser",
                  "api.scrub.example.com", "abcdefghijklmnop", "run_embedded_user", "tok_live_9f8e7d6c",
@@ -7088,28 +6801,22 @@ def test_security_hardening(m):
           "Login failed for user" in blob and "Max retries exceeded" in blob, True)
 
     # --- M2: the action token has a stdin channel too ----------------------------------------------
-    tmp = tempfile.mkdtemp()
-    real = (m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE)
-    m.CFG_DIR = tmp
-    m.CFG_PATH = os.path.join(tmp, "config.json")
-    m.STACKS_PATH = os.path.join(tmp, "stacks.json")
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp, "stacks.json"))
+    monkeypatch.setattr(m, "_CFG_CACHE", m._CFG_CACHE)
 
     class A:
         name, fqdn, token, action_token = "sec", "sec.example.com", "-", "-"
-    real_stdin = sys.stdin
-    sys.stdin = io.StringIO("tok-api\ntok-action\n")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("tok-api\ntok-action\n"))
     try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.cmd_stacks_add(A())
+        m.cmd_stacks_add(A())
         entry = m.load_stacks()["stacks"]["sec"]
         check("--token - and --action-token - read two stdin lines, in order",
               [entry.get("api_token"), entry.get("action_token")], ["tok-api", "tok-action"])
     except SystemExit:
         check("--action-token - is accepted", False, True)
-    finally:
-        sys.stdin = real_stdin
-        m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE = real
-        shutil.rmtree(tmp, ignore_errors=True)
 
     # SKILL.md must route saving through the script. A model writing config.json itself skips the
     # 0600 write and drops entity_salt, and `--token '<token>'` puts the token in argv.
@@ -7122,103 +6829,91 @@ def test_security_hardening(m):
     check("...and shows no token-in-argv example", "--token '<token>'" in skill, False)
 
     # --- L3: output paths are checked before anything is written -----------------------------------
-    work = tempfile.mkdtemp()
+    work = tempfile.mkdtemp(dir=tmp_path)
     # A HOME with no ~/.meridian and blank credential env vars: if the guard ever regresses, the
     # subprocess dies "not configured" instead of querying whatever stack this machine has saved --
     # which is exactly what the first draft of this check did against the pre-fix code.
     iso = dict(os.environ, HOME=work, USERPROFILE=work, MERIDIAN_FQDN="", MERIDIAN_API_TOKEN="",
                MERIDIAN_ACTION_TOKEN="")
-    try:
-        victim = os.path.join(work, "victim.py")
-        with open(victim, "w", encoding="utf-8") as f:
-            f.write("print('original')\n")
-        inp = os.path.join(work, "in.json")
-        with open(inp, "w", encoding="utf-8") as f:
-            json.dump({"table": "asset", "totalRecords": 0, "rows": []}, f)
-        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
-                            "--out", victim], capture_output=True, text=True, encoding="utf-8", env=iso)
-        with open(victim, encoding="utf-8") as f:
-            check("report --out refuses a non-report suffix (the script survives)",
-                  f.read() == "print('original')\n", True)
-        check("...exiting 2 with the reason", (r.returncode, "must end in" in r.stderr), (2, True))
-        with open(victim, "w", encoding="utf-8") as f:   # independent of the check above
-            f.write("print('original')\n")
-        r = subprocess.run([sys.executable, MERIDIAN_PY, "list", "--format", "csv",
-                            "--out", victim], capture_output=True, text=True, encoding="utf-8",
-                           env=iso)
-        with open(victim, encoding="utf-8") as f:
-            check("--format csv --out refuses a non-.csv target", f.read() == "print('original')\n", True)
-        check("...before any credential or API work", "must end in" in r.stderr, True)
-        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
-                            "--out", os.path.join(work, "missing", "r.html")],
-                           capture_output=True, text=True, encoding="utf-8", env=iso)
-        check("report --out into a missing directory is refused", r.returncode, 2)
+    victim = os.path.join(work, "victim.py")
+    with open(victim, "w", encoding="utf-8") as f:
+        f.write("print('original')\n")
+    inp = os.path.join(work, "in.json")
+    with open(inp, "w", encoding="utf-8") as f:
+        json.dump({"table": "asset", "totalRecords": 0, "rows": []}, f)
+    r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
+                        "--out", victim], capture_output=True, text=True, encoding="utf-8", env=iso)
+    with open(victim, encoding="utf-8") as f:
+        check("report --out refuses a non-report suffix (the script survives)",
+              f.read() == "print('original')\n", True)
+    check("...exiting 2 with the reason", (r.returncode, "must end in" in r.stderr), (2, True))
+    with open(victim, "w", encoding="utf-8") as f:   # independent of the check above
+        f.write("print('original')\n")
+    r = subprocess.run([sys.executable, MERIDIAN_PY, "list", "--format", "csv",
+                        "--out", victim], capture_output=True, text=True, encoding="utf-8",
+                       env=iso)
+    with open(victim, encoding="utf-8") as f:
+        check("--format csv --out refuses a non-.csv target", f.read() == "print('original')\n", True)
+    check("...before any credential or API work", "must end in" in r.stderr, True)
+    r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
+                        "--out", os.path.join(work, "missing", "r.html")],
+                       capture_output=True, text=True, encoding="utf-8", env=iso)
+    check("report --out into a missing directory is refused", r.returncode, 2)
 
-        # --- the token files are never an input (2026-09-25 security review) ------------------------
-        cfgdir = os.path.join(work, ".meridian")
-        os.makedirs(cfgdir, exist_ok=True)
-        stacks = os.path.join(cfgdir, "stacks.json")
-        fake = "fake-token-0000-do-not-leak"
-        with open(stacks, "w", encoding="utf-8") as f:
-            json.dump({"active": "s", "stacks": {"s": {"fqdn": "s.example", "token": fake}}}, f)
-        out_html = os.path.join(work, "leak.html")
-        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", stacks,
-                            "--out", out_html], capture_output=True, text=True, encoding="utf-8", env=iso)
-        check("report --input refuses the saved-stacks file", (r.returncode, "never an input" in r.stderr),
-              (2, True))
-        check("...and writes nothing", os.path.exists(out_html), False)
-        check("...nor echoes the token", fake in r.stdout + r.stderr, False)
-        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input",
-                            os.path.join(cfgdir, ".", "stacks.json"), "--out", out_html],
-                           capture_output=True, text=True, encoding="utf-8", env=iso)
-        check("...however the path is spelled", r.returncode, 2)
-        r = subprocess.run([sys.executable, MERIDIAN_PY, "api", "-X", "POST", "CMDB/v2/data/cmdb",
-                            "--body-file", stacks], capture_output=True, text=True, encoding="utf-8", env=iso)
-        check("api --body-file refuses it too", (r.returncode, "never an input" in r.stderr), (2, True))
-        r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
-                            "--out", os.path.join(work, "ok.html")],
-                           capture_output=True, text=True, encoding="utf-8", env=iso)
-        check("an ordinary input still renders", r.returncode, 0)
-        with open(os.path.join(work, "ok.html"), encoding="utf-8") as f:
-            page = f.read()
-        check("...under a Content-Security-Policy that allows no script or fetch",
-              "Content-Security-Policy\" content=\"default-src 'none'" in page and "<script" not in page, True)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    # --- the token files are never an input (2026-09-25 security review) ------------------------
+    cfgdir = os.path.join(work, ".meridian")
+    os.makedirs(cfgdir, exist_ok=True)
+    stacks = os.path.join(cfgdir, "stacks.json")
+    fake = "fake-token-0000-do-not-leak"
+    with open(stacks, "w", encoding="utf-8") as f:
+        json.dump({"active": "s", "stacks": {"s": {"fqdn": "s.example", "token": fake}}}, f)
+    out_html = os.path.join(work, "leak.html")
+    r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", stacks,
+                        "--out", out_html], capture_output=True, text=True, encoding="utf-8", env=iso)
+    check("report --input refuses the saved-stacks file", (r.returncode, "never an input" in r.stderr),
+          (2, True))
+    check("...and writes nothing", os.path.exists(out_html), False)
+    check("...nor echoes the token", fake in r.stdout + r.stderr, False)
+    r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input",
+                        os.path.join(cfgdir, ".", "stacks.json"), "--out", out_html],
+                       capture_output=True, text=True, encoding="utf-8", env=iso)
+    check("...however the path is spelled", r.returncode, 2)
+    r = subprocess.run([sys.executable, MERIDIAN_PY, "api", "-X", "POST", "CMDB/v2/data/cmdb",
+                        "--body-file", stacks], capture_output=True, text=True, encoding="utf-8", env=iso)
+    check("api --body-file refuses it too", (r.returncode, "never an input" in r.stderr), (2, True))
+    r = subprocess.run([sys.executable, MERIDIAN_PY, "report", "--html", "--input", inp,
+                        "--out", os.path.join(work, "ok.html")],
+                       capture_output=True, text=True, encoding="utf-8", env=iso)
+    check("an ordinary input still renders", r.returncode, 0)
+    with open(os.path.join(work, "ok.html"), encoding="utf-8") as f:
+        page = f.read()
+    check("...under a Content-Security-Policy that allows no script or fetch",
+          "Content-Security-Policy\" content=\"default-src 'none'" in page and "<script" not in page, True)
 
     # --- L1: ~/.meridian is tightened to 0700 even when something else created it --------------------
     if os.name != "nt":
-        tmp = tempfile.mkdtemp()
+        tmp = tempfile.mkdtemp(dir=tmp_path)
         os.chmod(tmp, 0o755)
-        real = (m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE)
-        m.CFG_DIR = tmp
-        m.CFG_PATH = os.path.join(tmp, "config.json")
-        m.STACKS_PATH = os.path.join(tmp, "stacks.json")
-        m._CFG_DIR_CHECKED = False
-        try:
-            m.save_stacks({"active": None, "stacks": {}})
-            check("a 0755 ~/.meridian is tightened to 0700", oct(os.stat(tmp).st_mode & 0o777), "0o700")
-        finally:
-            m.CFG_DIR, m.CFG_PATH, m.STACKS_PATH, m._CFG_CACHE = real
-            m._CFG_DIR_CHECKED = False
-            shutil.rmtree(tmp, ignore_errors=True)
+        monkeypatch.setattr(m, "CFG_DIR", tmp)
+        monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "config.json"))
+        monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp, "stacks.json"))
+        monkeypatch.setattr(m, "_CFG_DIR_CHECKED", False)
+        m.save_stacks({"active": None, "stacks": {}})
+        check("a 0755 ~/.meridian is tightened to 0700", oct(os.stat(tmp).st_mode & 0o777), "0o700")
 
         # prune_snapshots' fixed-name temp file must not follow a planted symlink.
-        tmp = tempfile.mkdtemp()
-        try:
-            hist = os.path.join(tmp, "snapshots.jsonl")
-            with open(hist, "w", encoding="utf-8") as f:
-                for i in range(3):
-                    f.write(json.dumps({"schema": m.SNAPSHOT_SCHEMA, "n": i}) + "\n")
-            victim = os.path.join(tmp, "victim.txt")
-            with open(victim, "w", encoding="utf-8") as f:
-                f.write("untouched")
-            os.symlink(victim, hist + ".tmp")
-            m.prune_snapshots(keep=1, path=hist)
-            with open(victim, encoding="utf-8") as f:
-                check("prune's temp file does not write through a planted symlink", f.read(), "untouched")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        tmp = tempfile.mkdtemp(dir=tmp_path)
+        hist = os.path.join(tmp, "snapshots.jsonl")
+        with open(hist, "w", encoding="utf-8") as f:
+            for i in range(3):
+                f.write(json.dumps({"schema": m.SNAPSHOT_SCHEMA, "n": i}) + "\n")
+        victim = os.path.join(tmp, "victim.txt")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("untouched")
+        os.symlink(victim, hist + ".tmp")
+        m.prune_snapshots(keep=1, path=hist)
+        with open(victim, encoding="utf-8") as f:
+            check("prune's temp file does not write through a planted symlink", f.read(), "untouched")
     else:
         print("  SKIP  POSIX permission checks (Windows)")
 
@@ -7240,17 +6935,14 @@ def test_security_hardening(m):
         def login(self, user, password): FakeSMTP.log.append("login")
         def send_message(self, msg): FakeSMTP.log.append("sent")
 
-    m._SMTP_CLIENT = FakeSMTP
+    monkeypatch.setattr(m, "_SMTP_CLIENT", FakeSMTP)
     try:
-        try:
-            m._send_email({"host": "smtp.example", "port": 25, "from": "a@example.com",
-                           "to": ["b@example.com"], "user": "u", "password": "p", "starttls": False},
-                          "s", "t", "<p>h</p>")
-        except ValueError:
-            pass
-        check("SMTP login without TLS is refused, before connecting", FakeSMTP.log, [])
-    finally:
-        m._SMTP_CLIENT = None
+        m._send_email({"host": "smtp.example", "port": 25, "from": "a@example.com",
+                       "to": ["b@example.com"], "user": "u", "password": "p", "starttls": False},
+                      "s", "t", "<p>h</p>")
+    except ValueError:
+        pass
+    check("SMTP login without TLS is refused, before connecting", FakeSMTP.log, [])
 
     v = {"firing": [{"rule": "<!channel> ping", "message": "see <https://evil.example|your bank>"}],
          "clear": [], "unevaluable": [], "stack": "demo",
@@ -7264,7 +6956,7 @@ def test_security_hardening(m):
         check("Slack renderer handles the fixture", type(e).__name__, None)
 
 
-def test_selfupdate_held_dir(m):
+def test_selfupdate_held_dir(m, monkeypatch, tmp_path):
     """An install directory some process is sitting in must still update.
 
     Windows refuses to rename a directory that is any process's working directory, and the likeliest
@@ -7273,13 +6965,13 @@ def test_selfupdate_held_dir(m):
     WinError 32, silently, while every earlier end-to-end check had run from outside the directory.
     The simulated lock runs everywhere; the real one runs wherever the OS enforces it (Windows CI).
     """
-    print("[34] selfupdate: an install directory in use still updates (offline)")
 
     def fake(version):
         def _f(repo):
             return {"version": version, "tag": "v" + version,
                     "assetName": "meridiancs.v%s.skill.zip" % version,
                     "assetUrl": "https://github.com/o/r/releases/download/v%s/x.skill.zip" % version,
+                    "sigUrl": "https://github.com/o/r/releases/download/v%s/x.skill.zip.sig" % version,
                     "assetSize": 1234}
         return _f
 
@@ -7291,10 +6983,6 @@ def test_selfupdate_held_dir(m):
         with open(os.path.join(install, rel), encoding="utf-8") as f:
             return f.read()
 
-    # getattr with a default so this can run against a build without the hooks -- which is how it
-    # was shown to fail against the pre-fix apply path rather than only to pass against the fix.
-    saved = {n: getattr(m, n, None) for n in ("latest_release", "_download_asset", "_rename_dir",
-                                              "_move_entry")}
     real_replace = os.replace
 
     def locked_rename(src, dst):
@@ -7302,95 +6990,89 @@ def test_selfupdate_held_dir(m):
             raise PermissionError(13, "simulated WinError 32: directory in use", src)
         return real_replace(src, dst)
 
-    def scenario(version, pkg_version=None):
-        tmp = tempfile.mkdtemp()
+    def scenario(mp, version, pkg_version=None):
+        tmp = tempfile.mkdtemp(dir=tmp_path)
         install = _su_install(tmp, version)
         with open(os.path.join(install, "old-only.txt"), "w", encoding="utf-8") as f:
             f.write("from the old install")
-        env = _SUEnv(m, install, tmp)
+        _su_env(mp, m, install, tmp)
         pkg = _su_package(tmp, pkg_version or "2.24.3")
-        m.latest_release = fake(pkg_version or "2.24.3")
-        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
-        return tmp, install, env
+        # raising=False so this can run against a build without the hooks -- which is how it was
+        # shown to fail against the pre-fix apply path rather than only to pass against the fix.
+        mp.setattr(m, "latest_release", fake(pkg_version or "2.24.3"), raising=False)
+        mp.setattr(m, "_download_asset", _su_fetch(pkg), raising=False)
+        return install
 
-    os.environ["MERIDIAN_UPDATE_REPO"] = "jwood25/meridiancs-public"
-    try:
-        # --- 1. the directory cannot be renamed: the contents are swapped instead ----------------
-        tmp, install, env = scenario("2.24.2")
+    monkeypatch.setenv("MERIDIAN_UPDATE_REPO", "jwood25/meridiancs-public")
+
+    # --- 1. the directory cannot be renamed: the contents are swapped instead ----------------
+    with monkeypatch.context() as mp:
+        install = scenario(mp, "2.24.2")
+        mp.setattr(m, "_rename_dir", locked_rename, raising=False)
+        ident = os.stat(install)
+        res = m.apply_update(m.check_update(force=True))
+        check("a locked install directory still updates", (res.get("applied"), res.get("toVersion")),
+              (True, "2.24.3"))
+        check("... by swapping its contents", res.get("swap"), "contents")
+        check("... in place (same directory, not a replacement)",
+              os.path.samestat(ident, os.stat(install)), True)
+        check("the new stamp and SKILL.md landed",
+              (m.installed_version().get("version"), "stub skill 2.24.3" in read(install, "SKILL.md")),
+              ("2.24.3", True))
+        check("the old install's files are gone, as with a directory swap",
+              os.path.exists(os.path.join(install, "old-only.txt")), False)
+        check("nothing is left beside the install", leftovers(install), [])
+
+    # --- 2. a failure mid-swap puts every old entry back -------------------------------------
+    with monkeypatch.context() as mp:
+        install = scenario(mp, "2.24.2")
+        mp.setattr(m, "_rename_dir", locked_rename, raising=False)
+
+        def failing_move(src, dst):
+            # Only the move IN from staging fails; moving the old entry back must still work.
+            if (os.path.basename(dst) == "scripts" and os.path.dirname(dst) == m.INSTALL_REAL
+                    and "unpacked" in src):
+                raise PermissionError(13, "simulated: cannot move scripts in", dst)
+            return real_replace(src, dst)
+        mp.setattr(m, "_move_entry", failing_move, raising=False)
         try:
-            m._rename_dir = locked_rename
-            ident = os.stat(install)
-            res = m.apply_update(m.check_update(force=True))
-            check("a locked install directory still updates", (res.get("applied"), res.get("toVersion")),
-                  (True, "2.24.3"))
-            check("... by swapping its contents", res.get("swap"), "contents")
-            check("... in place (same directory, not a replacement)",
-                  os.path.samestat(ident, os.stat(install)), True)
-            check("the new stamp and SKILL.md landed",
-                  (m.installed_version().get("version"), "stub skill 2.24.3" in read(install, "SKILL.md")),
-                  ("2.24.3", True))
-            check("the old install's files are gone, as with a directory swap",
-                  os.path.exists(os.path.join(install, "old-only.txt")), False)
-            check("nothing is left beside the install", leftovers(install), [])
-        finally:
-            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
+            m.apply_update(m.check_update(force=True))
+            check("a failed contents swap is reported", "applied", "raised")
+        except OSError:
+            check("a failed contents swap is reported", "raised", "raised")
+        check("... and the old install is back, whole",
+              (m.installed_version().get("version"), read(install, "SKILL.md"),
+               read(install, "scripts/meridian.py"), read(install, "old-only.txt")),
+              ("2.24.2", "# installed 2.24.2\n", "print('old')\n", "from the old install"))
+        check("... with nothing left beside it", leftovers(install), [])
 
-        # --- 2. a failure mid-swap puts every old entry back -------------------------------------
-        tmp, install, env = scenario("2.24.2")
+    # --- 3. a restore that cannot finish never deletes the only copy -------------------------
+    with monkeypatch.context() as mp:
+        install = scenario(mp, "2.24.2")
+        mp.setattr(m, "_rename_dir", locked_rename, raising=False)
+
+        def stuck_move(src, dst):
+            parent = os.path.dirname(dst)
+            if os.path.basename(dst) == "scripts" and parent == m.INSTALL_REAL and "unpacked" in src:
+                raise PermissionError(13, "simulated: cannot move scripts in", dst)
+            if os.path.basename(src) == "SKILL.md" and m.UPDATE_HELD_PREFIX in os.path.basename(os.path.dirname(src)):
+                raise PermissionError(13, "simulated: cannot restore SKILL.md", src)
+            return real_replace(src, dst)
+        mp.setattr(m, "_move_entry", stuck_move, raising=False)
         try:
-            m._rename_dir = locked_rename
+            m.apply_update(m.check_update(force=True))
+            check("an incomplete restore is reported", "applied", "raised")
+        except RuntimeError as e:
+            check("an incomplete restore is reported, naming where the old files are",
+                  m.UPDATE_HELD_PREFIX in str(e) and "SKILL.md" in str(e), True)
+        kept = [d for d in leftovers(install) if d.startswith(m.UPDATE_HELD_PREFIX)]
+        check("... and that directory is kept, holding the stuck file",
+              len(kept) == 1 and os.path.exists(os.path.join(os.path.dirname(install), kept[0],
+                                                             "SKILL.md")) if kept else False, True)
 
-            def failing_move(src, dst):
-                # Only the move IN from staging fails; moving the old entry back must still work.
-                if (os.path.basename(dst) == "scripts" and os.path.dirname(dst) == m.INSTALL_REAL
-                        and "unpacked" in src):
-                    raise PermissionError(13, "simulated: cannot move scripts in", dst)
-                return real_replace(src, dst)
-            m._move_entry = failing_move
-            try:
-                m.apply_update(m.check_update(force=True))
-                check("a failed contents swap is reported", "applied", "raised")
-            except OSError:
-                check("a failed contents swap is reported", "raised", "raised")
-            check("... and the old install is back, whole",
-                  (m.installed_version().get("version"), read(install, "SKILL.md"),
-                   read(install, "scripts/meridian.py"), read(install, "old-only.txt")),
-                  ("2.24.2", "# installed 2.24.2\n", "print('old')\n", "from the old install"))
-            check("... with nothing left beside it", leftovers(install), [])
-        finally:
-            m._move_entry = saved["_move_entry"] or os.replace
-            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
-
-        # --- 3. a restore that cannot finish never deletes the only copy -------------------------
-        tmp, install, env = scenario("2.24.2")
-        try:
-            m._rename_dir = locked_rename
-
-            def stuck_move(src, dst):
-                parent = os.path.dirname(dst)
-                if os.path.basename(dst) == "scripts" and parent == m.INSTALL_REAL and "unpacked" in src:
-                    raise PermissionError(13, "simulated: cannot move scripts in", dst)
-                if os.path.basename(src) == "SKILL.md" and m.UPDATE_HELD_PREFIX in os.path.basename(os.path.dirname(src)):
-                    raise PermissionError(13, "simulated: cannot restore SKILL.md", src)
-                return real_replace(src, dst)
-            m._move_entry = stuck_move
-            try:
-                m.apply_update(m.check_update(force=True))
-                check("an incomplete restore is reported", "applied", "raised")
-            except RuntimeError as e:
-                check("an incomplete restore is reported, naming where the old files are",
-                      m.UPDATE_HELD_PREFIX in str(e) and "SKILL.md" in str(e), True)
-            kept = [d for d in leftovers(install) if d.startswith(m.UPDATE_HELD_PREFIX)]
-            check("... and that directory is kept, holding the stuck file",
-                  len(kept) == 1 and os.path.exists(os.path.join(os.path.dirname(install), kept[0],
-                                                                 "SKILL.md")) if kept else False, True)
-        finally:
-            m._move_entry = saved["_move_entry"] or os.replace
-            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
-
-        # --- 4. for real: another process's working directory is the install ---------------------
-        m._rename_dir = saved["_rename_dir"] or os.replace
-        tmp, install, env = scenario("2.24.2")
+    # --- 4. for real: another process's working directory is the install ---------------------
+    with monkeypatch.context() as mp:
+        install = scenario(mp, "2.24.2")
         holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=install)
         try:
             res = m.apply_update(m.check_update(force=True))
@@ -7401,16 +7083,8 @@ def test_selfupdate_held_dir(m):
                   "contents" if os.name == "nt" else "directory")
             check("... and lands the new version", m.installed_version().get("version"), "2.24.3")
         finally:
-            holder.kill(); holder.wait()
-            env.restore(); shutil.rmtree(tmp, ignore_errors=True)
-    finally:
-        for n, v in saved.items():
-            if v is None:
-                if hasattr(m, n):
-                    delattr(m, n)
-            else:
-                setattr(m, n, v)
-        os.environ.pop("MERIDIAN_UPDATE_REPO", None)
+            holder.kill()
+            holder.wait()
 
 
 WN_CHANGELOG = """Intro prose that is not an entry.
@@ -7434,14 +7108,13 @@ WN_CHANGELOG = """Intro prose that is not an entry.
 """
 
 
-def test_whats_new(m):
+def test_whats_new(m, monkeypatch, tmp_path):
     """The release an install moved to announces itself once, from its own CHANGELOG.md.
 
     Users never open the skill folder, so the changelog only reaches anyone if the skill says it.
     The detection has to survive being updated BY an older updater, which rewrites `.updatecheck`
     with the new version straight after an apply -- which is why `.lastseen` is its own file.
     """
-    print("[35] what's new: changelog parsing, first-session announcement, release guard (offline)")
     root = os.path.dirname(HERE)
 
     # --- the shipped CHANGELOG.md is well-formed ---------------------------------------------------
@@ -7458,31 +7131,28 @@ def test_whats_new(m):
           [("2.25.0", 5), ("2.24.3", 1), ("2.24.2", 1)])
     check("continuation lines fold into their item", parsed[0][1][0],
           "**Newest.** first item with a continuation line")
-    tmp = tempfile.mkdtemp()
-    try:
-        cl = os.path.join(tmp, "CHANGELOG.md")
-        with open(cl, "w", encoding="utf-8") as f:
-            f.write(WN_CHANGELOG)
-        wn = m.whats_new("2.24.2", "2.25.0", path=cl)
-        check("everything newer than the last-seen version, newest first",
-              [r["version"] for r in wn], ["2.25.0", "2.24.3"])
-        check("... items capped, with the remainder counted", (len(wn[0]["items"]), wn[0].get("moreItems")),
-              (m.WHATS_NEW_MAX_ITEMS, 5 - m.WHATS_NEW_MAX_ITEMS))
-        check("an unknown earlier version announces only the current entry",
-              [r["version"] for r in m.whats_new(None, "2.25.0", path=cl)], ["2.25.0"])
-        check("a version with no entry announces nothing, not 'nothing changed'",
-              m.whats_new("2.25.0", "2.26.0", path=cl), [])
-        check("no changelog is no announcement, not an error", m.whats_new("2.24.2", "2.25.0",
-                                                                           path=cl + ".missing"), [])
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    cl = os.path.join(tmp, "CHANGELOG.md")
+    with open(cl, "w", encoding="utf-8") as f:
+        f.write(WN_CHANGELOG)
+    wn = m.whats_new("2.24.2", "2.25.0", path=cl)
+    check("everything newer than the last-seen version, newest first",
+          [r["version"] for r in wn], ["2.25.0", "2.24.3"])
+    check("... items capped, with the remainder counted", (len(wn[0]["items"]), wn[0].get("moreItems")),
+          (m.WHATS_NEW_MAX_ITEMS, 5 - m.WHATS_NEW_MAX_ITEMS))
+    check("an unknown earlier version announces only the current entry",
+          [r["version"] for r in m.whats_new(None, "2.25.0", path=cl)], ["2.25.0"])
+    check("a version with no entry announces nothing, not 'nothing changed'",
+          m.whats_new("2.25.0", "2.26.0", path=cl), [])
+    check("no changelog is no announcement, not an error", m.whats_new("2.24.2", "2.25.0",
+                                                                       path=cl + ".missing"), [])
 
     # --- the first-session announcement ------------------------------------------------------------
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=tmp_path)
     install = _su_install(tmp, "2.25.0")
     with open(os.path.join(install, "CHANGELOG.md"), "w", encoding="utf-8") as f:
         f.write(WN_CHANGELOG)
-    env = _SUEnv(m, install, tmp)
+    _su_env(monkeypatch, m, install, tmp)
     os.makedirs(m.CFG_DIR, exist_ok=True)
     lastseen = os.path.join(m.CFG_DIR, ".lastseen")
 
@@ -7493,74 +7163,51 @@ def test_whats_new(m):
     def announce(prior=None, local="2.25.0", state="current"):
         return m.announce_whats_new({"installedVersion": local, "state": state}, prior)
 
-    try:
-        r = announce()
-        check("a fresh install announces nothing", "whatsNew" in r, False)
-        check("... but records the version it started on",
-              json.load(open(lastseen, encoding="utf-8")).get("version"), "2.25.0")
-        check("the next session on the same version announces nothing", "whatsNew" in announce(), False)
+    r = announce()
+    check("a fresh install announces nothing", "whatsNew" in r, False)
+    check("... but records the version it started on",
+          json.load(open(lastseen, encoding="utf-8")).get("version"), "2.25.0")
+    check("the next session on the same version announces nothing", "whatsNew" in announce(), False)
 
-        seen("2.24.3")
-        r = announce()
-        check("the first session after an update announces the new entries",
-              ([x["version"] for x in r.get("whatsNew", [])], r.get("updatedFrom")), (["2.25.0"], "2.24.3"))
-        check("... once: the session after says nothing", "whatsNew" in announce(), False)
+    seen("2.24.3")
+    r = announce()
+    check("the first session after an update announces the new entries",
+          ([x["version"] for x in r.get("whatsNew", [])], r.get("updatedFrom")), (["2.25.0"], "2.24.3"))
+    check("... once: the session after says nothing", "whatsNew" in announce(), False)
 
-        os.remove(lastseen)
-        r = announce(prior={"installedVersion": "2.25.0", "state": "current"})
-        check("updated by a pre-2.25 updater (cache already says the new version): current entry only",
-              ([x["version"] for x in r.get("whatsNew", [])], r.get("updatedFrom")), (["2.25.0"], None))
+    os.remove(lastseen)
+    r = announce(prior={"installedVersion": "2.25.0", "state": "current"})
+    check("updated by a pre-2.25 updater (cache already says the new version): current entry only",
+          ([x["version"] for x in r.get("whatsNew", [])], r.get("updatedFrom")), (["2.25.0"], None))
 
-        os.remove(lastseen)
-        r = announce(prior={"installedVersion": "2.24.2", "state": "current"})
-        check("replaced by hand (cache still says the old version): the whole range",
-              [x["version"] for x in r.get("whatsNew", [])], ["2.25.0", "2.24.3"])
+    os.remove(lastseen)
+    r = announce(prior={"installedVersion": "2.24.2", "state": "current"})
+    check("replaced by hand (cache still says the old version): the whole range",
+          [x["version"] for x in r.get("whatsNew", [])], ["2.25.0", "2.24.3"])
 
-        os.remove(lastseen)
-        r = announce(local=None, state="dev", prior={"installedVersion": "2.24.2"})
-        check("a working tree never announces", "whatsNew" in r, False)
-        check("... and never records a version", os.path.exists(lastseen), False)
+    os.remove(lastseen)
+    r = announce(local=None, state="dev", prior={"installedVersion": "2.24.2"})
+    check("a working tree never announces", "whatsNew" in r, False)
+    check("... and never records a version", os.path.exists(lastseen), False)
 
-        # --- the apply path announces straight away, and records it -------------------------------
-        seen("2.25.0")
-        pkg = _su_package(tmp, "2.26.0", extra={"meridiancs/CHANGELOG.md":
-                                                "## 2.26.0\n\n- **Brand new.** thing\n\n" + WN_CHANGELOG})
-        saved = (m.latest_release, m._download_asset)
-        m.latest_release = lambda repo: {"version": "2.26.0", "tag": "v2.26.0",
-                                         "assetName": "x.skill.zip", "assetSize": 1,
-                                         "assetUrl": "https://github.com/o/r/releases/download/v2.26.0/x.skill.zip"}
-        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
-        os.environ["MERIDIAN_UPDATE_REPO"] = "jwood25/meridiancs-public"
-        try:
-            with open(os.path.join(install, "VERSION.json"), "w", encoding="utf-8") as f:
-                json.dump({"schema": 1, "version": "2.25.0", "commit": "c"}, f)
-            res = m.apply_update(m.check_update(force=True))
-            check("an apply reports the new version's notes from the NEW changelog",
-                  [x["version"] for x in res.get("whatsNew", [])], ["2.26.0"])
-            check("... and records them as seen, so the next session doesn't repeat them",
-                  "whatsNew" in announce(local="2.26.0", prior=m._read_updatecheck()), False)
-        finally:
-            m.latest_release, m._download_asset = saved
-            os.environ.pop("MERIDIAN_UPDATE_REPO", None)
-    finally:
-        env.restore()
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    # --- a release cannot be built without its entry ----------------------------------------------
-    script = os.path.join(root, "scripts", "make-package.py")
-    r = subprocess.run([sys.executable, script, "--version", "9.9.7"], capture_output=True, text=True,
-                       cwd=root)
-    check("make-package refuses a release with no changelog entry",
-          (r.returncode, "no `## 9.9.7` entry" in r.stdout), (1, True))
-    check("... and writes no package", os.path.exists(os.path.join(root, "meridiancs.v9.9.7.skill.zip")),
-          False)
-    out = os.path.join(tempfile.mkdtemp(), "probe.skill.zip")
-    subprocess.run([sys.executable, script, out, "--version", "9.9.7", "--allow-dirty"],
-                   capture_output=True, text=True, cwd=root)
-    import zipfile
-    with zipfile.ZipFile(out) as z:
-        check("CHANGELOG.md ships in the package", "meridiancs/CHANGELOG.md" in z.namelist(), True)
-    shutil.rmtree(os.path.dirname(out), ignore_errors=True)
+    # --- the apply path announces straight away, and records it -------------------------------
+    seen("2.25.0")
+    pkg = _su_package(tmp, "2.26.0", extra={"meridiancs/CHANGELOG.md":
+                                            "## 2.26.0\n\n- **Brand new.** thing\n\n" + WN_CHANGELOG})
+    monkeypatch.setattr(m, "latest_release",
+                        lambda repo: {"version": "2.26.0", "tag": "v2.26.0",
+                                      "assetName": "x.skill.zip", "assetSize": 1,
+                                      "assetUrl": "https://github.com/o/r/releases/download/v2.26.0/x.skill.zip",
+                                      "sigUrl": "https://github.com/o/r/releases/download/v2.26.0/x.skill.zip.sig"})
+    monkeypatch.setattr(m, "_download_asset", _su_fetch(pkg))
+    monkeypatch.setenv("MERIDIAN_UPDATE_REPO", "jwood25/meridiancs-public")
+    with open(os.path.join(install, "VERSION.json"), "w", encoding="utf-8") as f:
+        json.dump({"schema": 1, "version": "2.25.0", "commit": "c"}, f)
+    res = m.apply_update(m.check_update(force=True))
+    check("an apply reports the new version's notes from the NEW changelog",
+          [x["version"] for x in res.get("whatsNew", [])], ["2.26.0"])
+    check("... and records them as seen, so the next session doesn't repeat them",
+          "whatsNew" in announce(local="2.26.0", prior=m._read_updatecheck()), False)
 
     # --- SKILL.md carries the rules, not just the code ---------------------------------------------
     with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as f:
@@ -7573,117 +7220,27 @@ def test_whats_new(m):
         check("SKILL.md still says: %s" % rule[:48], rule in skill, True)
 
 
-def test_publish_public():
-    """publish-public.py makes the release commit BEFORE it builds, so the stamp names that commit.
-
-    Through v2.25.0 the build ran on the synced-but-uncommitted clone with --allow-dirty and the
-    operator committed afterwards, so every public package's VERSION.json named the PREVIOUS public
-    commit plus `dirty: true` (the v2.24.2 asset names the v2.24.0 seed). Driven end to end against a
-    throwaway clone of a local bare repo, so nothing here touches the network or the real clone.
-    """
-    print("[36] publish-public: release commit precedes the build; tip and no-op checks hold (offline)")
-    if derived_tree():
-        print("  SKIP  derived public tree - publishing derives from the internal tree it lacks")
-        return
-    import zipfile
-    root = os.path.dirname(HERE)
-    script = os.path.join(root, "scripts", "publish-public.py")
-    with open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8-sig") as f:
-        version = re.search(r"^##\s+\[?v?(\d+\.\d+\.\d+)", f.read(), re.M).group(1)
-
-    def git(cwd, *args):
-        return subprocess.run(["git"] + list(args), cwd=cwd, capture_output=True, text=True)
-
-    def rev(cwd, ref="HEAD"):
-        return git(cwd, "rev-parse", ref).stdout.strip()
-
-    def publish(clone, ver=version):
-        # --allow-dirty applies to the INTERNAL tree only, so the suite runs on a working copy with
-        # edits in it. The clone-side build is what this test is about, and it takes no such flag.
-        return subprocess.run([sys.executable, script, "--version", ver, "--clone", clone,
-                               "--allow-dirty"], capture_output=True, text=True, cwd=root)
-
-    def force_rm(func, path, _exc):
-        os.chmod(path, 0o700)   # git's object files are read-only, which Windows refuses to delete
-        func(path)
-
-    tmp = tempfile.mkdtemp(prefix="pubtest-")
-    try:
-        # The URL guard wants the public repo's name in the remote, so the bare repo carries it.
-        origin = os.path.join(tmp, "CyderesInc", "MeridianCS.git")
-        clone = os.path.join(tmp, "clone")
-        os.makedirs(origin)
-        git(origin, "init", "--quiet", "--bare")
-        # Forward slashes, so the remote URL reads CyderesInc/MeridianCS on Windows too.
-        git(tmp, "clone", "--quiet", origin.replace(os.sep, "/"), clone)
-        for k, v in (("user.name", "test"), ("user.email", "test@example.com"),
-                     ("commit.gpgsign", "false")):
-            git(clone, "config", k, v)
-        git(clone, "symbolic-ref", "HEAD", "refs/heads/main")
-        with open(os.path.join(clone, "README.md"), "w") as f:
-            f.write("seed\n")
-        git(clone, "add", "-A")
-        git(clone, "commit", "--quiet", "-m", "seed")
-        git(clone, "push", "--quiet", "-u", "origin", "main")
-        seed = rev(clone)
-        check("fixture: a seeded clone tracking its bare origin",
-              bool(seed) and rev(clone, "@{u}") == seed, True)
-
-        r = publish(clone)
-        out = r.stdout + r.stderr
-        check("a changed public tree builds and verifies (exit 0)", r.returncode, 0)
-        if r.returncode:
-            print(out[-2000:])
-        head = rev(clone)
-        check("... the release commit is made in the clone",
-              git(clone, "rev-list", "--count", "@{u}..HEAD").stdout.strip(), "1")
-        check("... on top of the published tip", rev(clone, "HEAD~1"), seed)
-        check("... and never pushed", rev(origin, "main"), seed)
-        check("... leaving the clone clean", git(clone, "status", "--porcelain").stdout.strip(), "")
-        stamp = {}
-        pkg = os.path.join(clone, "meridiancs.v%s.skill.zip" % version)
-        if os.path.exists(pkg):
-            with zipfile.ZipFile(pkg) as z:
-                stamp = json.loads(z.read("meridiancs/VERSION.json"))
-        # Both halves: with no commit made, HEAD is still the seed and "stamp == HEAD" holds
-        # vacuously -- which is exactly the v2.24.2 stamp.
-        check("the stamp names the release commit, not the one before it",
-              (stamp.get("commit") == head, stamp.get("commit") != seed), (True, True))
-        check("... and is not marked dirty", "dirty" in stamp, False)
-        check("the next steps no longer ask the operator to commit", "git commit" in out, False)
-        check("... still hand over the push", "git push origin HEAD" in out, True)
-        check("... and target the release at the stamped commit", ("--target %s" % head) in out, True)
-
-        # An unpushed release commit is exactly the state the run above leaves behind.
-        r = publish(clone)
-        check("a rerun over an unpushed release commit is refused (exit 2)", r.returncode, 2)
-        check("... without adding a second one", rev(clone), head)
-
-        # The previous release's package now sits in the clone, ignored by .gitignore. Walking the
-        # directory counted it as a difference, so the no-op check could never fire after a release.
-        git(clone, "push", "--quiet", "origin", "main")
-        r = publish(clone)
-        check("once pushed, an unchanged public tree is a no-op",
-              (r.returncode, "byte-identical" in r.stdout), (0, True))
-        check("... that commits nothing", rev(clone), head)
-
-        # A failure after the commit has to take it back, or the next run is refused as "ahead".
-        with open(os.path.join(clone, "stale.txt"), "w") as f:
-            f.write("drift\n")
-        git(clone, "add", "-A")
-        git(clone, "commit", "--quiet", "-m", "drift")
-        git(clone, "push", "--quiet", "origin", "main")
-        drift = rev(clone)
-        r = publish(clone, "0.0.1")   # no CHANGELOG entry, so make-package.py refuses the build
-        check("a build failing after the commit exits non-zero", r.returncode != 0, True)
-        check("... and undoes its release commit", rev(clone), drift)
-        check("... leaving the sync staged for inspection",
-              "stale.txt" in git(clone, "diff", "--cached", "--name-only").stdout, True)
-    finally:
-        shutil.rmtree(tmp, onerror=force_rm)
+_FAKE_GH = """#!%s
+import json, os, shutil, sys
+store, args = os.environ["FAKE_GH_STORE"], sys.argv[1:]
+with open(os.path.join(store, "calls.jsonl"), "a") as f:
+    f.write(json.dumps(args) + "\\n")
+if args[:2] == ["release", "create"]:
+    for a in args:
+        if a.endswith((".skill.zip", ".skill.zip.sig")) and os.path.isfile(a):
+            shutil.copy(a, store)
+elif args[:2] == ["release", "download"]:
+    dest = args[args.index("--dir") + 1]
+    for n in os.listdir(store):
+        if n.startswith("meridiancs.v"):
+            shutil.copy(os.path.join(store, n), dest)
+            if os.environ.get("FAKE_GH_CORRUPT") and n.endswith(".zip"):
+                with open(os.path.join(dest, n), "ab") as f:
+                    f.write(b"x")
+"""
 
 
-def test_low_findings(m):
+def test_low_findings(m, monkeypatch, tmp_path):
     """The 2026-09-22 review's low findings L4, L5, L6 and L8 -- each asserted against the old code.
 
     L4  the browser lookup ran whatever `chrome.bat` sat in the current directory;
@@ -7692,16 +7249,14 @@ def test_low_findings(m):
         left out the two sources most able to carry someone else's text;
     L8  the digest report interpolated non-numeric API values into HTML unescaped.
     """
-    print("[42] review low findings: browser lookup, output location, api writes, digest escaping (offline)")
     root = os.path.dirname(HERE)
 
     # --- L4: only absolute PATH entries, and on Windows only .exe -------------------------------
-    tmp = tempfile.mkdtemp(prefix="l4-")
-    here, saved_path = os.getcwd(), os.environ.get("PATH", "")
-    # The assistant's own shell sets this, which suppresses the Windows cwd search and hid the bug
-    # on the machine it was found from. An ordinary shell does not, so the test must not either.
-    saved_nodef = os.environ.pop("NoDefaultCurrentDirectoryInExePath", None)
-    try:
+    tmp = tempfile.mkdtemp(prefix="l4-", dir=tmp_path)
+    with monkeypatch.context() as mp:
+        # The assistant's own shell sets this, which suppresses the Windows cwd search and hid the bug
+        # on the machine it was found from. An ordinary shell does not, so the test must not either.
+        mp.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
         exe = ".exe" if os.name == "nt" else ""
         planted, trusted = os.path.join(tmp, "work"), os.path.join(tmp, "bin")
         os.makedirs(planted); os.makedirs(trusted)
@@ -7713,9 +7268,9 @@ def test_low_findings(m):
 
         for name in ("chrome.bat", "chrome.cmd", "chrome" + exe):
             touch(os.path.join(planted, name))
-        os.chdir(planted)
+        mp.chdir(planted)
         # An empty entry is POSIX's spelling of "the current directory"; Windows searches it anyway.
-        os.environ["PATH"] = os.pathsep.join(["", ".", trusted])
+        mp.setenv("PATH", os.pathsep.join(["", ".", trusted]))
         found = m._find_browser()
         check("a browser planted in the current directory is not picked",
               found is None or (os.path.isabs(found) and os.path.dirname(found) != planted), True)
@@ -7727,12 +7282,6 @@ def test_low_findings(m):
             os.remove(os.path.join(trusted, "chrome.exe"))
             touch(os.path.join(trusted, "chrome.bat"))
             check("...but on Windows only as an .exe", m._which_trusted("chrome"), None)
-    finally:
-        os.chdir(here)
-        os.environ["PATH"] = saved_path
-        if saved_nodef is not None:
-            os.environ["NoDefaultCurrentDirectoryInExePath"] = saved_nodef
-        shutil.rmtree(tmp, ignore_errors=True)
 
     # --- L5: an output inside the skill folder is warned about ----------------------------------
     inside = os.path.join(m.INSTALL_DIR, "Weekly-Posture.pdf")
@@ -7764,25 +7313,19 @@ def test_low_findings(m):
                        ("POST", "/CMDB/v2/data/ldg"), ("POST", "CMDB/v2/data/cmd%62"),
                        ("post", "CMDB/v2/smartlabel/search")):
         check("api -X %s %s is a read" % (method, ep), m.api_write_problem(method, ep), None)
-    import contextlib, io
-    calls, real_call = [], m.call
-    m.call = lambda method, endpoint, body=None, retries=1: calls.append(method) or {}
+    calls = []
+    monkeypatch.setattr(m, "call", lambda method, endpoint, body=None, retries=1: calls.append(method) or {})
+    class A:
+        method, endpoint, body, body_file = "PUT", "CMDB/v2/connector/profile/service", None, None
+    refused = False
     try:
-        class A:
-            method, endpoint, body, body_file = "PUT", "CMDB/v2/connector/profile/service", None, None
-        refused = False
-        try:
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                m.cmd_api(A())
-        except SystemExit:
-            refused = True
-        check("cmd_api refuses the PUT before anything reaches the wire", (refused, calls), (True, []))
-        A.allow_write = True
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.cmd_api(A())
-        check("...and sends it once allowed", calls, ["PUT"])
-    finally:
-        m.call = real_call
+        m.cmd_api(A())
+    except SystemExit:
+        refused = True
+    check("cmd_api refuses the PUT before anything reaches the wire", (refused, calls), (True, []))
+    A.allow_write = True
+    m.cmd_api(A())
+    check("...and sends it once allowed", calls, ["PUT"])
     with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as f:
         skill = " ".join(f.read().split())
     untrusted = skill[skill.find("### Meridian records are untrusted input"):][:700]
@@ -7808,14 +7351,13 @@ def test_low_findings(m):
           ("A&amp;B" in html, "&amp;amp;" in html, "&amp;lt;" in html), (True, False, False))
 
 
-def test_update_redirects(m):
+def test_update_redirects(m, monkeypatch, tmp_path):
     """Review finding L2: every redirect on the self-update path is held to the https-github rule.
 
     Driven through urllib's real redirect machinery, with a fake HTTPS handler serving canned
     responses -- so what is tested is the chain _gh_get and _download_asset actually run, not a
     handler called by hand. Nothing here touches the network.
     """
-    print("[44] self-update follows redirects only to https github hosts (offline)")
     import email.message, io, urllib.request, urllib.response
 
     routes = {}
@@ -7838,67 +7380,61 @@ def test_update_redirects(m):
             return resp
 
     real_build = urllib.request.build_opener
-    urllib.request.build_opener = lambda *h: real_build(*(h + (FakeHTTPS, FakeHTTP)))
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *h: real_build(*(h + (FakeHTTPS, FakeHTTP))))
     # A regression back to plain urlopen() would use urllib's cached global opener, which the patch
     # above never reaches -- so clear it too, and a regressed fetch fails here instead of going to the
     # network. Restored in the finally.
-    saved_opener = urllib.request._opener
-    urllib.request._opener = None
-    tmp = tempfile.mkdtemp(prefix="l2-")
-    try:
-        start = "https://github.com/o/r/releases/download/v1/p.skill.zip"
-        store = "https://release-assets.githubusercontent.com/p.skill.zip"
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    tmp = tempfile.mkdtemp(prefix="l2-", dir=tmp_path)
+    start = "https://github.com/o/r/releases/download/v1/p.skill.zip"
+    store = "https://release-assets.githubusercontent.com/p.skill.zip"
 
-        def attempt(fn):
-            try:
-                return fn(), None
-            except Exception as e:  # noqa
-                return None, str(e)
+    def attempt(fn):
+        try:
+            return fn(), None
+        except Exception as e:  # noqa
+            return None, str(e)
 
-        routes.clear()
-        routes.update({start: (302, store, b""), store: (200, None, b"PKG")})
-        dest = os.path.join(tmp, "ok.zip")
-        got, err = attempt(lambda: m._download_asset(start, dest))
-        check("a redirect to a github storage host is followed", (got, err), (3, None))
+    routes.clear()
+    routes.update({start: (302, store, b""), store: (200, None, b"PKG")})
+    dest = os.path.join(tmp, "ok.zip")
+    got, err = attempt(lambda: m._download_asset(start, dest))
+    check("a redirect to a github storage host is followed", (got, err), (3, None))
 
-        dest = os.path.join(tmp, "evil.zip")
-        routes[start] = (302, "https://evil.example/p.skill.zip", b"")
-        routes["https://evil.example/p.skill.zip"] = (200, None, b"EVIL")
-        got, err = attempt(lambda: m._download_asset(start, dest))
-        check("a redirect to another host is refused", (got, "refusing a redirect" in (err or "")),
-              (None, True))
-        check("...before anything is written", os.path.exists(dest), False)
+    dest = os.path.join(tmp, "evil.zip")
+    routes[start] = (302, "https://evil.example/p.skill.zip", b"")
+    routes["https://evil.example/p.skill.zip"] = (200, None, b"EVIL")
+    got, err = attempt(lambda: m._download_asset(start, dest))
+    check("a redirect to another host is refused", (got, "refusing a redirect" in (err or "")),
+          (None, True))
+    check("...before anything is written", os.path.exists(dest), False)
 
-        routes[start] = (302, "http://release-assets.githubusercontent.com/p.skill.zip", b"")
-        got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "http.zip")))
-        check("a downgrade to plain http is refused", (got, "refusing a redirect" in (err or "")),
-              (None, True))
+    routes[start] = (302, "http://release-assets.githubusercontent.com/p.skill.zip", b"")
+    got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "http.zip")))
+    check("a downgrade to plain http is refused", (got, "refusing a redirect" in (err or "")),
+          (None, True))
 
-        # A later hop, not just the first: the check has to hold along the whole chain.
-        hop = "https://objects.githubusercontent.com/hop"
-        routes[start] = (302, hop, b"")
-        routes[hop] = (302, "https://evil.example/p.skill.zip", b"")
-        got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "hop.zip")))
-        check("...on the second hop as well as the first", got, None)
+    # A later hop, not just the first: the check has to hold along the whole chain.
+    hop = "https://objects.githubusercontent.com/hop"
+    routes[start] = (302, hop, b"")
+    routes[hop] = (302, "https://evil.example/p.skill.zip", b"")
+    got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "hop.zip")))
+    check("...on the second hop as well as the first", got, None)
 
-        chain = ["https://objects.githubusercontent.com/%d" % i for i in range(m.UPDATE_MAX_REDIRECTS + 2)]
-        routes[start] = (302, chain[0], b"")
-        for a, b in zip(chain, chain[1:]):
-            routes[a] = (302, b, b"")
-        got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "long.zip")))
-        check("a redirect chain past UPDATE_MAX_REDIRECTS is refused", (got is None, bool(err)), (True, True))
+    chain = ["https://objects.githubusercontent.com/%d" % i for i in range(m.UPDATE_MAX_REDIRECTS + 2)]
+    routes[start] = (302, chain[0], b"")
+    for a, b in zip(chain, chain[1:]):
+        routes[a] = (302, b, b"")
+    got, err = attempt(lambda: m._download_asset(start, os.path.join(tmp, "long.zip")))
+    check("a redirect chain past UPDATE_MAX_REDIRECTS is refused", (got is None, bool(err)), (True, True))
 
-        api = "https://api.github.com/repos/o/r/releases/latest"
-        routes[api] = (302, "https://evil.example/latest.json", b"")
-        routes["https://evil.example/latest.json"] = (200, None, b'{"tag_name":"v99.0.0"}')
-        got, err = attempt(lambda: m._gh_get(api))
-        check("the release lookup refuses an off-github redirect too", got, None)
-        routes[api] = (200, None, b'{"tag_name":"v1.0.0"}')
-        check("...and still reads a direct answer", attempt(lambda: m._gh_get(api))[0], b'{"tag_name":"v1.0.0"}')
-    finally:
-        urllib.request.build_opener = real_build
-        urllib.request._opener = saved_opener
-        shutil.rmtree(tmp, ignore_errors=True)
+    api = "https://api.github.com/repos/o/r/releases/latest"
+    routes[api] = (302, "https://evil.example/latest.json", b"")
+    routes["https://evil.example/latest.json"] = (200, None, b'{"tag_name":"v99.0.0"}')
+    got, err = attempt(lambda: m._gh_get(api))
+    check("the release lookup refuses an off-github redirect too", got, None)
+    routes[api] = (200, None, b'{"tag_name":"v1.0.0"}')
+    check("...and still reads a direct answer", attempt(lambda: m._gh_get(api))[0], b'{"tag_name":"v1.0.0"}')
 
 
 def test_community_files(m):
@@ -7911,7 +7447,6 @@ def test_community_files(m):
     reporting link must name the UPDATE_REPO feed: that repository is the one whose releases run on
     every install, so it is where a vulnerability report has to land.
     """
-    print("[46] community files: private security reporting, redaction warnings, dependabot stays internal")
     root = os.path.dirname(HERE)
 
     def read(rel):
@@ -7946,25 +7481,6 @@ def test_community_files(m):
           ("reapplied internally" in contrib, "not merged here" in contrib), (True, True))
     check("... and states the inbound licence", "Apache License 2.0" in contrib, True)
 
-    # Dependabot belongs to the SOURCE repo: in the derived tree its pull requests could never merge.
-    if derived_tree():
-        check("the derived tree carries no dependabot config",
-              os.path.exists(os.path.join(root, ".github", "dependabot.yml")), False)
-        return
-    dep = read(".github/dependabot.yml")
-    check("dependabot keeps the pinned actions current", dep is not None and "github-actions" in dep, True)
-    spec = importlib.util.spec_from_file_location("mk_public_cf", os.path.join(root, "scripts", "make-public.py"))
-    mp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mp)
-    keep, _subs, dropped, _missing = mp.plan(mp.tracked_files())
-    check("make-public drops dependabot.yml", ".github/dependabot.yml" in dropped, True)
-    check("... and publishes the community files",
-          sorted(f for f in ("SECURITY.md", "CONTRIBUTING.md", ".github/ISSUE_TEMPLATE/config.yml",
-                             ".github/ISSUE_TEMPLATE/bug_report.yml",
-                             ".github/ISSUE_TEMPLATE/feature_request.yml") if f in keep),
-          [".github/ISSUE_TEMPLATE/bug_report.yml", ".github/ISSUE_TEMPLATE/config.yml",
-           ".github/ISSUE_TEMPLATE/feature_request.yml", "CONTRIBUTING.md", "SECURITY.md"])
-
 
 def test_documented_commands(m):
     """Every `meridian.py <verb> ...` the docs show parses with the real parser.
@@ -7975,7 +7491,6 @@ def test_documented_commands(m):
     the text is wrong fail here (unknown flags, bad choices). "Required argument missing" does not:
     prose mentions a verb by name ("run `meridian.py report`") without meaning a whole command.
     """
-    print("[56] documented commands parse against the real CLI")
     import contextlib, glob, io, shlex
     root = os.path.dirname(HERE)
     parser = m.build_parser()
@@ -8016,67 +7531,7 @@ def test_documented_commands(m):
     check("every documented command parses (no unknown flags or bad values)", bad, [])
 
 
-def test_ci_workflow():
-    """ci.yml's two supply-chain rules hold on every step, not just the ones someone remembered.
-
-    Actions are pinned to full commit SHAs, because a tag can be re-pointed by whoever controls the
-    action's repo. And every checkout sets persist-credentials: false, because nothing in CI pushes,
-    so a token left in the runner's git config is only something for a later step to read. Both are
-    one-line omissions in a new job, and Dependabot rewrites these lines weekly.
-    """
-    print("[47] CI workflows: actions pinned to commit SHAs, checkout persists no credentials")
-    wdir = os.path.join(os.path.dirname(HERE), ".github", "workflows")
-    names = sorted(n for n in os.listdir(wdir) if n.endswith((".yml", ".yaml"))) if os.path.isdir(wdir) else []
-    if "ci.yml" not in names:
-        print("  SKIP  no .github/workflows/ci.yml in this tree")
-        return
-    # Every workflow file, not just ci.yml. The Windows leg moved to its own file to trim billed
-    # minutes, and a guard that read one file would have stopped covering the other in silence.
-    texts = {}
-    for name in names:
-        with open(os.path.join(wdir, name), encoding="utf-8") as f:
-            texts[name] = f.read()
-        lines = texts[name].splitlines()
-        uses = [(i, l.split("uses:", 1)[1].split("#", 1)[0].strip()) for i, l in enumerate(lines)
-                if l.strip().startswith(("uses:", "- uses:"))]
-        check("%s: the workflow has steps to check" % name, len(uses) > 0, True)
-        check("%s: every action is pinned to a full commit SHA" % name,
-              [u for _i, u in uses if not re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", u)], [])
-        checkouts = [i for i, u in uses if u.startswith("actions/checkout@")]
-        check("%s: ... including every checkout" % name, len(checkouts) > 0, True)
-
-        def step(i):
-            out = []
-            for l in lines[i + 1:]:
-                if l.strip().startswith("- ") or (l.strip() and len(l) - len(l.lstrip()) <= 6):
-                    break
-                out.append(l.strip())
-            return out
-        check("%s: every checkout sets persist-credentials: false" % name,
-              [i + 1 for i in checkouts if "persist-credentials: false" not in step(i)], [])
-
-        # A draft skip without `ready_for_review` leaves a PR marked ready with no run at all. Read
-        # the `types:` line itself: the word also appears in the comment that explains it.
-        if "pull_request.draft" in texts[name]:
-            types = [l for l in lines if l.strip().startswith("types:")]
-            check("%s: skips drafts, so it also runs on ready_for_review" % name,
-                  any("ready_for_review" in l.split("#", 1)[0] for l in types), True)
-
-    # The Windows leg is the only coverage of the msvcrt lock, cp1252 and the Windows self-update
-    # swap. Trimming it to code PRs is fine; losing it, or losing it on main, is not.
-    win = [n for n, t in texts.items() if "windows-latest" in t and "evals/test_connect.py" in t]
-    check("the offline suite still runs on Windows", len(win) > 0, True)
-    for n in win:
-        on = texts[n].split("\njobs:", 1)[0]
-        push = on.split("\n  push:", 1)[1] if "\n  push:" in on else ""
-        check("%s: Windows runs on every push to main" % n, "branches: [main]" in push, True)
-        check("%s: ... with no path filter on main" % n, "paths" in push, False)
-        pr = on.split("\n  pull_request:", 1)[1].split("\n  push:", 1)[0] if "\n  pull_request:" in on else ""
-        check("%s: ... and on PRs that touch the code or the suite" % n,
-              all(p in pr for p in ('"scripts/**"', '"evals/**"')), True)
-
-
-def test_hr_sources(m):
+def test_hr_sources(m, monkeypatch):
     """`hr` answers "do we have HR data?" from configured connectors and exact counts, never a sample.
 
     Three things together made the skill tell users with an HR connector enabled that they had no HR
@@ -8086,9 +7541,7 @@ def test_hr_sources(m):
     three out of the model's hands. The negative space matters most: only `none_configured` may mean
     "no HR system", and only when the profiles were actually read.
     """
-    print("[48] hr: HR systems resolved from connectors, counted exactly, never an unread 'none'")
-    real = {n: getattr(m, n) for n in ("_fetch_connector_profiles", "summarize_connectors", "call",
-                                       "load_field_map", "_refetch_field_map")}
+    real_summarize = m.summarize_connectors
     secret = "hunter2-dayforce-secret"
 
     def prof(connector, bridge, services, profile="Prod"):
@@ -8122,112 +7575,102 @@ def test_hr_sources(m):
     fields = {"Owner_Manager": "String", "Dayforce_Department_SmartLabel": "String",
               "alias_dayforce_employee_displayName": "String", "alias_okta_user_Owner_Manager": "String",
               "Message_Usage_Adapter": "String", "Workday_Status_SmartLabel": "String"}
-    m._fetch_connector_profiles, m.summarize_connectors, m.call = fake_profiles, fake_summary, fake_call
-    m.load_field_map = lambda t, allow_fetch=True: dict(fields)
-    m._refetch_field_map = lambda t: False
-    try:
-        # 1. an unreadable profile endpoint is unknown -- the one case that must never read as "none"
-        state["profiles"] = RuntimeError("HTTP 403: Forbidden")
-        r = m.hr_sources()
-        check("unreadable profiles are unknown, not none", (r["state"], r["userRecords"]), ("unknown", None))
-        check("... and the summary says unknown is not none", "not the same as none" in r["summary"], True)
+    monkeypatch.setattr(m, "_fetch_connector_profiles", fake_profiles)
+    monkeypatch.setattr(m, "summarize_connectors", fake_summary)
+    monkeypatch.setattr(m, "call", fake_call)
+    monkeypatch.setattr(m, "load_field_map", lambda t, allow_fetch=True: dict(fields))
+    monkeypatch.setattr(m, "_refetch_field_map", lambda t: False)
+    # 1. an unreadable profile endpoint is unknown -- the one case that must never read as "none"
+    state["profiles"] = RuntimeError("HTTP 403: Forbidden")
+    r = m.hr_sources()
+    check("unreadable profiles are unknown, not none", (r["state"], r["userRecords"]), ("unknown", None))
+    check("... and the summary says unknown is not none", "not the same as none" in r["summary"], True)
 
-        # 2. only an IdP configured: none, and only because the profiles WERE read
-        state["profiles"] = [prof("Okta SSO", "okta", [("okta_user", True)])]
-        r = m.hr_sources()
-        check("an IdP alone is none_configured", (r["state"], r["systems"], r["where"]),
-              ("none_configured", [], None))
-        check("... noting the IdP may still fill manager and department", "identity provider" in r["summary"], True)
-        check("... and making no count query", state["calls"], [])
+    # 2. only an IdP configured: none, and only because the profiles WERE read
+    state["profiles"] = [prof("Okta SSO", "okta", [("okta_user", True)])]
+    r = m.hr_sources()
+    check("an IdP alone is none_configured", (r["state"], r["systems"], r["where"]),
+          ("none_configured", [], None))
+    check("... noting the IdP may still fill manager and department", "identity provider" in r["summary"], True)
+    check("... and making no count query", state["calls"], [])
 
-        # 3. Dayforce: catalog bridge `ceridian`, data `dayforce_employee`, nothing delivered
-        state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)])]
-        state["counts"], state["health"] = {("dayforce_employee",): 0}, "degraded"
-        r = m.hr_sources()
-        s = r["systems"][0]
-        check("Dayforce is recognised by its bridge name", (s["system"], s["bridge"]), ("Dayforce", "ceridian"))
-        check("configured but empty is configured_no_data, never none", r["state"], "configured_no_data")
-        check("... carrying the connector's health and last run",
-              (s["health"], s["lastIngest"]["status"]), ("degraded", "Error"))
-        check("... and the exact --where for its records", r["where"], "sourcetype match List dayforce_employee")
-        check("its sourcetype is counted exactly", s["sourcetypes"],
-              [{"sourcetype": "dayforce_employee", "userRecords": 0}])
+    # 3. Dayforce: catalog bridge `ceridian`, data `dayforce_employee`, nothing delivered
+    state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)])]
+    state["counts"], state["health"] = {("dayforce_employee",): 0}, "degraded"
+    r = m.hr_sources()
+    s = r["systems"][0]
+    check("Dayforce is recognised by its bridge name", (s["system"], s["bridge"]), ("Dayforce", "ceridian"))
+    check("configured but empty is configured_no_data, never none", r["state"], "configured_no_data")
+    check("... carrying the connector's health and last run",
+          (s["health"], s["lastIngest"]["status"]), ("degraded", "Error"))
+    check("... and the exact --where for its records", r["where"], "sourcetype match List dayforce_employee")
+    check("its sourcetype is counted exactly", s["sourcetypes"],
+          [{"sourcetype": "dayforce_employee", "userRecords": 0}])
 
-        # 4. two HR systems and an IdP: a person in both HR systems is ONE record
-        state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)]),
-                             prof("BambooHR", "bamboohr", [("bamboohr_employee", True), ("bamboohr_extra", False)]),
-                             prof("Okta SSO", "okta", [("okta_user", True)])]
-        state["counts"] = {("dayforce_employee",): 700, ("bamboohr_employee",): 400,
-                           ("bamboohr_employee", "dayforce_employee"): 900}
-        state["health"], state["calls"] = "ok", []
-        r = m.hr_sources()
-        check("data from either system is has_data", r["state"], "has_data")
-        check("the total is the de-duplicated OR count, not 700 + 400", r["userRecords"], 900)
-        check("... and the summary states that total", "900 user records" in r["summary"], True)
-        check("the IdP is not counted as an HR system", sorted(x["system"] for x in r["systems"]),
-              ["BambooHR", "Dayforce"])
-        check("a disabled service is reported but never counted",
-              ([x["servicesDisabled"] for x in r["systems"] if x["system"] == "BambooHR"],
-               any("bamboohr_extra" in c for c in state["calls"])), ([1], False))
-        check("the --where covers every HR sourcetype", r["where"],
-              "sourcetype in List dayforce_employee,bamboohr_employee")
-        check("HR fields: the source's alias copies and HR-named SmartLabels, nothing else", r["hrFields"],
-              ["Dayforce_Department_SmartLabel", "Workday_Status_SmartLabel",
-               "alias_dayforce_employee_displayName"])
-        check("no credential value reaches the output", secret in json.dumps(r), False)
-        check("the profiles hr read are handed to the connector summary, not fetched twice",
-              state.get("summaryProfiles"), (state["profiles"], {secret}))
+    # 4. two HR systems and an IdP: a person in both HR systems is ONE record
+    state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)]),
+                         prof("BambooHR", "bamboohr", [("bamboohr_employee", True), ("bamboohr_extra", False)]),
+                         prof("Okta SSO", "okta", [("okta_user", True)])]
+    state["counts"] = {("dayforce_employee",): 700, ("bamboohr_employee",): 400,
+                       ("bamboohr_employee", "dayforce_employee"): 900}
+    state["health"], state["calls"] = "ok", []
+    r = m.hr_sources()
+    check("data from either system is has_data", r["state"], "has_data")
+    check("the total is the de-duplicated OR count, not 700 + 400", r["userRecords"], 900)
+    check("... and the summary states that total", "900 user records" in r["summary"], True)
+    check("the IdP is not counted as an HR system", sorted(x["system"] for x in r["systems"]),
+          ["BambooHR", "Dayforce"])
+    check("a disabled service is reported but never counted",
+          ([x["servicesDisabled"] for x in r["systems"] if x["system"] == "BambooHR"],
+           any("bamboohr_extra" in c for c in state["calls"])), ([1], False))
+    check("the --where covers every HR sourcetype", r["where"],
+          "sourcetype in List dayforce_employee,bamboohr_employee")
+    check("HR fields: the source's alias copies and HR-named SmartLabels, nothing else", r["hrFields"],
+          ["Dayforce_Department_SmartLabel", "Workday_Status_SmartLabel",
+           "alias_dayforce_employee_displayName"])
+    check("no credential value reaches the output", secret in json.dumps(r), False)
+    check("the profiles hr read are handed to the connector summary, not fetched twice",
+          state.get("summaryProfiles"), (state["profiles"], {secret}))
 
-        # ...and summarize_connectors, given them, really doesn't read the profile endpoint.
-        reads = []
-        runs_empty = lambda: ({}, [], [], False)          # noqa: E731
-        m._fetch_connector_profiles = lambda: reads.append(1) or ([], set())
-        real_runs, m._fetch_connector_runs = m._fetch_connector_runs, runs_empty
-        prior_nc, os.environ["MERIDIAN_NO_CACHE"] = os.environ.get("MERIDIAN_NO_CACHE"), "1"
-        try:
-            got = real["summarize_connectors"](brief=False, refresh=True,
-                                               fetched_profiles=([], {secret}))
-            check("... summarize_connectors uses the given profiles and makes no profile read",
-                  (reads, got["fetched"].get("profiles")), ([], "ok"))
-            real["summarize_connectors"](brief=False, refresh=True)
-            check("... and without them still reads the endpoint itself", reads, [1])
-        finally:
-            m._fetch_connector_runs = real_runs
-            m._fetch_connector_profiles = fake_profiles
-            if prior_nc is None:
-                os.environ.pop("MERIDIAN_NO_CACHE", None)
-            else:
-                os.environ["MERIDIAN_NO_CACHE"] = prior_nc
-        state["health"] = "failing"
-        r = m.hr_sources()
-        check("data from a failing connector is flagged as possibly stale", "may be stale" in r["summary"], True)
+    # ...and summarize_connectors, given them, really doesn't read the profile endpoint.
+    reads = []
+    runs_empty = lambda: ({}, [], [], False)          # noqa: E731
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "_fetch_connector_profiles", lambda: reads.append(1) or ([], set()))
+        mp.setattr(m, "_fetch_connector_runs", runs_empty)
+        mp.setenv("MERIDIAN_NO_CACHE", "1")
+        got = real_summarize(brief=False, refresh=True, fetched_profiles=([], {secret}))
+        check("... summarize_connectors uses the given profiles and makes no profile read",
+              (reads, got["fetched"].get("profiles")), ([], "ok"))
+        real_summarize(brief=False, refresh=True)
+        check("... and without them still reads the endpoint itself", reads, [1])
+    state["health"] = "failing"
+    r = m.hr_sources()
+    check("data from a failing connector is flagged as possibly stale", "may be stale" in r["summary"], True)
 
-        # 5. a failed count with nothing positive is unknown, never a zero
-        state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)])]
-        state["counts"] = {("dayforce_employee",): RuntimeError("HTTP 500: boom")}
-        r = m.hr_sources()
-        check("a failed count is unknown, not configured_no_data", (r["state"], r["userRecords"]), ("unknown", None))
-        check("... keeping the error on the row", "HTTP 500" in r["systems"][0]["sourcetypes"][0]["error"], True)
+    # 5. a failed count with nothing positive is unknown, never a zero
+    state["profiles"] = [prof("Dayforce", "ceridian", [("dayforce_employee", True)])]
+    state["counts"] = {("dayforce_employee",): RuntimeError("HTTP 500: boom")}
+    r = m.hr_sources()
+    check("a failed count is unknown, not configured_no_data", (r["state"], r["userRecords"]), ("unknown", None))
+    check("... keeping the error on the row", "HTTP 500" in r["systems"][0]["sourcetypes"][0]["error"], True)
 
-        # 6. configured with every service switched off
-        state["profiles"] = [prof("Workday", "workday", [("workday_worker", False)])]
-        state["counts"], state["calls"] = {}, []
-        r = m.hr_sources()
-        check("every service off is configured_disabled, with no count query",
-              (r["state"], state["calls"]), ("configured_disabled", []))
+    # 6. configured with every service switched off
+    state["profiles"] = [prof("Workday", "workday", [("workday_worker", False)])]
+    state["counts"], state["calls"] = {}, []
+    r = m.hr_sources()
+    check("every service off is configured_disabled, with no count query",
+          (r["state"], state["calls"]), ("configured_disabled", []))
 
-        # 7. a recognised product under a bridge name the list has not seen yet
-        state["profiles"] = [prof("UKG", "ukg_ready_v2", [("ukg_employee", True)])]
-        state["counts"] = {("ukg_employee",): 3}
-        r = m.hr_sources()
-        check("recognised by display name when the bridge is new",
-              (r["state"], r["systems"][0]["system"]), ("has_data", "UKG"))
-    finally:
-        for n, v in real.items():
-            setattr(m, n, v)
+    # 7. a recognised product under a bridge name the list has not seen yet
+    state["profiles"] = [prof("UKG", "ukg_ready_v2", [("ukg_employee", True)])]
+    state["counts"] = {("ukg_employee",): 3}
+    r = m.hr_sources()
+    check("recognised by display name when the bridge is new",
+          (r["state"], r["systems"][0]["system"]), ("has_data", "UKG"))
 
 
-def test_field_cache_refetch(m):
+def test_field_cache_refetch(m, monkeypatch, tmp_path):
     """A cached field map that misses a name re-reads the metadata once before calling it missing.
 
     The disk cache never expired, so a field that appeared after it was written was refused as
@@ -8237,11 +7680,10 @@ def test_field_cache_refetch(m):
     real, the missing two the HR source's. Bounded to one metadata call per table per process, so a
     run of typos costs one call, not one each.
     """
-    print("[49] field cache: a miss re-fetches once, so a newly added field is not 'doesn't exist'")
-    import tempfile
-    real = {n: getattr(m, n) for n in ("CFG_DIR", "call", "load_config", "drop_labels_cache", "drop_rescache")}
-    saved_map, saved_live, saved_disk = dict(m._FIELD_MAP), set(m._FIELD_MAP_LIVE), set(m._FIELD_MAP_DISK)
-    tmp = tempfile.mkdtemp(prefix="fieldcache-")
+    monkeypatch.setattr(m, "_FIELD_MAP", dict(m._FIELD_MAP))
+    monkeypatch.setattr(m, "_FIELD_MAP_LIVE", set(m._FIELD_MAP_LIVE))
+    monkeypatch.setattr(m, "_FIELD_MAP_DISK", set(m._FIELD_MAP_DISK))
+    tmp = str(tmp_path)
     calls, dropped = [], []
     api = {"user": [{"fieldName": "Owner_Manager", "dataType": "String"},
                     {"fieldName": "alias_dayforce_employee_displayName", "dataType": "String"}]}
@@ -8252,10 +7694,11 @@ def test_field_cache_refetch(m):
             raise RuntimeError("HTTP 403: Forbidden")
         return {"metadata": api["user"]}
 
-    m.CFG_DIR, m.call = tmp, fake_call
-    m.load_config = lambda: ("s.example", "tok", None)
-    m.drop_labels_cache = lambda: dropped.append("labels") or True
-    m.drop_rescache = lambda: dropped.append("rescache") or True
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "call", fake_call)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "drop_labels_cache", lambda: dropped.append("labels") or True)
+    monkeypatch.setattr(m, "drop_rescache", lambda: dropped.append("rescache") or True)
     cached = [{"fieldName": "Owner_Manager", "dataType": "String"}]
 
     def reset():
@@ -8266,65 +7709,55 @@ def test_field_cache_refetch(m):
         with open(m._fields_path(), "w", encoding="utf-8") as f:
             json.dump({"fqdn": "s.example", "user": cached}, f)
 
-    try:
-        # the cache predates the HR connector: it knows Owner_Manager only
-        reset()
-        check("a field added after the cache was written is accepted",
-              m.field_problem("user", "alias_dayforce_employee_displayName"), None)
-        check("... at the cost of one metadata call", calls, ["/CMDB/v2/data/metadata/user"])
-        check("... dropping the caches derived from metadata", sorted(dropped), ["labels", "rescache"])
-        with open(m._fields_path(), encoding="utf-8") as f:
-            check("... and the disk cache now holds it",
-                  "alias_dayforce_employee_displayName" in {x["fieldName"] for x in json.load(f)["user"]}, True)
+    # the cache predates the HR connector: it knows Owner_Manager only
+    reset()
+    check("a field added after the cache was written is accepted",
+          m.field_problem("user", "alias_dayforce_employee_displayName"), None)
+    check("... at the cost of one metadata call", calls, ["/CMDB/v2/data/metadata/user"])
+    check("... dropping the caches derived from metadata", sorted(dropped), ["labels", "rescache"])
+    with open(m._fields_path(), encoding="utf-8") as f:
+        check("... and the disk cache now holds it",
+              "alias_dayforce_employee_displayName" in {x["fieldName"] for x in json.load(f)["user"]}, True)
 
-        # a typo: still refused, after exactly one refetch however many typos follow
-        reset()
-        api["user"] = list(cached)
-        p1, p2 = m.field_problem("user", "Owner_Mnager"), m.field_problem("user", "Owner_Mangr")
-        check("a real typo is still refused, with the suggestion",
-              (p1 is not None and "Owner_Manager" in p1, p2 is not None), (True, True))
-        check("... after one refetch, not one per query", len(calls), 1)
-        check("... and an unchanged field set drops no cache", dropped, [])
+    # a typo: still refused, after exactly one refetch however many typos follow
+    reset()
+    api["user"] = list(cached)
+    p1, p2 = m.field_problem("user", "Owner_Mnager"), m.field_problem("user", "Owner_Mangr")
+    check("a real typo is still refused, with the suggestion",
+          (p1 is not None and "Owner_Manager" in p1, p2 is not None), (True, True))
+    check("... after one refetch, not one per query", len(calls), 1)
+    check("... and an unchanged field set drops no cache", dropped, [])
 
-        # metadata unreachable on refetch: the cached answer stands, and it is not retried per query
-        reset()
-        api["fail"] = True
-        p1, p2 = m.field_problem("user", "Owner_Mnager"), m.field_problem("user", "Nope")
-        check("an unreachable refetch still refuses from the cache", (p1 is not None, p2 is not None), (True, True))
-        check("... trying the endpoint once", len(calls), 1)
-        api.pop("fail")
+    # metadata unreachable on refetch: the cached answer stands, and it is not retried per query
+    reset()
+    api["fail"] = True
+    p1, p2 = m.field_problem("user", "Owner_Mnager"), m.field_problem("user", "Nope")
+    check("an unreachable refetch still refuses from the cache", (p1 is not None, p2 is not None), (True, True))
+    check("... trying the endpoint once", len(calls), 1)
+    api.pop("fail")
 
-        # a field the cache already has costs nothing
-        reset()
-        check("a known field makes no call", (m.field_problem("user", "Owner_Manager"), calls), (None, []))
+    # a field the cache already has costs nothing
+    reset()
+    check("a known field makes no call", (m.field_problem("user", "Owner_Manager"), calls), (None, []))
 
-        # a cold start with no disk cache fetches exactly once, even when a name then misses
-        reset()
-        os.remove(m._fields_path())
-        m.field_problem("user", "Not_There")
-        check("a cold start fetches once, not a second time for the miss", len(calls), 1)
+    # a cold start with no disk cache fetches exactly once, even when a name then misses
+    reset()
+    os.remove(m._fields_path())
+    m.field_problem("user", "Not_There")
+    check("a cold start fetches once, not a second time for the miss", len(calls), 1)
 
-        # a map placed in the memo (not read from disk) is never refetched: this is what keeps the
-        # offline suite offline, since other tests inject a map and then probe a misspelt field
-        reset()
-        m._FIELD_MAP["user"] = {"Owner_Manager": "String"}
-        m.call = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network reached from a memo map"))
-        check("an injected map is judged as given, with no call",
-              "Did you mean" in (m.field_problem("user", "Owner_Mnager") or ""), True)
-        m.call = fake_call
-    finally:
-        for n, v in real.items():
-            setattr(m, n, v)
-        m._FIELD_MAP.clear()
-        m._FIELD_MAP.update(saved_map)
-        m._FIELD_MAP_LIVE.clear()
-        m._FIELD_MAP_LIVE.update(saved_live)
-        m._FIELD_MAP_DISK.clear()
-        m._FIELD_MAP_DISK.update(saved_disk)
-        shutil.rmtree(tmp, ignore_errors=True)
+    # a map placed in the memo (not read from disk) is never refetched: this is what keeps the
+    # offline suite offline, since other tests inject a map and then probe a misspelt field
+    reset()
+    m._FIELD_MAP["user"] = {"Owner_Manager": "String"}
+    monkeypatch.setattr(m, "call",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("network reached from a memo map")))
+    check("an injected map is judged as given, with no call",
+          "Did you mean" in (m.field_problem("user", "Owner_Mnager") or ""), True)
+    monkeypatch.setattr(m, "call", fake_call)
 
 
-def test_selfupdate_followups(m):
+def test_selfupdate_followups(m, monkeypatch, tmp_path):
     """Two defects found verifying v2.26.0 end to end, both on the self-update path.
 
     1. A cached check reported ANOTHER install's commit and folder. The cache is one file per user,
@@ -8335,14 +7768,14 @@ def test_selfupdate_followups(m):
        a 260 limit. Now staging is shallower, and a path that cannot fit is refused before a byte is
        extracted, with a reason that says what to do.
     """
-    print("[45] selfupdate: the cache never speaks for another install; deep paths refused up front (offline)")
 
     def fake(version):
         def _f(repo):
             return {"version": version, "tag": "v" + version,
                     "assetName": "meridiancs.v%s.skill.zip" % version,
                     "assetUrl": "https://github.com/o/r/releases/download/v%s/x.skill.zip" % version,
-                    "assetSize": 1234}
+                    "assetSize": 1234,
+                    "sigUrl": "https://github.com/o/r/releases/download/v%s/x.skill.zip.sig" % version}
         return _f
 
     def stamp(install, commit):
@@ -8353,184 +7786,69 @@ def test_selfupdate_followups(m):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(rec, f)
 
-    saved = {n: getattr(m, n, None) for n in ("latest_release", "_download_asset", "_long_paths_enabled")}
-    os.environ["MERIDIAN_UPDATE_REPO"] = "jwood25/meridiancs-public"
+    monkeypatch.setenv("MERIDIAN_UPDATE_REPO", "jwood25/meridiancs-public")
+    # --- 1. two installs of one version share the cache, never each other's identity ----------
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    a = _su_install(os.path.join(tmp, "a"), "2.26.0")
+    b = _su_install(os.path.join(tmp, "b"), "2.26.0")
+    stamp(a, "aaaa1111")
+    stamp(b, "bbbb2222")
+    monkeypatch.setattr(m, "latest_release", fake("2.26.0"), raising=False)
+    _su_env(monkeypatch, m, a, tmp)
+    first = m.check_update(force=True)
+    _su_env(monkeypatch, m, b, tmp)
+    monkeypatch.setattr(m, "latest_release",
+                        lambda repo: (_ for _ in ()).throw(AssertionError("cache should answer")), raising=False)
+    second = m.check_update()
+    check("the first install checks over the network", (first.get("checkedVia"), first.get("installedCommit")),
+          ("network", "aaaa1111"))
+    check("a second install of the same version is answered from the shared cache",
+          second.get("checkedVia"), "cache")
+    check("...but reports its OWN commit", second.get("installedCommit"), "bbbb2222")
+    check("...and its own folder", second.get("installDir"), os.path.realpath(b))
+    check("...while the feed facts still come from the cache",
+          (second.get("state"), second.get("latestVersion")), ("current", "2.26.0"))
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- 2. a deep install is refused before extraction, a normal one still updates -----------
+    font = {"meridiancs/assets/fonts/SpaceGrotesk-Bold.ttf": "x"}
+    monkeypatch.setattr(m, "_long_paths_enabled",
+                        lambda: False, raising=False)  # the Windows default, forced on every platform
+
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    # Deep enough that STAGED paths pass 259 chars while every INSTALLED path still fits, which
+    # is exactly the v2.26.0 case: the install works, only its update cannot.
+    target = 259 - len("/assets/fonts/SpaceGrotesk-Bold.ttf") - 4
+    root = os.path.join(tmp, "d")
+    while len(os.path.join(root, "skills", "meridiancs")) < target - 12:
+        root = os.path.join(root, "deepfolder")
+    install = _su_install(root, "2.25.0")
+    installed = len(os.path.join(os.path.realpath(install), "assets", "fonts", "SpaceGrotesk-Bold.ttf"))
+    staged = installed + len(m.UPDATE_STAGING_PREFIX) + 8 + len("/unpacked/")
+    check("fixture: the installed path fits and the staged one does not",
+          (installed <= m.WINDOWS_MAX_PATH, staged > m.WINDOWS_MAX_PATH), (True, True))
+    pkg = _su_package(tmp, "2.26.0", extra=font)
+    monkeypatch.setattr(m, "latest_release", fake("2.26.0"), raising=False)
+    monkeypatch.setattr(m, "_download_asset", _su_fetch(pkg), raising=False)
+    _su_env(monkeypatch, m, install, tmp)
+    err = ""
     try:
-        # --- 1. two installs of one version share the cache, never each other's identity ----------
-        tmp = tempfile.mkdtemp()
-        a = _su_install(os.path.join(tmp, "a"), "2.26.0")
-        b = _su_install(os.path.join(tmp, "b"), "2.26.0")
-        stamp(a, "aaaa1111")
-        stamp(b, "bbbb2222")
-        m.latest_release = fake("2.26.0")
-        env = _SUEnv(m, a, tmp)
-        try:
-            first = m.check_update(force=True)
-        finally:
-            env.restore()
-        env = _SUEnv(m, b, tmp)             # same tmp -> the same CFG_DIR and .updatecheck
-        try:
-            m.latest_release = lambda repo: (_ for _ in ()).throw(AssertionError("cache should answer"))
-            second = m.check_update()
-        finally:
-            env.restore()
-        check("the first install checks over the network", (first.get("checkedVia"), first.get("installedCommit")),
-              ("network", "aaaa1111"))
-        check("a second install of the same version is answered from the shared cache",
-              second.get("checkedVia"), "cache")
-        check("...but reports its OWN commit", second.get("installedCommit"), "bbbb2222")
-        check("...and its own folder", second.get("installDir"), os.path.realpath(b))
-        check("...while the feed facts still come from the cache",
-              (second.get("state"), second.get("latestVersion")), ("current", "2.26.0"))
-        shutil.rmtree(tmp, ignore_errors=True)
+        m.apply_update(m.check_update(force=True))
+    except Exception as e:  # noqa
+        err = str(e)
+    check("an update whose staged paths cannot fit is refused", "too deep" in err, True)
+    check("...saying how long the path is and what to do",
+          ("characters" in err, "LongPathsEnabled" in err), (True, True))
+    with open(os.path.join(install, "VERSION.json"), encoding="utf-8") as f:
+        check("...leaving the install untouched", json.load(f)["version"], "2.25.0")
+    check("...and nothing staged beside it",
+          [d for d in os.listdir(os.path.dirname(install)) if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
 
-        # --- 2. a deep install is refused before extraction, a normal one still updates -----------
-        font = {"meridiancs/assets/fonts/SpaceGrotesk-Bold.ttf": "x"}
-        m._long_paths_enabled = lambda: False       # the Windows default, forced on every platform
-
-        tmp = tempfile.mkdtemp()
-        # Deep enough that STAGED paths pass 259 chars while every INSTALLED path still fits, which
-        # is exactly the v2.26.0 case: the install works, only its update cannot.
-        target = 259 - len("/assets/fonts/SpaceGrotesk-Bold.ttf") - 4
-        root = os.path.join(tmp, "d")
-        while len(os.path.join(root, "skills", "meridiancs")) < target - 12:
-            root = os.path.join(root, "deepfolder")
-        install = _su_install(root, "2.25.0")
-        installed = len(os.path.join(os.path.realpath(install), "assets", "fonts", "SpaceGrotesk-Bold.ttf"))
-        staged = installed + len(m.UPDATE_STAGING_PREFIX) + 8 + len("/unpacked/")
-        check("fixture: the installed path fits and the staged one does not",
-              (installed <= m.WINDOWS_MAX_PATH, staged > m.WINDOWS_MAX_PATH), (True, True))
-        pkg = _su_package(tmp, "2.26.0", extra=font)
-        m.latest_release = fake("2.26.0")
-        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
-        env = _SUEnv(m, install, tmp)
-        try:
-            err = ""
-            try:
-                m.apply_update(m.check_update(force=True))
-            except Exception as e:  # noqa
-                err = str(e)
-            check("an update whose staged paths cannot fit is refused", "too deep" in err, True)
-            check("...saying how long the path is and what to do",
-                  ("characters" in err, "LongPathsEnabled" in err), (True, True))
-            with open(os.path.join(install, "VERSION.json"), encoding="utf-8") as f:
-                check("...leaving the install untouched", json.load(f)["version"], "2.25.0")
-            check("...and nothing staged beside it",
-                  [d for d in os.listdir(os.path.dirname(install)) if d.startswith(m.UPDATE_STAGING_PREFIX)], [])
-        finally:
-            env.restore()
-            shutil.rmtree(tmp, ignore_errors=True)
-
-        tmp = tempfile.mkdtemp()
-        install = _su_install(tmp, "2.25.0")
-        pkg = _su_package(tmp, "2.26.0", extra=font)
-        m._download_asset = lambda url, dest: (shutil.copyfile(pkg, dest), os.path.getsize(dest))[1]
-        env = _SUEnv(m, install, tmp)
-        try:
-            res = m.apply_update(m.check_update(force=True))
-            check("a normal-depth install still updates with the check in force",
-                  (res.get("applied"), res.get("toVersion")), (True, "2.26.0"))
-        finally:
-            env.restore()
-            shutil.rmtree(tmp, ignore_errors=True)
-    finally:
-        for n, v in saved.items():
-            if v is None:
-                if hasattr(m, n):
-                    delattr(m, n)
-            else:
-                setattr(m, n, v)
-        os.environ.pop("MERIDIAN_UPDATE_REPO", None)
-
-
-def main():
-    live = "--live" in sys.argv
-    print("Meridian connect preflight — smoke tests\n" + "-" * 42)
-    # The aggregate cache short-circuits BEFORE call() is reached, so on a machine with a real cache
-    # file a fixture-driven test was served the operator's live stack instead of its fixture -- the
-    # suite silently stopped being deterministic. Off for the whole run; the cache's own tests turn it
-    # back on around a temp CFG_DIR, which is the only place cached reads are exercised.
-    os.environ["MERIDIAN_NO_CACHE"] = "1"
-    m = load_meridian()
-    test_classify(m)
-    test_lazy_imports()
-    test_not_configured()
-    test_connector_rollup(m)
-    test_connector_warning_messages(m)
-    test_connector_brief_shape(m)
-    test_preflight_coverage(m)
-    test_result_cache(m)
-    test_connector_runs_pagination(m)
-    test_api_guard(m)
-    test_insights(m)
-    test_profile_shape(m)
-    test_compare(m)
-    test_tls_posture(m)
-    test_summary_completeness(m)
-    test_summary_without_field(m)
-    test_transport(m)
-    test_pace(m)
-    test_check_classification(m)
-    test_field_metadata(m)
-    test_top_ladder(m)
-    test_stacks_registry(m)
-    test_clause_parsing(m)
-    test_smartlabels(m)
-    test_csv_export(m)
-    test_list(m)
-    test_digest(m)
-    test_report_cleanup(m)
-    test_multi_profile_report(m)
-    test_snapshots(m)
-    test_coverage_identity(m)
-    test_trend(m)
-    test_trend_report(m)
-    test_metrics(m)
-    test_entities(m)
-    test_vuln_detail(m)
-    test_linked_assets_cap(m)
-    test_skill_frontmatter()
-    test_alert_routing()
-    test_skill_rule_survival()
-    test_launch_greeting()
-    test_doc_output_guard()
-    test_retention(m)
-    test_alerts(m)
-    test_alerts_notify(m)
-    test_selfupdate(m)
-    test_selfupdate_held_dir(m)
-    test_whats_new(m)
-    test_package_stamp()
-    test_publish_public()
-    test_low_findings(m)
-    test_update_redirects(m)
-    test_selfupdate_followups(m)
-    test_community_files(m)
-    test_ci_workflow()
-    test_documented_commands(m)
-    test_hr_routing()
-    test_hr_sources(m)
-    test_field_cache_refetch(m)
-    test_licensing()
-    test_brand_fallback(m)
-    test_public_variants()
-    test_trademark_notice()
-    test_dangling_links()
-    test_security_hardening(m)
-    test_data_currency(m)
-    test_historical_labels(m)
-    test_currency_routing(m)
-    if live:
-        test_live()
-        test_live_connectors()
-        test_live_entities(m)
-        test_live_currency(m)
-    else:
-        print("[21] live connect: SKIPPED (pass --live to run against your stack)")
-    print("-" * 42)
-    print("%d passed, %d failed" % (_passed, _failed))
-    sys.exit(1 if _failed else 0)
-
-
-if __name__ == "__main__":
-    main()
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    install = _su_install(tmp, "2.25.0")
+    pkg = _su_package(tmp, "2.26.0", extra=font)
+    monkeypatch.setattr(m, "_download_asset", _su_fetch(pkg), raising=False)
+    _su_env(monkeypatch, m, install, tmp)
+    res = m.apply_update(m.check_update(force=True))
+    check("a normal-depth install still updates with the check in force",
+          (res.get("applied"), res.get("toVersion")), (True, "2.26.0"))

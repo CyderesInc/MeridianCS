@@ -66,7 +66,7 @@ not from `git ls-files`), and `selfupdate` compares it against the latest public
 |---|---|
 | `current` | Installed version matches the latest release |
 | `outdated` | A newer release exists; `assetUrl` says what would be installed |
-| `unknown` | **The check failed** — unreachable, proxied, or rate-limited. Never conflate with `current` |
+| `unknown` | **The check failed** — unreachable, proxied, rate-limited, or the release is unsigned. Never conflate with `current` |
 | `disabled` | No update repo compiled in, or the user opted out |
 | `dev` | A working tree or unstamped copy; `reasons` lists why it will never be overwritten |
 | `ahead` | This build is newer than the release, so it is left alone (never a downgrade) |
@@ -95,6 +95,18 @@ Things not to change without reading why:
   `insecure_tls` opt-out explicitly does **not** apply: a self-signed appliance certificate is a
   reason to skip verification for that stack's API, not a licence to fetch executable code over an
   unverified connection.
+- **A release installs only with a valid signature by a shipped key, checked before the zip is
+  read** (since v2.28.0). Each release carries `<package>.sig`, an OpenSSH SSHSIG signature
+  (namespace `meridiancs-release`) that must verify under `RELEASE_SIGNING_KEYS`. The zip parser,
+  the extraction and the smoke test, which *runs* the new code, only ever see a signed package.
+  - **An install trusts the key list it already has**, so changing it strands every install unless
+    that release is signed by a key they know. The suite pins the key's fingerprint.
+  - **No env var or config key adds a trusted key**, for the same reason there's no "update from
+    this URL" variable.
+  - **A release with no `.sig` reads as `unknown`, not `outdated`**, or every session would
+    download it and fail.
+  - **The verifier is hand-written Ed25519** because installs are stdlib-only. It is tested against
+    RFC 8032's vectors, a reference implementation (`cryptography`), and real `ssh-keygen` output.
 - **The package is validated before a byte is extracted** — every member inside `meridiancs/`, no
   `..` or drive-qualified path (separators normalised *first*, or a backslash member walks straight
   past a forward-slash check on Windows), member-count and unpacked-size caps, the three required
@@ -388,42 +400,31 @@ These are release/packaging scripts, not something a user's question ever routes
 because this file's audience ("editing a helper") is already the audience for these, not the ordinary
 verb-flag lookups `scripts.md` serves.
 
-- `scripts/make-impact.py` — regenerates `Cyderes-Meridian-Skill-Enhancements.pdf`, the branded
+- `scripts/tools/make-impact.py` — regenerates `Cyderes-Meridian-Skill-Enhancements.pdf`, the branded
   change/impact summary (what shipped and why it matters commercially). Refresh it when a batch of
   work lands. Its figures are **measured, not estimated** — re-measure before changing any of them.
   Stakeholder-facing, so the same no-customer-data rule applies.
-- `scripts/make-guide.py` — regenerates the distributed
+- `scripts/tools/make-guide.py` — regenerates the distributed
   `Cyderes-Meridian-Skill-Guide.pdf`: a branded overview plus the 7-step install walkthrough handed
-  to new users. Run `python scripts/make-guide.py` after changing the install flow or the skill's
+  to new users. Run `python scripts/tools/make-guide.py` after changing the install flow or the skill's
   capabilities, and commit the resulting PDF. It reuses the same brand helpers and headless-Chrome
   print path as `report`, so it needs a Chromium browser. **Keep it free of customer data** — it
   ships in the repo, so use the `<person>` placeholder rather than a real name from any stack
   (`*.pdf` is gitignored precisely because report PDFs are not safe to commit; this one file is
   carved out by name).
-- `scripts/make-brief.py` — regenerates `Cyderes-MeridianCS-Brief.pdf`, the **customer- and
+- `scripts/tools/make-brief.py` — regenerates `Cyderes-MeridianCS-Brief.pdf`, the **customer- and
   executive-facing** brief: what the skill does, the business value per seat, and what asking it
   actually looks like. Regenerate whenever a customer-visible capability lands. It ships in the
   package and goes outside Cyderes, so its sample prompts use the `<person>` placeholder and its
   claims stay the measured ones from the impact doc — the hand-made original had no generator, which
   is how it fell behind the skill it describes.
-- **All three doc generators take an optional output path, and it must end in `.pdf`.** They
-  overwrite the target without asking -- headless Chrome's `--print-to-pdf` clobbers whatever is
-  there and still exits 0 -- so `make-brief.py SKILL.md` used to replace SKILL.md with a 134KB PDF,
-  silently. `docout.resolve_out` now refuses a non-`.pdf` target, a directory, and a missing parent
-  directory, exiting 2 with a specific message. Overwriting an existing `.pdf` is still allowed:
-  that is the regenerate case. Snyk reports this argument as Path Traversal (18 LOW findings) -- it
-  is not; the operator names their own output file. The overwrite was the real bug.
-- `scripts/make-package.py` — rebuilds `meridiancs.v<X.Y.Z>.skill.zip`, the distributable package.
-  `--version` is required (nothing in the tree stores one, and the zip is built before the release tag
-  exists, so `git describe` would name the *previous* release); it self-derives only from a tag on a
-  clean HEAD. The output name must end `.skill.zip` or the script exits, since `.gitignore` matches that
-  pattern and a package outside it becomes committable. **Rerun it
-  after any change to the skill's behaviour** and re-upload wherever the zip is published; it is
-  gitignored (a build artifact, not source), so nothing in the repo reminds you it went stale — which
-  is exactly how it once shipped two PRs behind. Contents come from `git ls-files` plus exactly one synthesized member, `VERSION.json` (see
-  Self-update above -- it is what lets an install know whether it is stale), so an untracked file
-  can't be packaged by accident and generated report PDFs (untracked by policy)
-  can't ride along in a file handed to someone else. `EXCLUDE`/`EXCLUDE_DIRS` drop the files that
-  maintain the skill rather than run it (`CLAUDE.md`, `evals/`, the three generators). Refuses a
-  dirty tree unless given `--allow-dirty`, and writes fixed member order plus fixed timestamps so an
-  unchanged tree rebuilds byte-identically.
+- **The three doc generators take no arguments; each rewrites its one committed PDF.** An output
+  argument once let `make-brief.py SKILL.md` replace SKILL.md with a PDF.
+- `scripts/tools/make-package.py` — builds `meridiancs.v<X.Y.Z>.skill.zip` (`--version`), or a
+  non-release `meridiancs.<label>.skill.zip` (`--label`) stamped `version: null`, which an install
+  refuses to self-update from. The name is always derived, so it always matches `.gitignore`'s
+  `*.skill.zip`. Contents come from `git ls-files` plus exactly one synthesized member,
+  `VERSION.json` (see Self-update above -- it is what lets an install know whether it is stale), so
+  an untracked file can't be packaged by accident and generated report PDFs (untracked by policy)
+  can't ride along. `EXCLUDE`/`EXCLUDE_DIRS` drop the files that maintain the skill rather than run
+  it. Fixed member order and timestamps make an unchanged tree rebuild byte-identically.

@@ -42,5 +42,5 @@ to the licensed **PX Grotesk** family for teams without a PX Grotesk license. PX
 proprietary, is not bundled, and is only named as a CSS fallback.
 
 The fonts are OFL and freely redistributable. **Cyderes brand assets are not** — see the trademark
-section of the top-level [NOTICE](../../NOTICE), and `scripts/make-public.py` for how they are
+section of the top-level [NOTICE](../../NOTICE), and `scripts/tools/make-public.py` for how they are
 excluded from public distributions.

@@ -3,6 +3,18 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.28.1 - 2026-09-30
+
+- **No changes to the skill.** This release is how 2.28.0's signed updates reach installs that
+  update on their own.
+
+## 2.28.0
+
+- **Updates are now signed, and the skill checks the signature before installing one.** A release
+  not signed by a trusted Cyderes key is refused before any of it is opened or run. Check one
+  yourself with `ssh-keygen -Y verify`.
+- Nothing changes in how updates reach you: they still install on their own, once a session.
+
 ## 2.27.4 - 2026-09-25
 
 - **Answers get their data-currency stamp faster.** Checking when Meridian last rebuilt now

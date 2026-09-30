@@ -11,5 +11,5 @@
     "MD060": false // table column style not worth enforcing here
   },
   "globs": ["**/*.md"],
-  "ignores": ["node_modules"]
+  "ignores": ["node_modules", "**/.venv*/**"] // uv's environment holds third-party docs, not ours
 }

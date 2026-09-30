@@ -34,3 +34,32 @@ repos:
     rev: v0.23.2
     hooks:
       - id: markdownlint-cli2
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
+  # docs-pii needs pass_filenames: false. Given single files it runs every pattern, ALLCAPS
+  # included, and ignores its sweep exemptions.
+  - repo: local
+    hooks:
+      - id: docs-pii
+        name: docs-pii (no real identifiers in tracked text)
+        entry: uv run --locked --project scripts/tools scripts/tools/check-docs-pii.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: sbom-current
+        name: sbom.cdx.json is current
+        entry: uv run --locked --project scripts/tools scripts/tools/make-sbom.py --check
+        language: system
+        pass_filenames: false
+        always_run: true
+      # Offline, so the verdict depends only on the files.
+      - id: zizmor
+        name: zizmor (GitHub Actions security)
+        entry: uv run --locked --project scripts/tools zizmor --offline .github
+        language: system
+        pass_filenames: false
+        files: ^\.github/

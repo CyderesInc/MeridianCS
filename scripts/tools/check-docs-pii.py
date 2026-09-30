@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Sweep this repository for real identifiers before they reach an audience.
 
-    python scripts/check-docs-pii.py                    # generators + every tracked text file
-    python scripts/check-docs-pii.py scripts/make-brief.py   # one file, full pattern set
+    python scripts/tools/check-docs-pii.py                    # generators + every tracked text file
+    python scripts/tools/check-docs-pii.py scripts/tools/make-brief.py   # one file, full pattern set
 
 Originally this checked only the three PDF generators, because those PDFs ship inside the package
 and one goes to customers. That scope was too narrow, and the gap was not theoretical: a repo-wide
@@ -46,7 +46,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SKILL = os.path.dirname(HERE)
+SKILL = os.path.dirname(os.path.dirname(HERE))
 GENERATORS = [os.path.join(HERE, f) for f in ("make-impact.py", "make-guide.py", "make-brief.py")]
 
 
