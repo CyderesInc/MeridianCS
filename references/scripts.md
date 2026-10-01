@@ -15,7 +15,7 @@ Split by what you are doing, so a lookup for one verb's flags does not pull in t
 |---|---|
 | query verbs — `connect`, `asof`, `connectors`, `top`, `list`, `summary`, `profile`, `compare`, `check`, `labels`, `stacks`, `api` | this file |
 | `snapshot`, `trend`, `metrics`, `digest`, `alerts` | [trend-verbs.md](trend-verbs.md) |
-| scheduling any of the above on a recurring cadence, per OS | [scheduling.md](scheduling.md) |
+| `schedule` — collecting snapshots on a recurring cadence, per OS | [scheduling.md](scheduling.md) |
 | `report` — branded PDFs, blast-radius graphs, trend charts | [reports.md](reports.md) |
 | editing the helpers — transport, pacing, concurrency, TLS, caching, `top`'s ladder, `selfupdate` — or the release/packaging maintenance scripts | [internals.md](internals.md) |
 
@@ -419,6 +419,8 @@ also clears the SmartLabel and result caches, as `refresh-fields` does.
 - `trend` — compare two snapshots. See **Trends** below; its refusals are the point of the verb.
 - `metrics` — the named counts captured on every snapshot, one API call each.
 - `snapshots` — inspect or trim the history file.
+- `schedule` — `show` prints an OS task definition (never registers it), `run` is what the task runs,
+  `status` reads each job's heartbeat. See [scheduling.md](scheduling.md).
 - `report` — branded PDF; several input files render one document with several subjects
   (profiles only). See below.
 

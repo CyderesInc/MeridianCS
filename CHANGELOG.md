@@ -3,6 +3,18 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.29.0 - 2026-10-01
+
+- **Snapshots can now be taken on a schedule.** Ask the skill to keep tracking something and it sets
+  up a daily or weekly job for Windows, macOS or Linux. You see it and approve it before anything is
+  registered.
+- **You hear about a scheduled job that stops or fails.** Each run is recorded, failures included, and
+  the next session says when a job has stopped, keeps failing, or is waiting on another stack.
+- **A job collects for one stack only.** While another stack is active it writes nothing, and
+  switching stacks tells you so.
+- **"Start tracking X" now says whether anything will measure it.** Before, a metric could be
+  registered with nothing ever taking a snapshot.
+
 ## 2.28.5 - 2026-09-30
 
 - **Risk answers follow Meridian's own risk model.** Rankings order by `Risk_Score`, tiers come from

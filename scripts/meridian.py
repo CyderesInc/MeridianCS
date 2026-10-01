@@ -29,6 +29,9 @@ Verbs:
   trend          compare two snapshots:  meridian.py trend [--since 2026-07-01] [--by Risk_Level]
   metrics        named counts captured on every snapshot (one API call each), for trending:
                  meridian.py metrics list | add --name kev --label "KEV exposed" --where "..." | rm kev
+  schedule       collection on a timer: `schedule show` prints the OS task definition (never registers
+                 it), `schedule run` is what the task runs (snapshot + alerts + a heartbeat line every
+                 run), `schedule status` says whether each job is still running and working
   stacks         multiple stacks:     meridian.py stacks list | add --name prod --fqdn F --token T | switch prod | rm prod
 
 `top`, `list` and `summary` also take --format csv [--out FILE]; the JSON envelope still prints, so the
@@ -72,6 +75,25 @@ if hasattr(sys.stdout, "reconfigure"):
 HOME = os.path.expanduser("~")
 CFG_DIR = os.path.join(HOME, ".meridian")
 CFG_PATH = os.path.join(CFG_DIR, "config.json")
+
+# A scheduled run under pythonw.exe (no console) starts with sys.stdout and sys.stderr set to None.
+# print() to None is a no-op, but the direct sys.stderr.write calls below raise -- one of them after a
+# snapshot is appended, so a run that wrote history would report that it hadn't. Both go to an
+# owner-only log instead, before anything can write; it is truncated past 1MB, since the heartbeat,
+# not this file, is the record of what ran.
+if sys.stdout is None or sys.stderr is None:
+    try:
+        _run_log = os.path.join(CFG_DIR, "schedule", "run.log")
+        os.makedirs(os.path.dirname(_run_log), mode=0o700, exist_ok=True)
+        _big = os.path.exists(_run_log) and os.path.getsize(_run_log) > 1000000
+        _fd = os.open(_run_log, os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if _big else os.O_APPEND), 0o600)
+        _stream = os.fdopen(_fd, "a", encoding="utf-8")
+    except Exception:
+        _stream = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = _stream
+    if sys.stderr is None:
+        sys.stderr = _stream
 STACKS_PATH = os.path.join(CFG_DIR, "stacks.json")  # registry of named stacks (multi-stack support)
 RL_PATH = os.path.join(CFG_DIR, ".ratelimit")
 RL_LIMIT = 55
@@ -929,9 +951,17 @@ def with_currency(tables, fn, straddle=False, sections=None):
     return attach_currency(out, data_currency(before, tables, after), sections)
 
 
+class _DieExit(SystemExit):
+    """SystemExit that keeps die()'s message. Identical to sys.exit(code) for every caller; it exists
+    so `schedule run` can write *why* a run stopped into its heartbeat instead of only an exit code."""
+    def __init__(self, msg, code):
+        super().__init__(code)
+        self.msg = msg
+
+
 def die(msg, code=2):
     jout({"error": msg}, stderr=True)
-    sys.exit(code)
+    raise _DieExit(msg, code)
 
 
 _PACE_LOCK = threading.Lock()   # serializes THREADS; _FileLock below serializes PROCESSES
@@ -3613,7 +3643,7 @@ def cmd_metrics(a):
                               origin="derived" if a.derived else None)
     if problem:
         die(problem)
-    out = {"added": rec, "tracked": len(load_metrics()), "cap": MAX_METRICS}
+    out = {"added": rec, "tracked": len(load_metrics()), "cap": MAX_METRICS, "collection": collection_for()}
     if a.derived:
         # A derived metric is registered in answer to a question that could not be answered, so the
         # answer needs today's value to offer as a baseline.
@@ -4537,6 +4567,9 @@ def cmd_trend(a):
             live["source"] = "names looked up live; the deltas themselves are from local snapshots"
             out["dataCurrency"] = dict(out["dataCurrency"], sections={"entities.names": live})
     out["stack"] = load_config()[0]
+    if out.get("insufficientHistory"):
+        # "Come back later" is only true if something is collecting in the meantime.
+        out["collection"] = collection_for()
     if getattr(a, "format", None) == "csv":
         # The envelope prints alongside the CSV so its caveats stay visible; hundreds of per-date
         # series values would bury exactly the flags it exists to surface. The series is for
@@ -5483,7 +5516,8 @@ def cmd_alerts(a):
                                  include_degraded=a.include_degraded)
         if problem:
             die(problem)
-        jout({"added": rec, "configured": len(load_alerts()), "cap": MAX_ALERTS})
+        jout({"added": rec, "configured": len(load_alerts()), "cap": MAX_ALERTS,
+              "collection": collection_for()})
         return
     if a.alerts_cmd == "notify":
         if a.to:
@@ -5510,6 +5544,714 @@ def cmd_alerts(a):
         print(render_alerts(v, a.format))
     # Exit code last, and always -- a scheduler reads this, not the payload.
     sys.exit(v["exitCode"])
+
+
+# --- Scheduled collection: `schedule run` / `show` / `status` ----------------------------------
+# Trends, alerts and entity deltas all read local history, and nothing wrote that history unless
+# someone hand-built an OS scheduled task past the defaults references/scheduling.md documents. What
+# that cost was observed, not predicted: an alerts evidence window closed with nothing in it because no
+# job ever ran, and rules sat on one stack while another was active. So the scheduled thing is one
+# verb that snapshots, evaluates and delivers, and that records every run -- the failed ones above all,
+# because a job that stopped running reads exactly like a quiet week. Spec: design/trends.md,
+# "Scheduled collection".
+
+SCHEDULE_CADENCES = ("daily", "weekly")
+# How long after the last attempt a job counts as stopped. Daily allows three days rather than two: an
+# InteractiveToken task on a laptop legitimately misses a weekend, and a warning every Monday morning
+# would teach the user to ignore the one that matters.
+SCHEDULE_STALE_AFTER = {"daily": 3 * 86400 + 6 * 3600, "weekly": 15 * 86400}
+# Matches the Task Scheduler ExecutionTimeLimit below. A `started` line older than this with no
+# `finished` was killed (timeout, crash, power loss), which a `finally` can never record itself.
+SCHEDULE_TIME_LIMIT_S = 30 * 60
+HEARTBEAT_MAX_LINES = 400
+# Not 2: die() and argparse both exit 2, and a task's LastTaskResult has to say which of these it was.
+SCHEDULE_EXIT_OK, SCHEDULE_EXIT_NOTHING, SCHEDULE_EXIT_PROBLEMS = 0, 1, 3
+# Constant and brand-neutral on purpose. A branded install de-brands when it self-updates, so a label
+# derived from _branded() would orphan the registered task: `unregister` would miss it and a second
+# `register` would run two jobs.
+SCHEDULE_LABEL_PREFIX = "meridiancs-snapshot-"
+SCHEDULE_WEEKDAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+_TASK_DAYS = {"MON": "Monday", "TUE": "Tuesday", "WED": "Wednesday", "THU": "Thursday",
+              "FRI": "Friday", "SAT": "Saturday", "SUN": "Sunday"}
+_CRON_DAYS = {"SUN": 0, "MON": 1, "TUE": 2, "WED": 3, "THU": 4, "FRI": 5, "SAT": 6}
+# Sourced by the macOS and Linux wrappers if it exists; this file never reads it. Alert targets stay
+# env-var-only (CLAUDE.md), and a scheduler does not inherit the shell they were exported in.
+_SCHEDULE_ENV_FILE = "$HOME/.meridian/schedule/alert.env"
+_SCHEDULE_ALERT_VARS = ("MERIDIAN_ALERT_SLACK_WEBHOOK", "MERIDIAN_ALERT_TEAMS_WEBHOOK",
+                        "MERIDIAN_ALERT_EMAIL_SMTP_HOST", "MERIDIAN_ALERT_EMAIL_TO")
+
+
+class _ScheduleRefused(Exception):
+    """This run must not collect, and says why. Not a failure of the stack: it is the wrong stack, or
+    credentials that can't be trusted to belong together."""
+
+
+def _fqdn_slug(fqdn):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", _clean_fqdn(fqdn))
+
+
+def _schedule_dir():
+    return os.path.join(CFG_DIR, "schedule")
+
+
+def _heartbeat_path(fqdn):
+    # Keyed on the stack the JOB is for, not the active one: a refused run has to land in the history
+    # of the job that refused, or the refusal is filed under the stack that caused it.
+    return os.path.join(CFG_DIR, "heartbeat.%s.jsonl" % _fqdn_slug(fqdn))
+
+
+def _utc_iso(t=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if t is None else t))
+
+
+def _parse_utc(s):
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def _config_file():
+    try:
+        with open(CFG_PATH, encoding="utf-8-sig") as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def _credential_sources():
+    """Where the FQDN and the token each resolve from: "env", "config" or None.
+
+    load_config() resolves the two separately, so MERIDIAN_FQDN in a job's environment with the token
+    falling through to config.json sends one stack's bearer token to another stack's host. A pinned
+    FQDN check can't see that -- the FQDN matches -- so the sources are compared instead.
+    """
+    cfg = _config_file()
+    fsrc = "env" if os.environ.get("MERIDIAN_FQDN") else ("config" if cfg.get("fqdn") else None)
+    tsrc = "env" if os.environ.get("MERIDIAN_API_TOKEN") else ("config" if cfg.get("api_token") else None)
+    return fsrc, tsrc
+
+
+def _replace_with_retry(tmp, path):
+    # Same Windows window as _private_write: a reader holding the destination for a moment.
+    for attempt in range(20):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 19:
+                raise
+            time.sleep(0.02)
+
+
+def _append_heartbeat(fqdn, entry):
+    path = _heartbeat_path(fqdn)
+    _ensure_cfg_dir()
+    # Locked because the trim is a read-modify-write, and a manual `schedule run` can overlap the
+    # scheduled one.
+    with _FileLock(path + ".lock"):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")
+        with open(path, encoding="utf-8-sig") as f:
+            lines = f.readlines()
+        if len(lines) > HEARTBEAT_MAX_LINES:
+            tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(lines[-HEARTBEAT_MAX_LINES:])
+            _replace_with_retry(tmp, path)
+    return path
+
+
+def load_heartbeat(path):
+    out = []
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(e, dict):
+                    out.append(e)
+    except OSError:
+        pass
+    return out
+
+
+def _snapshots_since(fqdn, since_iso):
+    # Read from the job's own history file, not _snapshots_path(): that one follows the active stack.
+    recs, _ = load_snapshots(os.path.join(CFG_DIR, "snapshots.%s.jsonl" % _fqdn_slug(fqdn)))
+    return len([r for r in recs if (r.get("takenAt") or "") >= since_iso])
+
+
+def _schedule_alerts(problems):
+    """Evaluate and deliver, by function rather than through cmd_alerts: its bit-field sys.exit would
+    make a firing rule look like a failed task, and the scheduler's verdict is about the job."""
+    try:
+        rules = load_alerts()
+    except Exception as e:
+        problems.append("alerts: %s" % _short(str(e), 200))
+        return {"error": _short(str(e), 200)}
+    if not rules:
+        return {"rules": 0}
+    v = _current_alert_verdict()
+    s = v.get("summary") or {}
+    out = {"rules": s.get("rules", len(rules)), "firing": s.get("firing", 0),
+           "unevaluable": s.get("unevaluable", 0)}
+    report = deliver_alerts(v, stack_date=v.get("stackDate"))
+    sent = report.get("sent") or {}
+    out["changed"] = bool(report.get("changed"))
+    out["sent"] = sorted(t for t, r in sent.items() if "error" not in r)
+    failed = {t: _short(r["error"], 120) for t, r in sent.items() if "error" in r}
+    if failed:
+        out["failed"] = failed
+        problems.append("alerts: delivery to %s failed" % ", ".join(sorted(failed)))
+    if out["changed"] and not out["sent"]:
+        if not any((report.get("configured") or {}).values()):
+            out["notSentReason"] = ("no notify target is configured in this job's environment (set %s "
+                                    "or the email settings where the job runs); the change stays "
+                                    "pending and goes out once one is"
+                                    % " or ".join(_SCHEDULE_ALERT_VARS[:2]))
+        else:
+            out["notSentReason"] = "every configured target failed; the change stays pending"
+        # A problem only while something is firing. The first evaluation of a clear rule set is a
+        # "change" too, and a stack whose rules are only ever read with `alerts eval` has no targets
+        # on purpose -- flagging that would fail every run, and a job that always fails is ignored.
+        if out["firing"]:
+            problems.append("alerts: %s firing, not sent: %s" % (out["firing"], out["notSentReason"]))
+    return out
+
+
+def _schedule_collect(expect, entities, res, problems, state):
+    fsrc, tsrc = _credential_sources()
+    if not (fsrc and tsrc):
+        raise _ScheduleRefused("this job's environment has no complete set of Meridian credentials "
+                               "(address from %s, token from %s); nothing was collected"
+                               % (fsrc or "nowhere", tsrc or "nowhere"))
+    if fsrc != tsrc:
+        raise _ScheduleRefused(
+            "the stack address comes from %s but the token from %s, so this job could send one "
+            "stack's token to another stack's host; nothing was collected. Give the job both from "
+            "the same place (normally config.json, with MERIDIAN_FQDN and MERIDIAN_API_TOKEN unset)."
+            % (fsrc, tsrc))
+    active = _clean_fqdn(load_config()[0])
+    if active != expect:
+        raise _ScheduleRefused(
+            "the active stack is %s, but this job collects for %s, so nothing was written. "
+            "`stacks switch` back to it to resume, or create a job for %s with `schedule show`."
+            % (active, expect, active))
+    state["matched"] = True
+    digest = build_digest(refresh=True)
+    salt = None
+    if entities:
+        cfg = _config_file()
+        if fsrc != "config" or _clean_fqdn(cfg.get("fqdn") or "") != expect:
+            # Re-read rather than trusting the start of the run: a `stacks switch` in a session while
+            # this ran would hand back the other stack's salt, and every later entity delta would
+            # report the whole population as appeared and disappeared.
+            problems.append("entities skipped: the stack in config.json is no longer %s" % expect)
+        elif not cfg.get("entity_salt"):
+            problems.append("entities skipped: this stack has no entity salt yet; run `schedule show "
+                            "--entities %s` once in a session to create it" % entities)
+        else:
+            salt = cfg["entity_salt"]
+    snap = take_snapshot(digest=digest, entities=entities if salt else None, salt=salt)
+    head = digest.get("headline") or {}
+    res.update({"stackDate": snap.get("stackDate"), "historyRecords": snap.get("historyRecords"),
+                "assets": head.get("assets"), "users": head.get("users")})
+    if snap.get("ldgRebuiltUtc"):
+        res["ldgRebuiltUtc"] = snap["ldgRebuiltUtc"]
+    for key in ("sectionsUnavailable", "metricsUnresolved", "entitiesUnavailable", "historySkipped"):
+        if snap.get(key):
+            problems.append("%s: %s" % (key, _short(json.dumps(snap[key], separators=(",", ":")), 200)))
+    res["alerts"] = _schedule_alerts(problems)
+
+
+def schedule_run(expect, cadence="daily", entities=None):
+    """One scheduled collection, and one `started` + one `finished` heartbeat line for it, whatever
+    happens. Returns the `finished` entry; its `exit` is the process exit code."""
+    expect = _clean_fqdn(expect)
+    t0 = time.time()
+    started = _utc_iso(t0)
+    base = {"run": "%s-%d" % (started, os.getpid()), "stack": expect, "cadence": cadence}
+    try:
+        _append_heartbeat(expect, dict(base, event="started", ts=started))
+    except Exception:
+        pass    # the finished line is still attempted; a missing start only weakens `killed`
+    res = dict(base, event="finished", ok=False, exit=SCHEDULE_EXIT_NOTHING, snapshotWritten=False)
+    problems, state = [], {}
+    try:
+        try:
+            _schedule_collect(expect, entities, res, problems, state)
+        except _ScheduleRefused as e:
+            res["refused"], res["error"] = True, str(e)
+        except _DieExit as e:
+            res["error"] = _short(e.msg, 300)
+        except SystemExit as e:
+            res["error"] = "exited with code %s" % e.code
+        except Exception as e:
+            res["error"] = _short(str(e), 300)
+    finally:
+        # Decided from the history file, not from whether take_snapshot returned: a failure after
+        # the append (a stderr write, the alert step) must not report a written snapshot as missing.
+        try:
+            written = bool(state.get("matched")) and _snapshots_since(expect, started) > 0
+        except Exception:
+            written = False
+        res["snapshotWritten"] = written
+        if problems:
+            res["problems"] = problems
+        if not written:
+            res["exit"] = SCHEDULE_EXIT_NOTHING
+        elif problems or res.get("error"):
+            res["exit"] = SCHEDULE_EXIT_PROBLEMS
+        else:
+            res["exit"] = SCHEDULE_EXIT_OK
+        res["ok"] = res["exit"] == SCHEDULE_EXIT_OK
+        res["ts"] = _utc_iso()
+        res["durationS"] = round(time.time() - t0, 1)
+        try:
+            _append_heartbeat(expect, res)
+        except Exception as e:
+            res["heartbeatError"] = _short(str(e), 200)
+    return res
+
+
+def heartbeat_summary(entries, now=None):
+    """What one job's heartbeat says. `stale` is about the job running at all; whether the runs work
+    is `lastRunOk`. They fail differently -- a stopped job and a job failing daily -- and need
+    different fixes, so neither is folded into the other."""
+    now = time.time() if now is None else now
+    started = {e["run"]: e for e in entries if e.get("event") == "started" and e.get("run")}
+    finished = [e for e in entries if e.get("event") == "finished"]
+    done = {e.get("run") for e in finished}
+    open_runs = [(r, _parse_utc(e.get("ts")) or now) for r, e in started.items() if r not in done]
+    killed = [(r, t) for r, t in open_runs if now - t > SCHEDULE_TIME_LIMIT_S]
+    last = finished[-1] if finished else None
+    last_ok = next((e for e in reversed(finished) if e.get("ok")), None)
+    attempts = [t for t in (_parse_utc(e.get("ts")) for e in entries) if t is not None]
+    last_attempt = max(attempts) if attempts else None
+    cadence = (entries[-1] if entries else {}).get("cadence")
+    out = {"stack": (entries[-1] if entries else {}).get("stack"), "cadence": cadence,
+           "lastRun": last.get("ts") if last else None,
+           "lastRunOk": bool(last.get("ok")) if last else None,
+           "lastOkRun": last_ok.get("ts") if last_ok else None,
+           "killedRuns": len(killed), "running": len(open_runs) > len(killed),
+           "runs7d": len([e for e in finished if now - (_parse_utc(e.get("ts")) or 0) <= 7 * 86400]),
+           "runs30d": len([e for e in finished if now - (_parse_utc(e.get("ts")) or 0) <= 30 * 86400])}
+    if last:
+        out["lastExit"] = last.get("exit")
+        if last.get("error"):
+            out["lastError"] = last["error"]
+        if last.get("refused"):
+            out["lastRefused"] = True
+        if last.get("problems"):
+            out["lastProblems"] = last["problems"]
+    newest_kill = max(killed, key=lambda k: k[1]) if killed else None
+    if newest_kill and (last is None or newest_kill[1] > (_parse_utc(last.get("ts")) or 0)):
+        out["lastRunOk"] = False
+        out["lastError"] = ("the run started at %s never finished: it was killed, timed out or "
+                            "crashed" % _utc_iso(newest_kill[1]))
+    limit = SCHEDULE_STALE_AFTER.get(cadence)
+    if limit is None:
+        out["stale"] = None
+        out["staleNote"] = "the cadence is not recorded, so a missed run can't be told from a slow one"
+    else:
+        out["stale"] = last_attempt is None or now - last_attempt > limit
+        out["staleAfterHours"] = round(limit / 3600)
+    return out
+
+
+def collection_status(now=None):
+    """Every scheduled job on this machine, not only the active stack's: a job refusing because
+    another stack is active is exactly the case that has to stay visible."""
+    jobs = []
+    try:
+        names = sorted(os.listdir(CFG_DIR))
+    except OSError:
+        names = []
+    for n in names:
+        if n.startswith("heartbeat.") and n.endswith(".jsonl"):
+            entries = load_heartbeat(os.path.join(CFG_DIR, n))
+            if entries:
+                jobs.append(heartbeat_summary(entries, now))
+    cfg = _config_file()
+    active = _clean_fqdn(os.environ.get("MERIDIAN_FQDN") or cfg.get("fqdn") or "") or None
+    for j in jobs:
+        j["activeStack"] = j.get("stack") == active
+    out = {"scheduled": bool(jobs), "activeStack": active, "jobs": jobs}
+    if not jobs:
+        out["note"] = ("No scheduled collection has run on this machine, so nothing is building history "
+                       "automatically. That is not the same as a job that is running fine.")
+    return out
+
+
+def collection_for(fqdn=None):
+    """Whether anything collects for this stack on a timer, in a few keys -- attached to the outputs
+    whose whole value depends on history accumulating (`metrics add`, `alerts add`, a trend with
+    `insufficientHistory`). Without it, "start tracking X" registered a metric nothing measured and
+    the answer read as done."""
+    st = collection_status()
+    fq = _clean_fqdn(fqdn or st.get("activeStack") or "")
+    job = next((j for j in st["jobs"] if j.get("stack") == fq), None)
+    if job:
+        return {"scheduled": True, "lastRun": job.get("lastRun"), "lastRunOk": job.get("lastRunOk"),
+                "stale": job.get("stale")}
+    out = {"scheduled": False,
+           "hint": "nothing takes snapshots for this stack on a timer, so history grows only when "
+                   "someone runs `snapshot`; `schedule show` sets one up"}
+    base = os.path.join(_schedule_dir(), SCHEDULE_LABEL_PREFIX + _fqdn_slug(fq))
+    if any(os.path.exists(base + ext) for ext in (".xml", ".plist", ".timer", ".cron")):
+        # Written, and perhaps registered, but it has never run: offering a second one would be wrong.
+        out["definitionWritten"] = True
+    return out
+
+
+def schedule_issues(now=None):
+    """The jobs worth a line at session start, or None. Healthy jobs and no jobs both say nothing, so
+    `connect` carries the key only when there is something to tell -- a stopped job reads exactly
+    like a quiet week, which is why this exists at all."""
+    issues = []
+    for j in collection_status(now)["jobs"]:
+        if j.get("lastRefused"):
+            kind = "refusing"
+        elif j.get("lastRunOk") is False:
+            kind = "failing"
+        elif j.get("stale"):
+            kind = "stopped"
+        else:
+            continue
+        row = {"stack": j.get("stack"), "issue": kind, "lastRun": j.get("lastRun"),
+               "lastOkRun": j.get("lastOkRun")}
+        if j.get("lastError"):
+            row["error"] = _short(j["lastError"], 200)
+        issues.append(row)
+    return issues or None
+
+
+def _attach_schedule_issues(out):
+    # Local file reads only, no API call; and never allowed to fail the preflight it rides on.
+    try:
+        issues = schedule_issues()
+    except Exception:
+        issues = None
+    if issues:
+        out["scheduledCollection"] = issues
+    return out
+
+
+def _long_path(p):
+    """Expand a Windows 8.3 short path (C:/Users/FIRSTN~1/...). Not realpath: that follows the skill
+    symlink into the dev tree, and the task should run whatever the install path points at."""
+    if os.name != "nt":
+        return p
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetLongPathNameW(str(p), buf, 32768)
+        return buf.value if 0 < n < 32768 else p
+    except Exception:
+        return p
+
+
+def _schedule_interpreter(target):
+    exe, warnings = sys.executable, []
+    if target == "windows" and os.name == "nt":
+        w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(w):
+            exe = w     # no console window flashing up at 09:00 every day
+        else:
+            warnings.append("there is no pythonw.exe beside %s, so each run briefly opens a console "
+                            "window" % exe)
+        if "WindowsApps" in exe:
+            warnings.append("%s is a Microsoft Store alias; if the task fails to start, generate the "
+                            "schedule from a python.org or uv-installed Python" % exe)
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        warnings.append("this is a virtual environment's interpreter (%s); if that environment is "
+                        "removed, every run fails. Generate the schedule from a lasting Python if "
+                        "this one is temporary." % exe)
+    return _long_path(exe), warnings
+
+
+def _shell_only_settings():
+    """Settings a session sees and a scheduled job won't, because they live only in the shell."""
+    cfg, out = _config_file(), []
+    if os.environ.get("MERIDIAN_CA_BUNDLE", "").strip() and not cfg.get("ca_bundle"):
+        out.append("MERIDIAN_CA_BUNDLE is set in this shell only, so behind a TLS-inspecting proxy every "
+                   "scheduled run would fail certificate verification. Add \"ca_bundle\": \"<path>\" "
+                   "to ~/.meridian/config.json, or set it in the job's environment.")
+    if (os.environ.get("MERIDIAN_INSECURE_TLS", "").strip().lower() in ("1", "true", "yes", "on")
+            and not cfg.get("insecure_tls")):
+        out.append("MERIDIAN_INSECURE_TLS is set in this shell only, so a scheduled run verifies the "
+                   "certificate and may fail where this session doesn't.")
+    return out
+
+
+def _next_start(at, now=None):
+    """Local date-time of the first run: today at HH:MM if that is still ahead, else tomorrow. A start
+    in the past plus StartWhenAvailable could fire a 'missed' run the moment the task registers."""
+    now = datetime.datetime.now() if now is None else now
+    first = now.replace(hour=at[0], minute=at[1], second=0, microsecond=0)
+    if first <= now:
+        first += datetime.timedelta(days=1)
+    return first
+
+
+def _task_xml(label, python, args, home, at, weekday, user, start):
+    """Task Scheduler XML. Every setting here exists because a default skips runs silently --
+    references/scheduling.md has the measured reasons."""
+    import subprocess
+    from xml.sax.saxutils import escape
+    if weekday:
+        sched = ("<ScheduleByWeek><DaysOfWeek><%s /></DaysOfWeek><WeeksInterval>1</WeeksInterval>"
+                 "</ScheduleByWeek>" % _TASK_DAYS[weekday])
+    else:
+        sched = "<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>"
+    command = '"%s"' % python if " " in python else python
+    user_el = "<UserId>%s</UserId>" % escape(user) if user else ""
+    return "\r\n".join([
+        '<?xml version="1.0" encoding="UTF-16"?>',
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+        "  <RegistrationInfo><Description>%s</Description></RegistrationInfo>"
+        % escape("Meridian scheduled snapshot for %s (meridiancs schedule run)" % args[4]),
+        "  <Triggers><CalendarTrigger><StartBoundary>%s</StartBoundary><Enabled>true</Enabled>%s"
+        "</CalendarTrigger></Triggers>" % (start.strftime("%Y-%m-%dT%H:%M:%S"), sched),
+        '  <Principals><Principal id="Author">%s<LogonType>InteractiveToken</LogonType>'
+        "<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>" % user_el,
+        "  <Settings>",
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+        "    <StartWhenAvailable>true</StartWhenAvailable>",
+        "    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>",
+        "    <Enabled>true</Enabled>",
+        "    <ExecutionTimeLimit>PT%dM</ExecutionTimeLimit>" % (SCHEDULE_TIME_LIMIT_S // 60),
+        "  </Settings>",
+        '  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>%s</Arguments>'
+        "<WorkingDirectory>%s</WorkingDirectory></Exec></Actions>"
+        % (escape(command), escape(subprocess.list2cmdline(args)), escape(home)),
+        "</Task>", ""])
+
+
+def _launchd_plist(label, python, args, home, at, weekday, log):
+    import plistlib
+    # The wrapper sources the alert env file if the user made one, then execs Python with the paths
+    # as real arguments -- "$@", so no path is ever spliced into the shell string.
+    sh = ('f="%s"; if [ -f "$f" ]; then set -a; . "$f"; set +a; fi; exec "$@"' % _SCHEDULE_ENV_FILE)
+    cal = {"Hour": at[0], "Minute": at[1]}
+    if weekday:
+        cal["Weekday"] = _CRON_DAYS[weekday]
+    d = {"Label": label, "ProgramArguments": ["/bin/sh", "-c", sh, "sh", python] + list(args),
+         "StartCalendarInterval": cal, "WorkingDirectory": home,
+         "StandardOutPath": log, "StandardErrorPath": log, "ProcessType": "Background"}
+    return plistlib.dumps(d).decode("utf-8")
+
+
+def _systemd_quote(s):
+    # ExecStart= quoting, plus systemd's own specifier (%) and variable ($) expansion.
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+    return '"%s"' % s
+
+
+def _systemd_units(label, python, args, at, weekday):
+    desc = "Meridian scheduled snapshot for %s" % args[4].replace("%", "%%")
+    svc = "\n".join([
+        "[Unit]", "Description=%s" % desc, "", "[Service]", "Type=oneshot", "WorkingDirectory=%h",
+        # The leading '-' makes the file optional: no alert targets is a valid setup.
+        "EnvironmentFile=-%h/.meridian/schedule/alert.env",
+        "ExecStart=%s" % " ".join(_systemd_quote(x) for x in [python] + list(args)),
+        "TimeoutStartSec=%dmin" % (SCHEDULE_TIME_LIMIT_S // 60), ""])
+    when = "*-*-* %02d:%02d:00" % at
+    if weekday:
+        when = "%s %s" % (weekday.title(), when)
+    timer = "\n".join([
+        "[Unit]", "Description=%s" % desc, "", "[Timer]", "OnCalendar=%s" % when,
+        # Persistent= is the Linux StartWhenAvailable: a run missed while the machine was off fires
+        # at the next boot instead of never.
+        "Persistent=true", "", "[Install]", "WantedBy=timers.target", ""])
+    return svc, timer
+
+
+def _cron_line(python, args, at, weekday, log):
+    import shlex
+    dow = str(_CRON_DAYS[weekday]) if weekday else "*"
+    cmd = ('cd "$HOME" && { f="%s"; if [ -f "$f" ]; then set -a; . "$f"; set +a; fi; %s >> %s 2>&1; }'
+           % (_SCHEDULE_ENV_FILE, " ".join(shlex.quote(x) for x in [python] + list(args)), log))
+    # No MAILTO="" here: it applies to every later line of the user's crontab, so setting it to quiet
+    # this job would silence their other jobs too. Our own redirect covers this line. And % is
+    # crontab's newline character, so it is escaped everywhere in the command.
+    return "%d %d * * %s %s" % (at[1], at[0], dow, cmd.replace("%", "\\%"))
+
+
+def _ps_quote(s):
+    return "'%s'" % s.replace("'", "''")
+
+
+def _sh_quote(s):
+    import shlex
+    return shlex.quote(s)
+
+
+def _write_schedule_file(name, content, utf16=False):
+    d = _schedule_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    path = os.path.join(d, name)
+    data = content.encode("utf-16") if utf16 else content.encode("utf-8")
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    _replace_with_retry(tmp, path)
+    return path
+
+
+def _parse_at(at):
+    m_ = re.match(r"^(\d{1,2}):(\d{2})$", at or "")
+    if not m_ or int(m_.group(1)) > 23 or int(m_.group(2)) > 59:
+        raise ValueError("--at takes a local time as HH:MM, e.g. 09:00 (got %r)" % at)
+    return int(m_.group(1)), int(m_.group(2))
+
+
+def schedule_show(target=None, at="09:00", weekly=None, entities=None, write=False, now=None):
+    """The OS task definition for the active stack, and the commands to register, remove and check it.
+
+    Never registers anything: a scheduled task is persistent configuration on the user's machine, so
+    the definition is shown and the user (or the model, after a yes) runs the register command.
+    """
+    fsrc, tsrc = _credential_sources()
+    if "env" in (fsrc, tsrc):
+        raise _ScheduleRefused(
+            "this session's stack comes from environment variables (MERIDIAN_FQDN / "
+            "MERIDIAN_API_TOKEN), which a scheduled job won't have. Save it with `stacks add`, unset "
+            "them, and create the schedule from the saved stack.")
+    fqdn = _clean_fqdn(load_config()[0])
+    here = "windows" if os.name == "nt" else ("macos" if sys.platform == "darwin" else "linux")
+    target = target or here
+    hm = _parse_at(at)
+    weekday = weekly.upper() if weekly else None
+    if weekday and weekday not in SCHEDULE_WEEKDAYS:
+        raise ValueError("--weekly takes one of %s" % ", ".join(SCHEDULE_WEEKDAYS))
+    cadence = "weekly" if weekday else "daily"
+    out = {"os": target, "stack": fqdn, "cadence": cadence, "at": "%02d:%02d" % hm}
+    if weekday:
+        out["weekday"] = weekday
+    salt_note = None
+    if entities:
+        spec, problem = parse_entity_scope(entities, False)
+        if not spec:
+            raise ValueError(problem)
+        had = bool(_config_file().get("entity_salt"))
+        # Created here, in a session, so a scheduled run never has to write config.json.
+        salt_note = {"entitySalt": "existing" if had else "created", "saltId": salt_id(entity_salt())}
+    python, warnings = _schedule_interpreter(target)
+    if target != here:
+        warnings.append("generated for %s on %s: the interpreter and script paths are this machine's "
+                        "and must be changed before use" % (target, here))
+    script = _long_path(os.path.abspath(__file__))
+    home = _long_path(HOME)
+    args = [script, "schedule", "run", "--expect-stack", fqdn, "--cadence", cadence]
+    if entities:
+        args += ["--entities", entities]
+    label = SCHEDULE_LABEL_PREFIX + _fqdn_slug(fqdn)
+    sdir = _schedule_dir()
+    # sys.executable, not the task's interpreter: pythonw prints nothing to the console it runs in.
+    if target == "windows":
+        status_cmd = "& %s %s schedule status" % (_ps_quote(sys.executable), _ps_quote(script))
+    else:
+        status_cmd = "%s %s schedule status" % (_sh_quote(sys.executable), _sh_quote(script))
+    files = []
+    if target == "windows":
+        user = ("%s\\%s" % (os.environ["USERDOMAIN"], os.environ["USERNAME"])
+                if os.environ.get("USERDOMAIN") and os.environ.get("USERNAME") else None)
+        files.append({"name": label + ".xml", "utf16": True,
+                      "content": _task_xml(label, python, args, home, hm, weekday, user,
+                                           _next_start(hm, now))})
+        path = os.path.join(sdir, files[0]["name"])
+        out["register"] = ("Register-ScheduledTask -TaskName %s -Xml (Get-Content -LiteralPath %s -Raw)"
+                           % (_ps_quote(label), _ps_quote(path)))
+        out["unregister"] = "Unregister-ScheduledTask -TaskName %s -Confirm:$false" % _ps_quote(label)
+        out["status"] = ("Get-ScheduledTaskInfo -TaskName %s | Select-Object LastRunTime, "
+                         "LastTaskResult, NextRunTime" % _ps_quote(label))
+        out["shell"] = "powershell"
+        out["environment"] = (
+            "Alert targets are read from environment variables. Set them as user environment variables "
+            "([Environment]::SetEnvironmentVariable('<NAME>', '<value>', 'User')), then sign out and "
+            "back in so the task sees them: %s." % ", ".join(_SCHEDULE_ALERT_VARS))
+    elif target == "macos":
+        log = os.path.join(sdir, "launchd.%s.log" % _fqdn_slug(fqdn))
+        files.append({"name": label + ".plist",
+                      "content": _launchd_plist(label, python, args, home, hm, weekday, log)})
+        path = os.path.join(sdir, files[0]["name"])
+        agent = "~/Library/LaunchAgents/%s.plist" % label
+        # Written beside the other schedule files, never straight into LaunchAgents: launchd loads
+        # that folder at the next login, so writing there would register the job by itself.
+        out["register"] = ("mkdir -p ~/Library/LaunchAgents && cp %s %s && launchctl bootstrap "
+                           "gui/$(id -u) %s" % (_sh_quote(path), agent, agent))
+        out["unregister"] = "launchctl bootout gui/$(id -u)/%s; rm -f %s" % (label, agent)
+        out["status"] = "launchctl print gui/$(id -u)/%s" % label
+    elif target == "linux":
+        svc, timer = _systemd_units(label, python, args, hm, weekday)
+        files += [{"name": label + ".service", "content": svc}, {"name": label + ".timer", "content": timer}]
+        units = "~/.config/systemd/user"
+        out["register"] = ("mkdir -p %s && cp %s %s %s/ && systemctl --user daemon-reload && "
+                           "systemctl --user enable --now %s.timer"
+                           % (units, _sh_quote(os.path.join(sdir, label + ".service")),
+                              _sh_quote(os.path.join(sdir, label + ".timer")), units, label))
+        out["unregister"] = ("systemctl --user disable --now %s.timer; rm -f %s/%s.service %s/%s.timer; "
+                             "systemctl --user daemon-reload" % (label, units, label, units, label))
+        out["status"] = "systemctl --user list-timers %s.timer; journalctl --user -u %s.service" % (label, label)
+        out["linger"] = ("A user timer stops when you log out. To keep collecting while logged out, run "
+                         "`loginctl enable-linger \"$USER\"`.")
+    else:  # cron
+        log = '"$HOME/.meridian/schedule/cron.%s.log"' % _fqdn_slug(fqdn)
+        files.append({"name": label + ".cron", "content": _cron_line(python, args, hm, weekday, log) + "\n"})
+        out["register"] = ("crontab -e, then add the line from %s. Nothing here edits your crontab."
+                           % os.path.join(sdir, files[0]["name"]))
+        out["unregister"] = "crontab -e, then delete that line."
+        out["status"] = "cron keeps no run history; `schedule status` reads the job's own heartbeat."
+    if target != "windows":
+        out["environment"] = (
+            "Alert targets are read from environment variables, which a scheduler does not inherit from "
+            "your shell. To deliver alerts, put one NAME='value' line per setting in "
+            "~/.meridian/schedule/alert.env and `chmod 600` it; the job reads it at each start: %s."
+            % ", ".join(_SCHEDULE_ALERT_VARS))
+    out["label"] = label
+    out["command"] = [python] + args
+    out["files"] = [{"name": f["name"], "path": os.path.join(sdir, f["name"]), "content": f["content"]}
+                    for f in files]
+    out["checkWith"] = status_cmd
+    if salt_note:
+        out.update(salt_note)
+    warnings += _shell_only_settings()
+    if warnings:
+        out["warnings"] = warnings
+    if write:
+        out["written"] = [_write_schedule_file(f["name"], f["content"], f.get("utf16", False))
+                          for f in files]
+        out["note"] = "Written, not registered. Run `register` to start the schedule."
+    else:
+        out["written"] = []
+        out["note"] = "Nothing written or registered. Re-run with --write, then run `register`."
+    return out
+
+
+def cmd_schedule(a):
+    if a.schedule_cmd == "run":
+        res = schedule_run(a.expect_stack, a.cadence, getattr(a, "entities", None))
+        jout(res)
+        # Last, and always: the scheduler reads this, not the payload.
+        sys.exit(res["exit"])
+    if a.schedule_cmd == "status":
+        jout(collection_status())
+        return
+    try:
+        jout(schedule_show(a.target_os, a.at, a.weekly, getattr(a, "entities", None), a.write))
+    except (_ScheduleRefused, ValueError) as e:
+        die(str(e))
 
 
 def resolve(name, table, key, search_fields):
@@ -8385,7 +9127,7 @@ def cmd_connect(a):
         if isinstance(out, Exception):
             raise out
         if out.get("state") == "connected":
-            out = attach_currency(out, data_currency(stamp, ["asset", "user"]))
+            out = _attach_schedule_issues(attach_currency(out, data_currency(stamp, ["asset", "user"])))
         jout(out); return
     # The coverage lookup doesn't depend on the validation call, and this runs on the first question
     # of every session - so all three round trips go out together instead of one after another. On a
@@ -8397,7 +9139,7 @@ def cmd_connect(a):
     if out.get("state") == "connected":
         # Read fresh, never derived from the coverage block: that block is cached for an hour, and a
         # stamp taken from it would be up to an hour stale -- the exact failure this field exists for.
-        out = attach_currency(out, data_currency(stamp, ["asset", "user"]))
+        out = _attach_schedule_issues(attach_currency(out, data_currency(stamp, ["asset", "user"])))
         if isinstance(cov, Exception):
             out["connectors"] = {"unavailable": _short(str(cov), 200)}
         elif getattr(a, "coverage_full", False):
@@ -8500,6 +9242,7 @@ def cmd_stacks_switch(a):
     if a.name not in reg.get("stacks", {}):
         avail = ", ".join(reg.get("stacks", {})) or "(none saved yet)"
         die("No stack named '%s'. Saved stacks: %s" % (a.name, avail))
+    prev = (reg.get("stacks", {}).get(reg.get("active")) or {}).get("fqdn")
     reg["active"] = a.name
     save_stacks(reg)
     mirror_active_to_config(reg)
@@ -8507,6 +9250,13 @@ def cmd_stacks_switch(a):
     warn = _env_override_warning()
     if warn:
         result["warning"] = warn
+    new = (reg["stacks"][a.name] or {}).get("fqdn")
+    if prev and _clean_fqdn(prev) != _clean_fqdn(new or "") and os.path.exists(_heartbeat_path(prev)):
+        # Pin + refuse means a scheduled job stops collecting the moment its stack stops being
+        # active. Said here, at the switch, rather than discovered as a gap in a trend weeks later.
+        result["scheduleWarning"] = ("A scheduled job collects for %s. While another stack is active "
+                                     "it refuses each run and writes nothing; switch back to resume."
+                                     % _clean_fqdn(prev))
     result.update(diagnose_connection())
     jout(result)
 
@@ -9734,8 +10484,36 @@ def build_parser():
     mr = mxs.add_parser("rm", help="stop measuring a metric (captured history is kept)")
     mr.add_argument("name"); mr.set_defaults(func=cmd_metrics)
 
-    # alerts -- MVP, deliberately NOT routed from SKILL.md yet. Reachable by explicit CLI use only, so
-    # merging it cannot change what a natural-language question does (design/trends.md rule 1).
+    sc = sub.add_parser("schedule", help="collect snapshots on a timer: the OS task definition, the job "
+                                         "it runs, and whether that job is still working")
+    scs = sc.add_subparsers(dest="schedule_cmd", required=True)
+    sr = scs.add_parser("run", help="what the scheduled task runs: snapshot, alerts, and one heartbeat "
+                                    "line per run (exit 0 ok, 1 nothing written, 3 written with problems)")
+    # These flags are a contract: a registered task keeps calling them across self-updates.
+    sr.add_argument("--expect-stack", dest="expect_stack", required=True, metavar="FQDN",
+                    help="the stack this job collects for; while any other stack is active, each run "
+                         "is refused rather than collected")
+    sr.add_argument("--cadence", choices=SCHEDULE_CADENCES, default="daily",
+                    help="how often the task fires, so `schedule status` can tell a missed run")
+    sr.add_argument("--entities", metavar="SCOPE",
+                    help="also capture per-entity scores (the `snapshot --entities` scopes); needs the "
+                         "salt `schedule show --entities` creates")
+    sr.set_defaults(func=cmd_schedule)
+    sh = scs.add_parser("show", help="print the OS task definition for the active stack, with register / "
+                                     "unregister / status commands (never registers it)")
+    sh.add_argument("--os", dest="target_os", choices=("windows", "macos", "linux", "cron"),
+                    help="which scheduler to target (default: this machine's)")
+    sh.add_argument("--at", default="09:00", help="local time to run, HH:MM (default 09:00)")
+    sh.add_argument("--weekly", metavar="DAY", type=str.upper, choices=SCHEDULE_WEEKDAYS,
+                    help="run weekly on DAY (MON..SUN) instead of daily")
+    sh.add_argument("--entities", metavar="SCOPE",
+                    help="also capture per-entity scores each run; creates the stack's salt now")
+    sh.add_argument("--write", action="store_true",
+                    help="also write the definition under ~/.meridian/schedule/ (still not registered)")
+    sh.set_defaults(func=cmd_schedule)
+    scs.add_parser("status", help="when each scheduled job last ran, whether it worked, and whether it "
+                                  "has stopped").set_defaults(func=cmd_schedule)
+
     al = sub.add_parser("alerts", help="threshold rules evaluated against this stack's local history")
     als = al.add_subparsers(dest="alerts_cmd", required=True)
     als.add_parser("list", help="configured rules, and whether each can be evaluated").set_defaults(func=cmd_alerts)

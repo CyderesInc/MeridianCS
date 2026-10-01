@@ -5988,7 +5988,8 @@ def test_data_currency(m, monkeypatch, tmp_path, capsys):
     # passthrough (SKILL.md treats `api` output as currency-unknown). The local-history verbs are
     # historical by definition and get their own labels in phase 2 of design/data-currency.md.
     not_ldg = {"api", "refresh-fields", "labels", "check", "selfupdate", "stacks", "report"}
-    history = {"snapshot", "snapshots", "trend", "metrics", "alerts"}
+    # `schedule` writes snapshots and reads its own heartbeat: local history, like `snapshot`.
+    history = {"snapshot", "snapshots", "trend", "metrics", "alerts", "schedule"}
     check("every verb is classified for data currency",
           sorted(declared - stamped - not_ldg - history), [])
     check("...and nothing classified has been removed", sorted((stamped | not_ldg | history) - declared), [])
@@ -8299,3 +8300,494 @@ def test_selfupdate_followups(m, monkeypatch, tmp_path):
     res = m.apply_update(m.check_update(force=True))
     check("a normal-depth install still updates with the check in force",
           (res.get("applied"), res.get("toVersion")), (True, "2.26.0"))
+
+
+# --- Scheduled collection (`schedule run` / `show` / `status`) -----------------------------------
+
+_SCHED_ENV = ("MERIDIAN_FQDN", "MERIDIAN_API_TOKEN", "MERIDIAN_ACTION_TOKEN", "MERIDIAN_CA_BUNDLE",
+              "MERIDIAN_INSECURE_TLS", "MERIDIAN_ALERT_SLACK_WEBHOOK", "MERIDIAN_ALERT_TEAMS_WEBHOOK",
+              "MERIDIAN_ALERT_EMAIL_SMTP_HOST", "MERIDIAN_ALERT_EMAIL_TO")
+
+
+def _sched_home(m, monkeypatch, tmp_path, fqdn="demo.example.com", **cfg):
+    """An isolated ~/.meridian holding one saved stack, and none of the operator's environment."""
+    d = tempfile.mkdtemp(prefix="sched-", dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", d)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(d, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(d, "stacks.json"))
+    monkeypatch.setattr(m, "HOME", str(tmp_path))
+    monkeypatch.setattr(m, "_CFG_CACHE", None)
+    for v in _SCHED_ENV:
+        monkeypatch.delenv(v, raising=False)
+    doc = {"fqdn": fqdn, "api_token": "tok-0000-1234"}
+    doc.update(cfg)
+    with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+    return d
+
+
+def _sched_digest(m, monkeypatch, fqdn="demo.example.com"):
+    def fake(*a, **k):
+        d = _snap_digest()
+        d["stack"] = fqdn
+        return d
+    monkeypatch.setattr(m, "build_digest", fake)
+
+
+def _hb(m, fqdn):
+    return m.load_heartbeat(m._heartbeat_path(fqdn))
+
+
+def test_schedule_run(m, monkeypatch, tmp_path):
+    """`schedule run` is what an OS scheduler runs unattended, so its record of each run is the only
+    way anyone learns it stopped working. Pinned: a heartbeat pair on every path, including die() and
+    a crash; a run on the wrong stack, or with an address and token from different places, writes
+    nothing; and "written" is judged from the history file, so a failure after the append can't hide
+    a snapshot that landed (or invent one that didn't)."""
+    # --- a clean run --------------------------------------------------------------------------
+    d = _sched_home(m, monkeypatch, tmp_path)
+    _sched_digest(m, monkeypatch)
+    res = m.schedule_run("demo.example.com")
+    check("a clean run exits 0", (res["exit"], res["ok"], res["snapshotWritten"]), (0, True, True))
+    hb = _hb(m, "demo.example.com")
+    check("...and records a started and a finished line for the same run",
+          [(e["event"], e["run"] == res["run"]) for e in hb], [("started", True), ("finished", True)])
+    check("...carrying the cadence status needs", hb[-1].get("cadence"), "daily")
+    check("...and one snapshot in the job's own history",
+          len(m.load_snapshots(os.path.join(d, "snapshots.demo.example.com.jsonl"))[0]), 1)
+    check("...with no rules, alerts say so rather than nothing", res.get("alerts"), {"rules": 0})
+
+    # --- the wrong stack is refused, and nothing is written anywhere ----------------------------
+    d = _sched_home(m, monkeypatch, tmp_path, fqdn="other.example.com")
+    _sched_digest(m, monkeypatch, "other.example.com")
+    res = m.schedule_run("demo.example.com")
+    check("a job for another stack is refused", (res["exit"], res.get("refused")), (1, True))
+    check("...naming both stacks",
+          ("other.example.com" in res["error"], "demo.example.com" in res["error"]), (True, True))
+    check("...writing no snapshot for either", [f for f in os.listdir(d) if f.startswith("snapshots.")], [])
+    check("...and the refusal lands in the job's heartbeat, not the active stack's",
+          (len(_hb(m, "demo.example.com")), len(_hb(m, "other.example.com"))), (2, 0))
+
+    # --- an address and a token from different places are refused -------------------------------
+    d = _sched_home(m, monkeypatch, tmp_path, fqdn="other.example.com")
+    _sched_digest(m, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_FQDN", "demo.example.com")
+    res = m.schedule_run("demo.example.com")
+    check("an env address with a config token is refused, though the address matches",
+          (res["exit"], res.get("refused"), "token" in res["error"]), (1, True, True))
+    monkeypatch.delenv("MERIDIAN_FQDN")
+
+    # --- a crash, and a die(), still finish the heartbeat ----------------------------------------
+    for label, boom, want in [
+            ("an exception", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stack timed out")),
+             "stack timed out"),
+            ("a die()", lambda *a, **k: m.die("HTTP 401: token rejected"), "HTTP 401: token rejected")]:
+        _sched_home(m, monkeypatch, tmp_path)
+        monkeypatch.setattr(m, "build_digest", boom)
+        import contextlib, io
+        with contextlib.redirect_stderr(io.StringIO()):
+            res = m.schedule_run("demo.example.com")
+        hb = _hb(m, "demo.example.com")
+        check("%s still writes the finished line" % label, [e["event"] for e in hb], ["started", "finished"])
+        check("...with the reason, and exit 1", (hb[-1].get("error"), hb[-1]["exit"]), (want, 1))
+
+    # --- a failure after the append reports the snapshot it wrote ----------------------------
+    _sched_home(m, monkeypatch, tmp_path)
+    _sched_digest(m, monkeypatch)
+
+    def alerts_crash(problems):
+        raise RuntimeError("alert step crashed")
+    monkeypatch.setattr(m, "_schedule_alerts", alerts_crash)
+    res = m.schedule_run("demo.example.com")
+    check("a crash after the append is 'written with problems', not 'nothing written'",
+          (res["exit"], res["snapshotWritten"], res.get("error")), (3, True, "alert step crashed"))
+
+    # --- written is read from the history file, in both directions ---------------------------
+    real = m.take_snapshot
+
+    def appended_then_crashed(*a, **k):
+        real(*a, **k)
+        raise RuntimeError("stderr write failed after the append")
+    _sched_home(m, monkeypatch, tmp_path)
+    _sched_digest(m, monkeypatch)
+    monkeypatch.setattr(m, "take_snapshot", appended_then_crashed)
+    res = m.schedule_run("demo.example.com")
+    check("a snapshot that landed before a crash is reported written",
+          (res["snapshotWritten"], res["exit"]), (True, 3))
+    _sched_home(m, monkeypatch, tmp_path)
+    monkeypatch.setattr(m, "take_snapshot", lambda *a, **k: {"written": True, "stackDate": "2026-08-05"})
+    res = m.schedule_run("demo.example.com")
+    check("...and a return value claiming one that never landed is not",
+          (res["snapshotWritten"], res["exit"]), (False, 1))
+
+
+def test_schedule_run_alerts(m, monkeypatch, tmp_path):
+    """A scheduler does not inherit the shell where webhook variables were exported, so the likeliest
+    first failure of a scheduled alert is a firing rule with nowhere to go. That must be loud (exit 3,
+    a named reason), and a corrupt rules file must not cost the run its snapshot."""
+    _sched_home(m, monkeypatch, tmp_path)
+    _sched_digest(m, monkeypatch)
+    monkeypatch.setattr(m, "load_alerts", lambda: [{"name": "kev-ceiling"}])
+    monkeypatch.setattr(m, "_current_alert_verdict",
+                        lambda *a, **k: {"summary": {"rules": 1, "firing": 1, "unevaluable": 0},
+                                         "stackDate": "2026-08-05"})
+    monkeypatch.setattr(m, "deliver_alerts", lambda v, **k: {
+        "changed": True, "configured": {"slack": False, "teams": False, "email": False},
+        "sent": {}, "skipped": {}})
+    res = m.schedule_run("demo.example.com")
+    a = res.get("alerts") or {}
+    check("firing with no target in the job's environment exits 3", (res["exit"], res["snapshotWritten"]),
+          (3, True))
+    check("...naming why nothing was sent", "environment" in (a.get("notSentReason") or ""), True)
+    check("...and listing it as a problem", any("not sent" in p for p in res.get("problems", [])), True)
+
+    monkeypatch.setattr(m, "_current_alert_verdict",
+                        lambda *a, **k: {"summary": {"rules": 1, "firing": 0, "unevaluable": 0},
+                                         "stackDate": "2026-08-05"})
+    res = m.schedule_run("demo.example.com")
+    check("nothing firing and no targets is noted, not a failed run (found live: the first evaluation "
+          "is a change, and a stack read only with `alerts eval` would fail every run)",
+          (res["exit"], bool(res["alerts"].get("notSentReason"))), (0, True))
+
+    monkeypatch.setattr(m, "deliver_alerts", lambda v, **k: {
+        "changed": True, "configured": {"slack": True}, "sent": {"slack": {"status": 200}}})
+    res = m.schedule_run("demo.example.com")
+    check("delivered, the same run is clean", (res["exit"], res["alerts"]["sent"]), (0, ["slack"]))
+
+    def corrupt():
+        raise RuntimeError("the alert rules file could not be read")
+    monkeypatch.setattr(m, "load_alerts", corrupt)
+    res = m.schedule_run("demo.example.com")
+    check("an unreadable rules file keeps the snapshot and exits 3",
+          (res["exit"], res["snapshotWritten"]), (3, True))
+    check("...and names the file problem", any("rules file" in p for p in res.get("problems", [])), True)
+
+
+def test_schedule_heartbeat_trim(m, monkeypatch, tmp_path):
+    _sched_home(m, monkeypatch, tmp_path)
+    monkeypatch.setattr(m, "HEARTBEAT_MAX_LINES", 5)
+    for i in range(8):
+        m._append_heartbeat("demo.example.com", {"event": "finished", "n": i})
+    check("the heartbeat is capped, keeping the newest lines",
+          [e["n"] for e in _hb(m, "demo.example.com")], [3, 4, 5, 6, 7])
+
+
+def test_schedule_pythonw_streams(tmp_path):
+    """pythonw.exe starts with no stdout or stderr. print() to None is a no-op, but this file writes
+    to sys.stderr directly, and one of those writes runs after a snapshot is appended -- so without
+    the redirect a run that wrote history reports that it hadn't."""
+    code = ("import sys, importlib.util\n"
+            "sys.stdout = None\nsys.stderr = None\n"
+            "spec = importlib.util.spec_from_file_location('meridian', %r)\n"
+            "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+            "sys.stderr.write('stderr-reached\\n'); sys.stderr.flush()\n"
+            "print('stdout-reached'); sys.stdout.flush()\n" % MERIDIAN_PY)
+    env = dict(os.environ, HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    p = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+    check("importing with no streams does not crash", (p.returncode, p.stderr), (0, ""))
+    log = os.path.join(str(tmp_path), ".meridian", "schedule", "run.log")
+    body = open(log, encoding="utf-8").read() if os.path.exists(log) else ""
+    check("...and both streams land in the owner-only run log",
+          ("stderr-reached" in body, "stdout-reached" in body), (True, True))
+
+
+def test_schedule_show(m, monkeypatch, tmp_path):
+    """The definitions are what decide whether a schedule ever runs, so each OS's is parsed rather
+    than grepped, with paths chosen to break naive quoting. Also pinned: nothing is registered, macOS
+    files never go where launchd would load them by itself, and the command a task will call keeps
+    parsing -- a registered task outlives the release that created it."""
+    import plistlib
+    import xml.etree.ElementTree as ET
+    # --- Windows XML, built directly with hostile paths -------------------------------------
+    py = "C:\\Program Files\\Py & Co\\pythonw.exe"
+    args = ["C:\\Users\\A B\\skill\\scripts\\meridian.py", "schedule", "run", "--expect-stack",
+            "demo.example.com", "--cadence", "daily", "--entities", "C:\\trailing slash\\"]
+    home = "C:\\Users\\A B"
+    xml = m._task_xml("meridiancs-snapshot-demo.example.com", py, args, home, (9, 0), None,
+                      "EXAMPLE\\someone", datetime.datetime(2026, 10, 2, 9, 0))
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    root = ET.fromstring(xml.encode("utf-16"))
+    s = {c.tag.split("}")[1]: c.text for c in root.find("t:Settings", ns)}
+    check("the battery default that skips runs is off", s.get("DisallowStartIfOnBatteries"), "false")
+    check("...and so is the one that kills a run mid-flight", s.get("StopIfGoingOnBatteries"), "false")
+    check("a run missed while asleep catches up", s.get("StartWhenAvailable"), "true")
+    check("overlapping runs are not started", s.get("MultipleInstancesPolicy"), "IgnoreNew")
+    check("the time limit matches what `status` calls killed",
+          s.get("ExecutionTimeLimit"), "PT%dM" % (m.SCHEDULE_TIME_LIMIT_S // 60))
+    check("no password is stored",
+          root.find("t:Principals/t:Principal/t:LogonType", ns).text, "InteractiveToken")
+    ex = root.find("t:Actions/t:Exec", ns)
+    check("the working directory is home, never the install dir (WinError 32 on self-update)",
+          ex.find("t:WorkingDirectory", ns).text, home)
+    check("an interpreter path with spaces and & survives, quoted",
+          ex.find("t:Command", ns).text, '"%s"' % py)
+    check("the arguments round-trip through Windows quoting, trailing backslash included",
+          ex.find("t:Arguments", ns).text, subprocess.list2cmdline(args))
+    check("daily is a daily trigger",
+          root.find("t:Triggers/t:CalendarTrigger/t:ScheduleByDay/t:DaysInterval", ns).text, "1")
+    wk = ET.fromstring(m._task_xml("x", py, args, home, (9, 0), "MON", None,
+                                   datetime.datetime(2026, 10, 2, 9, 0)).encode("utf-16"))
+    check("weekly names the day", wk.find(
+        "t:Triggers/t:CalendarTrigger/t:ScheduleByWeek/t:DaysOfWeek/t:Monday", ns) is not None, True)
+
+    # --- the first run is never in the past -------------------------------------------------
+    check("before the hour, the first run is today",
+          m._next_start((9, 0), datetime.datetime(2026, 10, 1, 8, 0)).date(), datetime.date(2026, 10, 1))
+    check("after it, tomorrow", m._next_start((9, 0), datetime.datetime(2026, 10, 1, 10, 0)).date(),
+          datetime.date(2026, 10, 2))
+
+    # --- macOS: parsed with plistlib, never written into LaunchAgents ------------------------
+    pl = plistlib.loads(m._launchd_plist("lbl", "/usr/bin/python3", args[:7], "/Users/a b", (7, 5), "MON",
+                                         "/Users/a b/.meridian/schedule/launchd.log").encode("utf-8"))
+    check("paths are real arguments, never spliced into the shell string",
+          pl["ProgramArguments"][3:6], ["sh", "/usr/bin/python3", args[0]])
+    check("...and the wrapper execs them", pl["ProgramArguments"][2].endswith('exec "$@"'), True)
+    check("weekday and time", pl["StartCalendarInterval"], {"Hour": 7, "Minute": 5, "Weekday": 1})
+    check("logs stay out of /tmp (they carry PII)", "/tmp" in pl["StandardOutPath"], False)
+
+    # --- systemd: specifiers and quotes escaped; a missed run fires later --------------------
+    svc, timer = m._systemd_units("lbl", '/opt/py "3"/python3', ["/srv/a%b$c/meridian.py"] + args[1:7],
+                                  (9, 0), None)
+    check("ExecStart escapes quotes, % and $",
+          [ln for ln in svc.splitlines() if ln.startswith("ExecStart=")][0].split(" ")[0:2],
+          ['ExecStart="/opt/py', '\\"3\\"/python3"'])
+    check("...including the script path", '"/srv/a%%b$$c/meridian.py"' in svc, True)
+    check("the alert env file is optional", "EnvironmentFile=-%h/.meridian/schedule/alert.env" in svc, True)
+    check("a missed run fires at the next boot", "Persistent=true" in timer, True)
+
+    # --- cron: no MAILTO, % escaped, its own redirect ----------------------------------------
+    line = m._cron_line("/usr/bin/python3", ["/srv/100%/meridian.py"] + args[1:7], (9, 0), None,
+                        '"$HOME/.meridian/schedule/cron.log"')
+    check("no MAILTO (it would silence the user's other jobs)", "MAILTO" in line, False)
+    check("% is escaped, since cron reads it as a newline", "/srv/100\\%/meridian.py" in line, True)
+    check("...and the line redirects its own output", ">> \"$HOME/.meridian/schedule/cron.log\" 2>&1" in line, True)
+    check("minute and hour are in cron's order", line.split(" ")[:5], ["0", "9", "*", "*", "*"])
+
+    # --- the full verb ----------------------------------------------------------------------
+    d = _sched_home(m, monkeypatch, tmp_path)
+    out = m.schedule_show("windows", "09:00", None, None, write=False)
+    check("show writes nothing by default", (out["written"], os.path.isdir(os.path.join(d, "schedule"))),
+          ([], False))
+    check("the label is brand-neutral and per stack",
+          (out["label"], "cyderes" in out["label"].lower()), ("meridiancs-snapshot-demo.example.com", False))
+    cmd = out["command"][2:]
+    check("the command a task will call parses", m.build_parser().parse_args(cmd).schedule_cmd, "run")
+    check("...pinned to the active stack",
+          m.build_parser().parse_args(cmd).expect_stack, "demo.example.com")
+    out = m.schedule_show("windows", "09:00", None, None, write=True)
+    raw = open(out["written"][0], "rb").read()
+    check("Windows XML is written UTF-16, which schtasks requires", raw[:2], b"\xff\xfe")
+    check("...under ~/.meridian/schedule", os.path.dirname(out["written"][0]), os.path.join(d, "schedule"))
+    check("...and register reads that file", out["written"][0] in out["register"], True)
+    check("...but nothing was registered", "not registered" in out["note"].lower(), True)
+    out = m.schedule_show("macos", "09:00", "mon", None, write=True)
+    check("a macOS plist is written beside the others, not into LaunchAgents",
+          ("LaunchAgents" in out["written"][0], os.path.dirname(out["written"][0])),
+          (False, os.path.join(d, "schedule")))
+    check("...and registering is the explicit bootstrap step", "launchctl bootstrap" in out["register"], True)
+    check("weekly is recorded as the cadence", (out["cadence"], out["weekday"]), ("weekly", "MON"))
+
+    # --- what show refuses and warns about ---------------------------------------------------
+    monkeypatch.setenv("MERIDIAN_API_TOKEN", "tok-env")
+    try:
+        m.schedule_show("linux")
+        refused = None
+    except m._ScheduleRefused as e:
+        refused = str(e)
+    check("a stack from env vars is refused (a scheduled job won't have them)",
+          refused is not None and "environment variables" in refused, True)
+    monkeypatch.delenv("MERIDIAN_API_TOKEN")
+    monkeypatch.setenv("MERIDIAN_CA_BUNDLE", "/etc/proxy-root.pem")
+    warns = m.schedule_show("linux").get("warnings") or []
+    check("a CA bundle set only in the shell is warned about", any("MERIDIAN_CA_BUNDLE" in w for w in warns), True)
+    _sched_home(m, monkeypatch, tmp_path, ca_bundle="/etc/proxy-root.pem")
+    monkeypatch.setenv("MERIDIAN_CA_BUNDLE", "/etc/proxy-root.pem")
+    warns = m.schedule_show("linux").get("warnings") or []
+    check("...but not once config.json carries it", any("MERIDIAN_CA_BUNDLE" in w for w in warns), False)
+    for bad in ("9", "25:00", "09:60"):
+        try:
+            m.schedule_show("linux", bad)
+            ok = False
+        except ValueError:
+            ok = True
+        check("--at %s is refused" % bad, ok, True)
+
+
+def test_schedule_status(m, monkeypatch, tmp_path):
+    """`stale` means the job stopped; `lastRunOk` means it ran and failed. A killed run can't write
+    its own finished line, so a started line with none after it is the only evidence. No heartbeat at
+    all is "not scheduled", never "ok"."""
+    t = m._parse_utc("2026-10-02T09:00:00Z")     # a Friday
+    run = lambda ts, ok=True, cad="daily", **kw: dict(  # noqa: E731
+        {"event": "finished", "run": ts, "ts": ts, "ok": ok, "exit": 0 if ok else 1, "cadence": cad,
+         "stack": "demo.example.com"}, **kw)
+    fresh = m.heartbeat_summary([run("2026-10-02T09:00:00Z")], now=t + 3600)
+    check("a run an hour ago is fresh and ok", (fresh["stale"], fresh["lastRunOk"]), (False, True))
+    weekend = m.heartbeat_summary([run("2026-10-02T09:00:00Z")], now=m._parse_utc("2026-10-05T08:00:00Z"))
+    check("a daily job that missed the weekend is not stale on Monday morning", weekend["stale"], False)
+    gone = m.heartbeat_summary([run("2026-10-02T09:00:00Z")], now=t + 4 * 86400)
+    check("four days without a daily run is stale", gone["stale"], True)
+    weekly = m.heartbeat_summary([run("2026-10-02T09:00:00Z", cad="weekly")], now=t + 9 * 86400)
+    check("a weekly job a week and two days on is not stale", weekly["stale"], False)
+    unknown = m.heartbeat_summary([run("2026-10-02T09:00:00Z", cad=None)], now=t + 99 * 86400)
+    check("no recorded cadence never claims stale", unknown["stale"], None)
+    failed = m.heartbeat_summary([run("2026-10-02T09:00:00Z", ok=False, error="HTTP 401: token rejected")],
+                                 now=t + 60)
+    check("a failed run is fresh but not ok, with its reason",
+          (failed["stale"], failed["lastRunOk"], failed.get("lastError")),
+          (False, False, "HTTP 401: token rejected"))
+    killed = m.heartbeat_summary([run("2026-10-01T09:00:00Z"),
+                                  {"event": "started", "run": "k", "ts": "2026-10-02T09:00:00Z",
+                                   "cadence": "daily", "stack": "demo.example.com"}], now=t + 7200)
+    check("a start with no finish, past the time limit, is a killed run",
+          (killed["killedRuns"], killed["lastRunOk"], "never finished" in killed.get("lastError", "")),
+          (1, False, True))
+    running = m.heartbeat_summary([{"event": "started", "run": "r", "ts": "2026-10-02T09:00:00Z",
+                                    "cadence": "daily"}], now=t + 300)
+    check("a start five minutes ago is still running, not killed",
+          (running["running"], running["killedRuns"]), (True, 0))
+
+    d = _sched_home(m, monkeypatch, tmp_path)
+    none = m.collection_status()
+    check("no heartbeat at all is 'not scheduled', with a note", (none["scheduled"], bool(none.get("note"))),
+          (False, True))
+    m._append_heartbeat("demo.example.com", run("2026-10-02T09:00:00Z"))
+    m._append_heartbeat("other.example.com", run("2026-10-02T09:00:00Z", ok=False, refused=True,
+                                                 stack="other.example.com"))
+    st = m.collection_status()
+    check("every job on the machine is listed, the inactive stack's too",
+          sorted((j["stack"], j["activeStack"]) for j in st["jobs"]),
+          [("demo.example.com", True), ("other.example.com", False)])
+    check("...including that it is refusing",
+          [j.get("lastRefused") for j in st["jobs"] if j["stack"] == "other.example.com"], [True])
+    check("the lock sidecar is not read as a job", len(st["jobs"]), 2)
+    check("heartbeats live in ~/.meridian", os.path.exists(os.path.join(d, "heartbeat.demo.example.com.jsonl")), True)
+
+
+def test_schedule_stack_switch_warning(m, monkeypatch, tmp_path, capsys):
+    """Pin + refuse means a scheduled job stops collecting the moment its stack stops being active.
+    The switch is where that has to be said, not a gap found in a trend a month later."""
+    d = _sched_home(m, monkeypatch, tmp_path)
+    with open(os.path.join(d, "stacks.json"), "w", encoding="utf-8") as f:
+        json.dump({"active": "demo", "stacks": {
+            "demo": {"fqdn": "demo.example.com", "api_token": "tok-a"},
+            "other": {"fqdn": "other.example.com", "api_token": "tok-b"}}}, f)
+    monkeypatch.setattr(m, "diagnose_connection", lambda: {"state": "connected"})
+    m._append_heartbeat("demo.example.com", {"event": "finished", "ok": True})
+
+    class A:
+        name = "other"
+    m.cmd_stacks_switch(A())
+    out = json.loads(capsys.readouterr().out)
+    check("switching away from a scheduled stack warns", "demo.example.com" in out.get("scheduleWarning", ""), True)
+    A.name = "demo"
+    m.cmd_stacks_switch(A())
+    out = json.loads(capsys.readouterr().out)
+    check("switching to it (no job for the stack left) does not", "scheduleWarning" in out, False)
+
+
+def test_schedule_collection_blocks(m, monkeypatch, tmp_path, capsys):
+    """The outputs whose value depends on history say whether anything collects it. Before this, "start
+    tracking X" registered a metric nothing ever measured, and the answer read as done. `connect`
+    carries `scheduledCollection` only when a job needs a word, so a healthy machine pays nothing for
+    it at session start."""
+    import argparse as _ap
+    d = _sched_home(m, monkeypatch, tmp_path)
+    monkeypatch.setattr(m, "load_config", lambda: ("demo.example.com", "tok", None))
+    none = m.collection_for()
+    check("no job: not scheduled, with the fix named", (none["scheduled"], "schedule show" in none["hint"]),
+          (False, True))
+    check("...and no claim that a definition exists", "definitionWritten" in none, False)
+    os.makedirs(os.path.join(d, "schedule"))
+    open(os.path.join(d, "schedule", "meridiancs-snapshot-demo.example.com.xml"), "w").close()
+    check("a written definition that never ran is said, so a second isn't offered",
+          m.collection_for().get("definitionWritten"), True)
+    m._append_heartbeat("demo.example.com", {"event": "finished", "run": "r", "ts": m._utc_iso(),
+                                             "ok": True, "cadence": "daily", "stack": "demo.example.com"})
+    got = m.collection_for()
+    check("a job that ran: scheduled, fresh, ok", (got["scheduled"], got["stale"], got["lastRunOk"]),
+          (True, False, True))
+
+    # --- the verbs carry it ------------------------------------------------------------------
+    monkeypatch.setattr(m, "add_metric", lambda *a, **k: ({"name": "kev"}, None))
+    monkeypatch.setattr(m, "load_metrics", lambda: [{"name": "kev"}])
+    m.cmd_metrics(_ap.Namespace(metrics_cmd="add", name="kev", label=None, table="asset", where=["x"],
+                                smart_label=None, derived=False))
+    check("metrics add says whether anything will measure it",
+          json.loads(capsys.readouterr().out).get("collection", {}).get("scheduled"), True)
+    monkeypatch.setattr(m, "add_alert", lambda *a, **k: ({"name": "r"}, None))
+    monkeypatch.setattr(m, "load_alerts", lambda: [{"name": "r"}])
+    m.cmd_alerts(_ap.Namespace(alerts_cmd="add", name="r", condition="coverage-regressed", metric=None,
+                               value=None, include_degraded=False))
+    check("...and so does alerts add", "collection" in json.loads(capsys.readouterr().out), True)
+    m.cmd_trend(_ap.Namespace(since=None, metric=None, table=None, by=None, name_entities=False,
+                              format=None, out=None, derive_where=None, derive_smart_label=None,
+                              derive_label=None, derive_table="asset"))
+    tr = json.loads(capsys.readouterr().out)
+    check("a trend with no history says whether the wait will end",
+          (tr.get("insufficientHistory"), "collection" in tr), (True, True))
+
+    # --- connect: silent when healthy, one entry per job that needs a word -----------------------
+    check("healthy jobs raise nothing at launch", m.schedule_issues(), None)
+    m._append_heartbeat("other.example.com", {"event": "finished", "run": "x", "ts": m._utc_iso(),
+                                              "ok": False, "exit": 1, "refused": True, "cadence": "daily",
+                                              "error": "the active stack is demo.example.com",
+                                              "stack": "other.example.com"})
+    issues = m.schedule_issues()
+    check("a refusing job on another stack is raised", [(i["stack"], i["issue"]) for i in issues],
+          [("other.example.com", "refusing")])
+    old = m._utc_iso(time.time() - 5 * 86400)
+    m._append_heartbeat("demo.example.com", {"event": "finished", "run": "o", "ts": old, "ok": True,
+                                             "cadence": "daily", "stack": "demo.example.com"})
+    # Rewrite demo's heartbeat so its newest attempt is five days old.
+    with open(m._heartbeat_path("demo.example.com"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"event": "finished", "run": "o", "ts": old, "ok": True, "cadence": "daily",
+                            "stack": "demo.example.com"}) + "\n")
+    kinds = {i["stack"]: i["issue"] for i in m.schedule_issues()}
+    check("a daily job silent for five days is raised as stopped", kinds.get("demo.example.com"), "stopped")
+    monkeypatch.setattr(m, "diagnose_connection", lambda: {"state": "connected", "fqdn": "demo.example.com"})
+    monkeypatch.setattr(m, "ldg_rebuild", lambda: {})
+    monkeypatch.setattr(m, "attach_currency", lambda out, *a, **k: out)
+    monkeypatch.setattr(m, "data_currency", lambda *a, **k: {})
+    m.cmd_connect(_ap.Namespace(with_connectors=False))
+    con = json.loads(capsys.readouterr().out)
+    check("connect carries them", len(con.get("scheduledCollection") or []), 2)
+    for n in os.listdir(d):
+        if n.startswith("heartbeat."):
+            os.remove(os.path.join(d, n))
+    m.cmd_connect(_ap.Namespace(with_connectors=False))
+    check("...and nothing at all when there is nothing to say",
+          "scheduledCollection" in json.loads(capsys.readouterr().out), False)
+
+
+def test_schedule_routing():
+    """SKILL.md's routing to `schedule`, and the rules that travel with it -- the same both-directions
+    contract as test_alert_routing. Routing is where the verb's failure modes become reachable from a
+    question: registering a task nobody agreed to, offering a second job beside an unrun one, and
+    letting a stopped job pass for a quiet week. SKILL.md is prose the model follows, so no behaviour
+    test can notice one of those sentences going."""
+    body = open(SKILL_MD, encoding="utf-8").read()
+    flat = " ".join(body.split())
+    check("the verb table routes setting one up", "`meridian.py schedule show`" in body, True)
+    check("...and checking on one", "`meridian.py schedule status`" in body, True)
+    check("a definition is shown and agreed before it is written or registered",
+          "**Show the definition and get a yes before writing it (`--write`) or running its `register` "
+          "command**" in flat, True)
+    check("...because it is persistent configuration", "persistent configuration on the user's machine" in flat, True)
+    check("the outputs that depend on history say whether anything collects", "`collection.scheduled`" in body, True)
+    check("an unrun definition is not doubled", "`definitionWritten: true`" in body, True)
+    check("pin + refuse is said to stack-switchers", "refuses while another is active" in flat, True)
+    check("alerts need the job's environment, not the shell", "in the job's environment, not the shell" in flat, True)
+    check("...and an exit 3 with notSentReason means a firing rule reached nobody", "`notSentReason`" in body, True)
+    check("launch says when a job needs a word", "`scheduledCollection`" in body, True)
+    check("...and nothing when none does", "then you say nothing about scheduling" in flat, True)
+    check("...because a stopped job looks like a quiet week", "looks exactly like a quiet week" in flat, True)
+
+    ref = os.path.join(os.path.dirname(HERE), "references", "scheduling.md")
+    doc = " ".join(open(ref, encoding="utf-8").read().split()) if os.path.isfile(ref) else ""
+    check("scheduling.md says nothing registers itself", "**Nothing registers itself.**" in doc, True)
+    check("...documents pin + refuse", "## One job, one stack" in doc, True)
+    check("...the exit codes", "exits **0** (ok), **1** (nothing written" in doc, True)
+    check("...stale vs lastRunOk", ("**`stale`** means the job has stopped" in doc,
+                                    "**`lastRunOk`** means the job ran and failed" in doc), (True, True))
+    check("...and why cron gets no MAILTO", "does **not** set `MAILTO=\"\"`" in doc, True)

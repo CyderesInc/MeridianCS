@@ -377,6 +377,14 @@ Rules for it:
   missing CrowdStrike?" with CrowdStrike degraded, "who has no MFA?" with the identity connector
   failing — say so alongside the answer instead of presenting the number as complete.
 
+**If `connect` returns `scheduledCollection`, add one line per job after the coverage summary.** Each
+entry is a scheduled snapshot job that has `stopped` (no run for longer than its cadence allows),
+is `failing` (it ran and failed; quote its `error`), or is `refusing` (another stack was active, so
+it wrote nothing). Name the stack and its `lastOkRun`, e.g. "The daily snapshot for <stack> hasn't
+succeeded since <date>: <error>." The key is absent when every job is healthy or none exists, and
+then you say nothing about scheduling. A stopped job looks exactly like a quiet week, which is why
+this line exists. → [scheduling.md](references/scheduling.md)
+
 ## 2. Making calls
 
 Use the bundled helper (works from the skill directory; pass an absolute path otherwise):
@@ -757,6 +765,8 @@ Pick the script from the question shape; for exact flags run `meridian.py <verb>
 | the user names something in **their own** vocabulary ("crown jewels", "PCI scope", "our tier-1 estate") | `meridian.py labels --search "<their term>"` **first** |
 | "what SmartLabels / labels do we have" / "what does our `<label>` label mean" | `meridian.py labels` (`--table user` for user labels; `--search` for one label's full definition) |
 | a periodic/scheduled posture review, or "send me this every week" | `meridian.py digest` → pipe to `report` |
+| "keep tracking this on its own" / "take a snapshot every day" / "set up the schedule" | `meridian.py schedule show` → show the definition; on a yes, `--write` and run its `register` command |
+| "is the scheduled snapshot running" / "did last night's snapshot work" | `meridian.py schedule status` |
 | "how has X changed" / "trend" / "since last month" / "are we getting better" / "what's the direction" | `meridian.py trend` (`--since YYYY-MM-DD`, `--metric <name>`, `--by <field>`) |
 | "**which** assets/users got worse" / "what changed since Friday" / "who's new in the top 10" | `meridian.py trend --name-entities` (needs snapshots taken with `--entities`) |
 | a **shareable trend chart** ("chart this", "trend report for the QBR") | `meridian.py trend ... > t.json` → `report --input t.json --out <name>.pdf` — branded line charts; a break in a line is a not-captured date, and the page says so |
@@ -908,6 +918,21 @@ rule.** Read it when the user asks why, or when you need exact arguments — tho
   was a false alarm) and don't invent a threshold: take it from the current figure and say what you
   picked and why — a rule that fires every day carries no information.
   → [trend-verbs.md](references/trend-verbs.md)
+
+- **Nothing trends or alerts unless something collects, so say when nothing does.** `metrics add`,
+  `alerts add` and a trend with `insufficientHistory` carry a `collection` block. When
+  `collection.scheduled` is `false`, history grows only when someone takes a snapshot. Say that, and
+  offer to schedule one with `schedule show`. **Show the definition and get a yes before writing it
+  (`--write`) or running its `register` command**: a scheduled task is persistent configuration on the
+  user's machine, and nothing registers itself. `definitionWritten: true` means a definition exists but
+  has never run, so ask whether it was registered rather than offering a second one. Say two things
+  when setting one up:
+  - **A job collects for one stack and refuses while another is active.** Mention it to anyone who
+    switches stacks.
+  - **Alerts from a job need their webhook/SMTP variables in the job's environment, not the shell.**
+    The `environment` field says where they go. A `schedule run` that exits 3 with `notSentReason`
+    means a firing rule reached nobody.
+  → [scheduling.md](references/scheduling.md)
 
 - **Route all HTTP through `meridian.py`**, never `curl` or `Invoke-WebRequest` directly: it paces
   every call against the `~/.meridian/.ratelimit` budget to stay under 60/min. That pacer is the

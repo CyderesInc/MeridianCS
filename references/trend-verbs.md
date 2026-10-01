@@ -1,7 +1,7 @@
 # Snapshots, metrics and trends — flags and usage
 
 The verbs that build and read this stack's local history: `snapshot`, `trend`, `metrics`, `digest`,
-`alerts`. Flags for the query verbs are in [scripts.md](scripts.md); the implementation notes are in
+`alerts`, `schedule`. Flags for the query verbs are in [scripts.md](scripts.md); the implementation notes are in
 [internals.md](internals.md); scheduling any of these on a recurring cadence (Windows/macOS/Linux,
 plus the heartbeat-log pattern) is in [scheduling.md](scheduling.md).
 
@@ -29,6 +29,8 @@ can only answer what was already being captured.
 ~/.meridian/snapshots.<sanitised-fqdn>.jsonl   history, append-only, one JSON record per line
 ~/.meridian/metrics.<sanitised-fqdn>.json      the tracked metric definitions
 ~/.meridian/config.json                        also holds entity_salt (see PII posture)
+~/.meridian/heartbeat.<sanitised-fqdn>.jsonl   one started + one finished line per scheduled run
+~/.meridian/schedule/                          generated task definitions, run and scheduler logs
 ```
 
 Per stack, sanitised with the same expression the field and label caches use. `config.json` holds only
@@ -254,17 +256,20 @@ reads a BOM-less UTF-8 CSV as the local codepage and mangles non-ASCII asset nam
 fields are flattened to `a; b` rather than `str(list)`, which would put Python syntax in a cell someone
 is about to sort.
 
-### Scheduling a recurring report
+### Collecting on a schedule
 
-The skill deliberately does **not** schedule anything itself — that belongs to the OS or to Claude
-Code, and a daemon inside a CLI would be the wrong place for it. `digest` exists so the scheduled thing
-is a single command:
+History only accumulates if something takes snapshots on a timer, and there is no backfill. The skill
+runs no daemon. Instead, `schedule` gives the OS one command to run and checks that it keeps running:
 
 ```bash
-python scripts/meridian.py digest > "$HOME/meridian-reports/digest.json" && python scripts/meridian.py report --input "$HOME/meridian-reports/digest.json" --out "$HOME/meridian-reports/Weekly-Posture.pdf" --title "Weekly Meridian Posture Digest"
+python scripts/meridian.py schedule show --write   # task definition for this machine, written under ~/.meridian/schedule/
+python scripts/meridian.py schedule status         # last run, whether it worked, whether the job has stopped
 ```
 
-Full per-OS setup (Windows Task Scheduler, macOS `launchd`, Linux `cron`/`systemd`) and the
-silent-failure gotchas each one has — including the heartbeat-log pattern for noticing a job that
-quietly stopped running — is in [scheduling.md](scheduling.md). Note the output carries customer PII,
-so a scheduled job must write somewhere appropriate — see the data-handling rules.
+The task calls `schedule run`: a fresh snapshot with every defined metric, alert evaluation and
+delivery on change, and a heartbeat pair on every run. It is pinned to one stack and refuses to run
+while another is active. Registering the definition is a separate, explicit step. Per-OS setup, the
+silent-failure defaults each scheduler has, and how alert targets reach a job that doesn't inherit your
+shell are in [scheduling.md](scheduling.md). A recurring PDF is still `digest` piped to `report`,
+chained by hand; its output carries customer PII, so write it somewhere appropriate (see the
+data-handling rules).
