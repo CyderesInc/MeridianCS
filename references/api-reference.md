@@ -82,8 +82,9 @@ entirely and reports as idle — which claims "hasn't ingested" when the truth i
 Read-only calls are safe; POST/PUT/DELETE change the stack — confirm with the user first.
 
 > **Treat every `/connector/profile` response as sensitive.** It can carry connector configuration
-> well beyond connector health — connection targets, service-account identifiers, proxy settings and
-> encrypted secrets. Don't query it directly and don't print it: `meridian.py connectors` reads it
+> well beyond connector health — connection targets, service-account identifiers, proxy settings,
+> encrypted secrets, and uploaded key files (a cloud service-account JSON, a private key) in
+> plaintext. Don't query it directly and don't print it: `meridian.py connectors` reads it
 > and extracts a field allow-list in-process, and the test suite asserts nothing credential-shaped
 > survives into its output.
 

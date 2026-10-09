@@ -263,6 +263,10 @@ python scripts/meridian.py stacks rm prod
   stack you just moved to.
 - Each stack needs a token generated **on that stack** (tokens are per-stack — you can't reuse one).
 - `add` never touches other stacks; the **first** stack added becomes active automatically.
+- `rm` of the active stack makes another saved stack active: **say which** (`active`), since the next
+  answer comes from it. `rm` keeps the stack's history, metrics and alert rules (`keptOnDisk`); add
+  `--purge` only when the user asks to delete them, after saying it can't be undone. Relay a
+  `scheduleWarning` with its `unregister` command.
 - Env vars (`MERIDIAN_*`) still override `config.json`; `switch` warns if they'd mask the change.
 - An existing single-stack `config.json` is migrated into the registry automatically on first use,
   so nothing is lost when the feature is first exercised.

@@ -107,6 +107,7 @@ BRANDED_DOCS = {
     "scripts/tools/make-guide.py",
     "scripts/tools/make-impact.py",
     "scripts/tools/make-brief.py",
+    "scripts/tools/make-getting-started.py",
 }
 
 INTERNAL_DOCS = {"CLAUDE.md"}

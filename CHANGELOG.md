@@ -3,6 +3,19 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.30.0 - 2026-10-09
+
+- **Large inventories download much less.** The skill now asks Meridian to compress its responses: a
+  page of 100 assets shrank 28 times on a test stack. How much faster a question gets depends on how
+  fast your stack itself answers.
+- **A busy stack slows an answer down instead of failing it.** When Meridian says it is getting too many
+  requests, the skill waits as long as it asks, up to a minute, says so, and tries again.
+- **Removing a stack stops using its credentials.** Before, its token stayed in use until you switched.
+  Another saved stack now takes over and the skill says which; its cached data is deleted, and
+  `--purge` deletes its history too.
+- **Private keys are kept out of connector messages.** An error that quoted an uploaded key file, such
+  as a cloud service-account file, is now cleaned by recognising the key itself.
+
 ## 2.29.0 - 2026-10-01
 
 - **Snapshots can now be taken on a schedule.** Ask the skill to keep tracking something and it sets

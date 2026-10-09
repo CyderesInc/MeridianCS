@@ -315,6 +315,15 @@ when the 60/min bucket is actually full; extra fixed sleeps in the multi-call ve
 `list`, `top`, `check`) are pure added latency and were removed for that reason. The `time.sleep(2)`
 inside the request-retry paths is **backoff, not pacing** — leave it alone.
 
+**HTTP 429 is retried on its own budget.** `pace()` keeps *this* process under the limit, so a 429
+almost always means another client on the same stack spent it. `call()` waits for the server's
+`Retry-After` (seconds or an HTTP-date, clamped to 1–60s; 5s then 10s when absent) and retries up
+to `RATE_LIMITED_RETRIES` (2) times. Those retries don't count against the caller's `retries`,
+because callers that pass `retries=0` want a broken stack to fail fast, and a throttled stack isn't
+broken. Each wait prints a note on stderr, since a silent wait of up to a minute reads as a hang.
+After the last retry it fails as `HTTP 429: ...`, which `classify_connect_error()` reads as
+`http_error`.
+
 ## Concurrency
 
 Independent calls go through `parallel()` (stdlib threads, 8 workers max). Anything that doesn't need
@@ -375,6 +384,13 @@ connections would be discarded on every fan-out.
   another host. Tested.
 - **The error string shape is load-bearing**: `classify_connect_error()` parses `HTTP <code>` out of
   it, so keep `"HTTP %s: %s"`.
+- **Responses are requested with `Accept-Encoding: gzip`** and decoded only when `Content-Encoding`
+  says gzip, so a proxy that ignores the header still works. Measured on the demo stack, a
+  100-record asset page drops from 717,276 bytes to 25,467 (28×). The wall clock there didn't
+  change (~11s either way, all of it server time); the gain is on wide stacks where the transfer
+  dominates. `_gunzip` decodes every member, refuses a truncated or corrupt body by name, and caps
+  expansion at `GZIP_MAX_BYTES` (1 GiB) so a small body can't inflate without bound. It uses
+  `zlib` (0.08ms to import) rather than `gzip` (4ms).
 
 Measured effect, on top of the concurrency work: `check` 1.48s → 1.05s, `summary --by` 6.6s → 5.8s,
 `--metrics` 1.12s → 0.74s. Part is the ~79ms handshake saved per reused connection, part is
@@ -447,8 +463,12 @@ verb-flag lookups `scripts.md` serves.
   package and goes outside Cyderes, so its sample prompts use the `<person>` placeholder and its
   claims stay the measured ones from the impact doc — the hand-made original had no generator, which
   is how it fell behind the skill it describes.
-- **The three doc generators take no arguments; each rewrites its one committed PDF.** An output
-  argument once let `make-brief.py SKILL.md` replace SKILL.md with a PDF.
+- `scripts/tools/make-getting-started.py` — regenerates `Cyderes-Meridian-Getting-Started.pdf`, a
+  short install guide for a first-time Mac or Windows user: one platform path end to end, then a few
+  first questions. Unlike the three above, its PDF is **not committed** and does not ship in the
+  package (an install guide inside an install helps no one); regenerate it and hand it out directly.
+- **The doc generators take no arguments; each rewrites its one PDF.** An output argument once let
+  `make-brief.py SKILL.md` replace SKILL.md with a PDF.
 - `scripts/tools/make-package.py` — builds `meridiancs.v<X.Y.Z>.skill.zip` (`--version`), or a
   non-release `meridiancs.<label>.skill.zip` (`--label`) stamped `version: null`, which an install
   refuses to self-update from. The name is always derived, so it always matches `.gitignore`'s

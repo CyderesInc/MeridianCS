@@ -41,7 +41,7 @@ Numeric (Float/Integer) values in --where are sent as real JSON numbers automati
 Output is JSON on stdout.
 """
 import argparse, csv, datetime, http.client, json, os
-import socket, ssl, sys, threading, time
+import socket, ssl, sys, threading, time, zlib   # zlib: 0.08ms, and every data page needs it (gzip)
 # Only urllib.parse: urllib.request/.error were leftovers from the pre-pool urlopen transport, and
 # urllib.request alone drags in email/base64/etc -- ~20-40ms of startup paid by every verb.
 import urllib.parse, re
@@ -1312,6 +1312,60 @@ _POOL_LOCK = threading.Lock()
 _POOL_MAX = 8   # parallel()'s worker ceiling; more idle sockets than that would just be waste
 _TRANSPORT_ERRS = (http.client.HTTPException, ConnectionError, socket.timeout, OSError)
 
+# Responses are asked for gzip-compressed. Measured on the demo stack: a 100-record asset page is
+# 717,276 bytes plain and 25,467 gzipped (28x). Wall clock there was unchanged (~11s either way, all of
+# it server time), so the win is on wide stacks where the transfer dominates -- one stack measured
+# 115MB for a 98-record page. The ceiling bounds what a small compressed body may expand to, so the
+# header can't become an amplifier: no measured page is within two orders of magnitude of it.
+GZIP_MAX_BYTES = 1 << 30
+# HTTP 429 means the stack's budget is spent -- usually by another client on the same stack, since
+# pace() keeps this process under it. That is "come back later", not a fault, so it gets its own small
+# retry budget independent of the caller's `retries` (several callers pass 0 to fail fast on a broken
+# stack, which a throttle isn't). Waits follow Retry-After, clamped: the window is one minute, so a
+# longer ask is either a misconfiguration or a deliberate block, and neither is worth waiting out.
+RATE_LIMITED_RETRIES = 2
+RETRY_AFTER_MAX = 60.0
+
+
+def _gunzip(raw, limit=GZIP_MAX_BYTES):
+    """Decompress a gzip body (every member), refusing a truncated one or one that expands past
+    `limit`. Raises ValueError, which call() treats like any other failed attempt."""
+    out, total = [], 0
+    while raw:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        try:
+            chunk = d.decompress(raw, limit - total + 1)
+        except zlib.error as e:   # not a ValueError subclass, so name it rather than let it escape
+            raise ValueError("compressed response is corrupt: %s" % e)
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("compressed response expands past %d bytes; refusing it" % limit)
+        if not d.eof:
+            raise ValueError("compressed response was truncated")
+        out.append(chunk)
+        raw = d.unused_data
+    return b"".join(out)
+
+
+def _retry_after_seconds(value, attempt):
+    """Seconds to wait before retrying a 429. Retry-After is delta-seconds or an HTTP-date; absent or
+    unreadable falls back to 5s, then 10s. Always within [1, RETRY_AFTER_MAX]."""
+    wait = None
+    if value:
+        v = value.strip()
+        if v.isdigit():
+            wait = float(v)
+        else:
+            try:
+                import email.utils   # only on this path; see the import-cost notes at the top
+                when = email.utils.parsedate_to_datetime(v)
+                wait = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+            except (TypeError, ValueError, IndexError, OverflowError):
+                wait = None
+    if wait is None:
+        wait = 5.0 * attempt
+    return min(max(wait, 1.0), RETRY_AFTER_MAX)
+
 
 def _new_conn(fqdn, ctx):
     return http.client.HTTPSConnection(fqdn, context=ctx, timeout=60)
@@ -1342,7 +1396,7 @@ def _pool_put(key, conn):
 
 
 def _round_trip(fqdn, key, ctx, method, endpoint, data, headers):
-    """One request over a pooled connection. Returns (status, text, location).
+    """One request over a pooled connection. Returns (status, text, location, retry_after).
 
     A pooled socket can be closed by the server or an intermediary between calls, which surfaces as a
     transport error on the NEXT request rather than as a status code. That is the cost of pooling, not
@@ -1355,10 +1409,15 @@ def _round_trip(fqdn, key, ctx, method, endpoint, data, headers):
             conn.request(method, endpoint, body=data, headers=headers)
             resp = conn.getresponse()
             # Drain the body fully, or the socket can't be handed back for reuse.
-            text = resp.read().decode("utf-8", "replace")
-            loc = resp.getheader("Location")
+            raw = resp.read()
+            enc = (resp.getheader("Content-Encoding") or "").strip().lower()
+            loc, retry_after = resp.getheader("Location"), resp.getheader("Retry-After")
             _pool_put(key, conn)
-            return resp.status, text, loc
+            # Decoded only when the server says it encoded: a stack or proxy that ignores the
+            # Accept-Encoding header sends plain JSON, which passes through untouched.
+            if enc == "gzip":
+                raw = _gunzip(raw)
+            return resp.status, raw.decode("utf-8", "replace"), loc, retry_after
         except ssl.SSLCertVerificationError:
             try:
                 conn.close()
@@ -1389,13 +1448,17 @@ def call(method, endpoint, body=None, retries=1):
     headers = {"Content-Type": "application/json",
                "Authorization": "Bearer %s" % token,
                # Some Meridian stacks sit behind Cloudflare, which blocks the default UA (error 1010).
-               "User-Agent": "Mozilla/5.0 (meridian-cli)"}
+               "User-Agent": "Mozilla/5.0 (meridian-cli)",
+               # Setting it here also stops http.client adding its default `identity`. See GZIP_MAX_BYTES.
+               "Accept-Encoding": "gzip"}
     last_err = None
-    for attempt in range(retries + 1):
+    attempts_left, throttled = retries + 1, 0
+    while attempts_left > 0:
+        attempts_left -= 1
         pace()
         redirect_err = None
         try:
-            status, text, loc = _round_trip(fqdn, key, ctx, method, endpoint, data, headers)
+            status, text, loc, retry_after = _round_trip(fqdn, key, ctx, method, endpoint, data, headers)
             # urlopen used to follow redirects transparently; http.client does not, so a trailing-slash
             # or canonicalisation redirect would otherwise become a mystery empty result. Same-host
             # only: these headers carry the API token, and it must never be replayed to another host.
@@ -1409,7 +1472,8 @@ def call(method, endpoint, body=None, retries=1):
                 endpoint = (nxt.path or endpoint) + (("?" + nxt.query) if nxt.query else "")
                 hops += 1
                 pace()
-                status, text, loc = _round_trip(fqdn, key, ctx, method, endpoint, data, headers)
+                status, text, loc, retry_after = _round_trip(fqdn, key, ctx, method, endpoint, data,
+                                                             headers)
         except ssl.SSLCertVerificationError as e:
             # A rejected certificate is a configuration/trust problem, not a blip: retrying just
             # doubles the wait. Say what to do rather than surfacing it as a generic 'unreachable'.
@@ -1437,6 +1501,16 @@ def call(method, endpoint, body=None, retries=1):
                 break
         # Keep this string shape: classify_connect_error() parses "HTTP <code>" out of it.
         last_err = "HTTP %s: %s" % (status, text[:300])
+        if status == 429 and throttled < RATE_LIMITED_RETRIES:
+            # See RATE_LIMITED_RETRIES: a throttle doesn't spend the caller's retries. Said on stderr
+            # because a wait of up to a minute with nothing printed reads as a hang.
+            throttled += 1
+            attempts_left += 1
+            wait = _retry_after_seconds(retry_after, throttled)
+            sys.stderr.write("note: %s is rate-limiting requests (HTTP 429); retrying in %ds.\n"
+                             % (fqdn, int(round(wait))))
+            time.sleep(wait)
+            continue
         if status in (401, 403, 404):
             break  # not transient
         time.sleep(2)
@@ -5594,6 +5668,23 @@ def _schedule_dir():
     return os.path.join(CFG_DIR, "schedule")
 
 
+# The definition file `schedule show` writes for each target, and how to unregister that job. One
+# table so `stacks rm` names the same command `schedule show` printed when the job was set up.
+SCHEDULE_DEFINITION_EXT = {"windows": ".xml", "macos": ".plist", "linux": ".timer", "cron": ".cron"}
+
+
+def _schedule_unregister(target, label):
+    if target == "windows":
+        return "Unregister-ScheduledTask -TaskName %s -Confirm:$false" % _ps_quote(label)
+    if target == "macos":
+        return "launchctl bootout gui/$(id -u)/%s; rm -f ~/Library/LaunchAgents/%s.plist" % (label, label)
+    if target == "linux":
+        units = "~/.config/systemd/user"
+        return ("systemctl --user disable --now %s.timer; rm -f %s/%s.service %s/%s.timer; "
+                "systemctl --user daemon-reload" % (label, units, label, units, label))
+    return "crontab -e, then delete that line."
+
+
 def _heartbeat_path(fqdn):
     # Keyed on the stack the JOB is for, not the active one: a refused run has to land in the history
     # of the job that refused, or the refusal is filed under the stack that caused it.
@@ -5905,7 +5996,7 @@ def collection_for(fqdn=None):
            "hint": "nothing takes snapshots for this stack on a timer, so history grows only when "
                    "someone runs `snapshot`; `schedule show` sets one up"}
     base = os.path.join(_schedule_dir(), SCHEDULE_LABEL_PREFIX + _fqdn_slug(fq))
-    if any(os.path.exists(base + ext) for ext in (".xml", ".plist", ".timer", ".cron")):
+    if any(os.path.exists(base + ext) for ext in SCHEDULE_DEFINITION_EXT.values()):
         # Written, and perhaps registered, but it has never run: offering a second one would be wrong.
         out["definitionWritten"] = True
     return out
@@ -6173,7 +6264,7 @@ def schedule_show(target=None, at="09:00", weekly=None, entities=None, write=Fal
         path = os.path.join(sdir, files[0]["name"])
         out["register"] = ("Register-ScheduledTask -TaskName %s -Xml (Get-Content -LiteralPath %s -Raw)"
                            % (_ps_quote(label), _ps_quote(path)))
-        out["unregister"] = "Unregister-ScheduledTask -TaskName %s -Confirm:$false" % _ps_quote(label)
+        out["unregister"] = _schedule_unregister("windows", label)
         out["status"] = ("Get-ScheduledTaskInfo -TaskName %s | Select-Object LastRunTime, "
                          "LastTaskResult, NextRunTime" % _ps_quote(label))
         out["shell"] = "powershell"
@@ -6191,7 +6282,7 @@ def schedule_show(target=None, at="09:00", weekly=None, entities=None, write=Fal
         # that folder at the next login, so writing there would register the job by itself.
         out["register"] = ("mkdir -p ~/Library/LaunchAgents && cp %s %s && launchctl bootstrap "
                            "gui/$(id -u) %s" % (_sh_quote(path), agent, agent))
-        out["unregister"] = "launchctl bootout gui/$(id -u)/%s; rm -f %s" % (label, agent)
+        out["unregister"] = _schedule_unregister("macos", label)
         out["status"] = "launchctl print gui/$(id -u)/%s" % label
     elif target == "linux":
         svc, timer = _systemd_units(label, python, args, hm, weekday)
@@ -6201,8 +6292,7 @@ def schedule_show(target=None, at="09:00", weekly=None, entities=None, write=Fal
                            "systemctl --user enable --now %s.timer"
                            % (units, _sh_quote(os.path.join(sdir, label + ".service")),
                               _sh_quote(os.path.join(sdir, label + ".timer")), units, label))
-        out["unregister"] = ("systemctl --user disable --now %s.timer; rm -f %s/%s.service %s/%s.timer; "
-                             "systemctl --user daemon-reload" % (label, units, label, units, label))
+        out["unregister"] = _schedule_unregister("linux", label)
         out["status"] = "systemctl --user list-timers %s.timer; journalctl --user -u %s.service" % (label, label)
         out["linger"] = ("A user timer stops when you log out. To keep collecting while logged out, run "
                          "`loginctl enable-linger \"$USER\"`.")
@@ -6211,7 +6301,7 @@ def schedule_show(target=None, at="09:00", weekly=None, entities=None, write=Fal
         files.append({"name": label + ".cron", "content": _cron_line(python, args, hm, weekday, log) + "\n"})
         out["register"] = ("crontab -e, then add the line from %s. Nothing here edits your crontab."
                            % os.path.join(sdir, files[0]["name"]))
-        out["unregister"] = "crontab -e, then delete that line."
+        out["unregister"] = _schedule_unregister("cron", label)
         out["status"] = "cron keeps no run history; `schedule status` reads the job's own heartbeat."
     if target != "windows":
         out["environment"] = (
@@ -8128,13 +8218,22 @@ def _short(v, n=200):
 # regardless of source. Scrub BEFORE _short(): truncating first can leave half a value behind.
 REDACTED = "[redacted]"
 _SCRUB_PATTERNS = (
+    # A PEM private key, whatever its type (RSA, EC, OPENSSH, ENCRYPTED, plain PKCS#8), JSON-escaped
+    # or not, and to the end of the text when the message was cut before the END line. Connector
+    # file-upload fields (a GCP service-account JSON, an OCI or DocuSign key file) are not
+    # encrypt-marked and come back from the API as plaintext keys, and a field name like `json_file`
+    # gives the key-name collector nothing to go on, so this matches the key by its own shape.
+    # First, so the credential-name pattern below never splits a block it then can't recognise.
+    (re.compile(r"-----BEGIN ((?:[A-Z0-9]+ )*)PRIVATE KEY-----.*?(?:-----END \1PRIVATE KEY-----|\Z)",
+                re.S),
+     r"-----BEGIN \1PRIVATE KEY-----" + REDACTED + r"-----END \1PRIVATE KEY-----"),
     # scheme://user:pass@host -> scheme://[redacted]@host
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@"), r"\1" + REDACTED + "@"),
     # Authorization-header shapes
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 " + REDACTED),
     # key=value / key: value for credential-named keys, quoted or not
     (re.compile(r"(?i)\b((?:client[_-]?)?secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
-                r"secret[_-]?key|(?:access|refresh|auth|api|session)?[_-]?token)"
+                r"secret[_-]?key|private[_-]?key|(?:access|refresh|auth|api|session)?[_-]?token)"
                 r"(\s*[=:]\s*)([\"']?)[^\s\"'&,;)}]+"), r"\1\2\3" + REDACTED),
 )
 # Key names (split on _ - and camelCase) whose string values are credential-shaped. Anything under
@@ -8155,6 +8254,18 @@ def _key_parts(k):
     return {p for p in re.split(r"[_\-\s.]+", k.lower()) if p}
 
 
+def _json_object(s):
+    """`s` parsed, if it is a JSON object stored as a string; otherwise None. Cheap on the common
+    case: anything not starting with "{" is never handed to the parser."""
+    if not s.lstrip().startswith("{"):
+        return None
+    try:
+        v = json.loads(s)
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
 def _profile_secrets(obj, _inherit=False):
     """Credential-shaped string values anywhere in one raw connector profile, for _scrub().
 
@@ -8171,9 +8282,15 @@ def _profile_secrets(obj, _inherit=False):
     elif isinstance(obj, list):
         for v in obj:
             found |= _profile_secrets(v, _inherit)
-    elif _inherit and isinstance(obj, str):
+    elif isinstance(obj, str):
+        inner = _json_object(obj)
+        if inner is not None:
+            # A JSON document stored as a string -- a GCP service-account file uploaded into
+            # `json_file`. Its own key names (`client_email`, `private_key`) say what is sensitive
+            # even though the outer field's name says nothing, so read it as the object it is.
+            return _profile_secrets(inner, _inherit)
         v = obj.strip()
-        if len(v) >= 4 and v.lower() not in _SECRET_VALUE_SKIP:
+        if _inherit and len(v) >= 4 and v.lower() not in _SECRET_VALUE_SKIP:
             found.add(v)
             if "://" in v:   # also the host and user a URL carries, which errors quote bare
                 u = urllib.parse.urlsplit(v)
@@ -9261,21 +9378,118 @@ def cmd_stacks_switch(a):
     jout(result)
 
 
+# Files under CFG_DIR that belong to one stack, named by its fqdn slug. Caches rebuild themselves on
+# the next query, so removing a stack always deletes them. History, and the metric and alert rules
+# written for it, can't be rebuilt -- the API holds no history -- so those go only with --purge.
+# test_stacks_rm reads every per-stack path this file builds and fails on one missing from here.
+STACK_CACHE_FILES = ("topcache.%s.json", "rescache.%s.json", "fields.%s.json", "labels.%s.json")
+STACK_HISTORY_FILES = ("snapshots.%s.jsonl", "metrics.%s.json", "alerts.%s.json",
+                       "alertstate.%s.json", "heartbeat.%s.jsonl", "heartbeat.%s.jsonl.lock",
+                       # A scheduled job's own output on macOS and cron; Windows keeps none.
+                       "schedule/launchd.%s.log", "schedule/cron.%s.log")
+# The config.json keys mirror_active_to_config owns. Anything else there was set by hand.
+_REGISTRY_CONFIG_KEYS = ("fqdn", "api_token", "action_token", "entity_salt", "insecure_tls")
+
+
+def _stack_files(fqdn, kinds):
+    """The files of `kinds` that exist for `fqdn`, as names relative to CFG_DIR."""
+    slug = _fqdn_slug(fqdn)
+    return [k % slug for k in kinds if os.path.exists(os.path.join(CFG_DIR, k % slug))]
+
+
+def _delete_stack_files(names):
+    """(deleted, failed) -- best effort per file, so one locked file can't stop the rest."""
+    deleted, failed = [], []
+    for n in names:
+        try:
+            os.remove(os.path.join(CFG_DIR, n))
+            deleted.append(n)
+        except OSError:
+            failed.append(n)
+    return deleted, failed
+
+
 def cmd_stacks_rm(a):
+    global _CFG_CACHE
     reg = load_stacks()
     if a.name not in reg.get("stacks", {}):
         die("No stack named '%s'." % a.name)
+    entry = reg["stacks"][a.name] or {}
+    fqdn = _clean_fqdn(entry.get("fqdn") or "")
+    # Files are keyed on the fqdn, not the stack name, so a second name for the same stack shares
+    # them. Deleting them would take that stack's history too; refuse before anything changes.
+    shared = sorted(n for n, s in reg["stacks"].items()
+                    if n != a.name and _clean_fqdn((s or {}).get("fqdn") or "") == fqdn)
+    if getattr(a, "purge", False) and shared:
+        die("Not purged: stack(s) %s use the same address (%s) and share its files. Run without "
+            "--purge to remove only '%s'." % (", ".join(shared), fqdn, a.name))
     was_active = reg.get("active") == a.name
     del reg["stacks"][a.name]
     if was_active:
         reg["active"] = next(iter(reg["stacks"]), None)
     save_stacks(reg)
-    note = "Removed '%s'." % a.name
-    if was_active:
-        note += (" It was active; run `stacks switch %s` to point config.json at another stack." % reg["active"]
-                 if reg.get("active") else " No stacks remain active - config.json is unchanged.")
-    jout({"removed": a.name, "wasActive": was_active, "active": reg.get("active"),
-                      "storePath": STACKS_PATH, "note": note})
+    result = {"removed": a.name, "fqdn": fqdn, "wasActive": was_active, "active": reg.get("active"),
+              "storePath": STACKS_PATH}
+    notes = ["Removed '%s'." % a.name]
+
+    # config.json is what every query reads. It used to keep the removed stack's token whenever that
+    # stack was active -- indefinitely, if no stacks remained -- while the registry named a different
+    # stack as active. Tokens are compared in-process and never printed.
+    try:
+        with open(CFG_PATH, encoding="utf-8-sig") as f:
+            cfg = json.load(f) or {}
+    except Exception:
+        cfg = {}
+    holds = (bool(fqdn) and _clean_fqdn(cfg.get("fqdn") or "") == fqdn
+             and cfg.get("api_token") == entry.get("api_token"))
+    if (was_active or holds) and reg.get("active"):
+        mirror_active_to_config(reg)
+        result["config"] = "switched"
+        nxt = reg["stacks"][reg["active"]] or {}
+        notes.append("Queries now go to '%s' (%s), the active stack." % (reg["active"], nxt.get("fqdn")))
+        warn = _env_override_warning()
+        if warn:
+            result["warning"] = warn
+    elif holds:
+        for k in _REGISTRY_CONFIG_KEYS:
+            cfg.pop(k, None)
+        _private_write(CFG_PATH, cfg)
+        _CFG_CACHE = None
+        result["config"] = "cleared"
+        notes.append("No stacks remain; its credentials were removed from config.json.")
+    else:
+        result["config"] = "unchanged"
+
+    if fqdn and shared:
+        notes.append("Its files are kept: %s still use(s) %s." % (", ".join(shared), fqdn))
+    elif fqdn:
+        result["cachesDeleted"], failed = _delete_stack_files(_stack_files(fqdn, STACK_CACHE_FILES))
+        history = _stack_files(fqdn, STACK_HISTORY_FILES)
+        if getattr(a, "purge", False):
+            result["purged"], more = _delete_stack_files(history)
+            failed += more
+            if result["purged"]:
+                notes.append("Its snapshot history, metrics, alert rules and heartbeat were deleted.")
+        elif history:
+            result["keptOnDisk"] = history
+            notes.append("Its history, metrics and alert rules are kept in %s; `stacks rm` with "
+                         "--purge deletes them. Its entity salt went with it, so if the stack is "
+                         "re-added, new entity snapshots can't be compared with the kept ones."
+                         % CFG_DIR)
+        if failed:
+            result["notDeleted"] = failed
+        # A job pinned to this stack keeps firing and refusing, and its next run writes a fresh
+        # heartbeat. Named here so it gets unregistered rather than found as a failure later.
+        sched = SCHEDULE_LABEL_PREFIX + _fqdn_slug(fqdn)
+        for target, ext in SCHEDULE_DEFINITION_EXT.items():
+            if os.path.exists(os.path.join(_schedule_dir(), sched + ext)):
+                result["scheduleWarning"] = ("A scheduled job ('%s') was set up for this stack. If it "
+                                             "is registered, every run fails from now on; unregister "
+                                             "it." % sched)
+                result["unregister"] = _schedule_unregister(target, sched)
+                break
+    result["note"] = " ".join(notes)
+    jout(result)
 
 
 def cmd_check(a):
@@ -10676,7 +10890,11 @@ def build_parser():
     sw = sksub.add_parser("switch", help="make a saved stack active and validate it")
     sw.add_argument("name"); sw.set_defaults(func=cmd_stacks_switch)
     sr = sksub.add_parser("rm", help="remove a saved stack")
-    sr.add_argument("name"); sr.set_defaults(func=cmd_stacks_rm)
+    sr.add_argument("name")
+    sr.add_argument("--purge", action="store_true",
+                    help="also delete this stack's snapshot history, metrics, alert rules and "
+                         "heartbeat (cannot be undone; caches are always deleted)")
+    sr.set_defaults(func=cmd_stacks_rm)
 
     s = sub.add_parser("report", help="branded PDF from any verb's JSON -- the shareable deliverable")
     s.add_argument("--input", nargs="+",

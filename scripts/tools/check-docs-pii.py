@@ -13,7 +13,7 @@ script never opened.
 
 So there are now two scopes, and they run different pattern sets on purpose:
 
-  * **The three generators** get the full set, ALLCAPS included. They are prose-light, so a
+  * **The doc generators** get the full set, ALLCAPS included. They are prose-light, so a
     name-shaped ALLCAPS token there is nearly always a real name.
   * **Every tracked text file** gets the high-signal patterns only. ALLCAPS is deliberately NOT
     run repo-wide: measured over this tree it produced 80+ matches, essentially all of them
@@ -47,13 +47,14 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL = os.path.dirname(os.path.dirname(HERE))
-GENERATORS = [os.path.join(HERE, f) for f in ("make-impact.py", "make-guide.py", "make-brief.py")]
+GENERATORS = [os.path.join(HERE, f) for f in ("make-impact.py", "make-guide.py", "make-brief.py",
+                                              "make-getting-started.py")]
 
 
 def derived_public_tree():
     """True when this is make-public.py's OUTPUT rather than the source repo.
 
-    The public build drops design/ and the three branded-doc generators together, so their joint
+    The public build drops design/ and the branded-doc generators together, so their joint
     absence is the signal -- and joint is the load-bearing word. A generator missing from the
     source repo means someone deleted a document that then silently stopped being checked, which
     has to stay a hard failure; a generator missing beside an absent design/ is the derivation

@@ -425,5 +425,5 @@ also clears the SmartLabel and result caches, as `refresh-fields` does.
   (profiles only). See below.
 
 Release/packaging maintenance scripts (`make-impact.py`, `make-guide.py`, `make-brief.py`,
-`make-package.py`) are not verbs a user's question ever routes to — see
+`make-getting-started.py`, `make-package.py`) are not verbs a user's question ever routes to — see
 [internals.md](internals.md#maintenance-tools-not-verbs).

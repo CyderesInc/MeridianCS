@@ -2064,7 +2064,7 @@ def test_transport(m, monkeypatch):
 
     def off_host(fqdn, key, ctx, method, endpoint, data, headers):
         seen.append(endpoint)
-        return 302, "", "https://evil.example/steal"
+        return 302, "", "https://evil.example/steal", None
 
     monkeypatch.setattr(m, "_round_trip", off_host)
     try:
@@ -2081,15 +2081,15 @@ def test_transport(m, monkeypatch):
     def same_host(fqdn, key, ctx, method, endpoint, data, headers):
         hops.append(endpoint)
         if endpoint == "/CMDB/v2/x":
-            return 301, "", "/CMDB/v2/y"
-        return 200, '{"ok": true}', None
+            return 301, "", "/CMDB/v2/y", None
+        return 200, '{"ok": true}', None, None
 
     monkeypatch.setattr(m, "_round_trip", same_host)
     check("same-host redirect followed", m.call("GET", "/CMDB/v2/x", retries=0), {"ok": True})
     check("...to the redirected path", hops, ["/CMDB/v2/x", "/CMDB/v2/y"])
 
     # A non-2xx keeps the string shape classify_connect_error() parses.
-    monkeypatch.setattr(m, "_round_trip", lambda *a, **k: (403, '{"code":403001}', None))
+    monkeypatch.setattr(m, "_round_trip", lambda *a, **k: (403, '{"code":403001}', None, None))
     try:
         m.call("GET", "/CMDB/v2/x", retries=0)
         check("403 raises", False, True)
@@ -2121,6 +2121,151 @@ def test_transport(m, monkeypatch):
     check("pool won't reuse across a TLS-posture change",
           m._pool_get(("a.example", True), "a.example", None) is d3, False)
     m._POOL.clear()
+
+
+def test_transport_gzip(m, monkeypatch):
+    """Responses are requested gzipped and decoded only when the server says it encoded them. Driven
+    through the real _round_trip with a fake connection, so the header, the Content-Encoding check
+    and the decode are exercised together rather than each against a stub of the others."""
+    import gzip
+    monkeypatch.setattr(m, "load_config", lambda: ("stack.example", "tok", None))
+    monkeypatch.setattr(m, "pace", lambda: None)
+    monkeypatch.setattr(m, "_ssl_context", lambda: None)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    sent = []
+
+    class Resp:
+        def __init__(self, body, enc):
+            self.status, self._body, self._enc = 200, body, enc
+
+        def read(self):
+            return self._body
+
+        def getheader(self, name):
+            return self._enc if name == "Content-Encoding" else None
+
+    def serve(body, enc):
+        class Conn:
+            def request(self, method, endpoint, body=None, headers=None):
+                sent.append(dict(headers))
+
+            def getresponse(self):
+                return Resp(body, enc)
+
+            def close(self):
+                pass
+        monkeypatch.setattr(m, "_pool_get", lambda *a: Conn())
+        monkeypatch.setattr(m, "_pool_put", lambda *a: None)
+
+    page = json.dumps({"totalRecords": 2, "data": [{"Asset_Name": "a"}, {"Asset_Name": "b"}]})
+    serve(gzip.compress(page.encode()), "gzip")
+    check("a gzipped page decodes to the same JSON", m.call("POST", "/CMDB/v2/data/cmdb", {}),
+          json.loads(page))
+    check("...and gzip was asked for", sent[-1].get("Accept-Encoding"), "gzip")
+    check("...alongside the token, which still goes", sent[-1].get("Authorization"), "Bearer tok")
+
+    # A stack or proxy that ignores the header sends plain JSON: it must pass through untouched.
+    serve(page.encode(), None)
+    check("a plain response is unaffected", m.call("POST", "/CMDB/v2/data/cmdb", {}), json.loads(page))
+    # The header value is case-insensitive and may carry whitespace.
+    serve(gzip.compress(page.encode()), " GZIP ")
+    check("Content-Encoding is matched case-insensitively", m.call("GET", "/CMDB/v2/x"),
+          json.loads(page))
+    # RFC 1952 allows several members back to back; a decoder that stops after one returns half a page.
+    half = len(page) // 2
+    serve(gzip.compress(page[:half].encode()) + gzip.compress(page[half:].encode()), "gzip")
+    check("a multi-member body decodes whole", m.call("GET", "/CMDB/v2/x"), json.loads(page))
+
+    # Truncated or corrupt: an error naming the cause, never a partial page parsed as a short result.
+    for label, body, word in (("truncated", gzip.compress(page.encode())[:-12], "truncated"),
+                              # compression method 7: only 8 (deflate) exists
+                              ("corrupt", b"\x1f\x8b\x07\x00\x00\x00\x00\x00\x00\x03abc", "corrupt")):
+        serve(body, "gzip")
+        try:
+            m.call("GET", "/CMDB/v2/x", retries=0)
+            check("%s gzip raises" % label, False, True)
+        except RuntimeError as e:
+            check("%s gzip names the cause" % label, word in str(e), True)
+
+    # The expansion ceiling: a small body that inflates past the limit is refused, and exactly at
+    # the limit is fine -- so the bound is the limit, not one byte under it.
+    bomb = gzip.compress(b"\0" * 4096)
+    check("the bomb is small on the wire", len(bomb) < 200, True)
+    check("exactly at the limit decodes", len(m._gunzip(bomb, limit=4096)), 4096)
+    try:
+        m._gunzip(bomb, limit=4095)
+        check("past the limit raises", False, True)
+    except ValueError as e:
+        check("past the limit is refused by name", "expands past 4095" in str(e), True)
+    # Across members too: the ceiling is on the whole body, not each member.
+    try:
+        m._gunzip(bomb + bomb, limit=6000)
+        check("two members past the limit raise", False, True)
+    except ValueError:
+        check("the limit spans members", True, True)
+    check("the shipped ceiling is far above any measured page (115MB)",
+          m.GZIP_MAX_BYTES >= 1 << 30, True)
+
+
+def test_transport_rate_limited(m, monkeypatch, capsys):
+    """HTTP 429 is a throttle, not a fault: it is retried after Retry-After even when the caller
+    passed retries=0, a bounded number of times, with a note on stderr so the wait isn't a silent
+    hang. Past that it fails with the usual "HTTP <code>" string."""
+    monkeypatch.setattr(m, "load_config", lambda: ("stack.example", "tok", None))
+    monkeypatch.setattr(m, "pace", lambda: None)
+    monkeypatch.setattr(m, "_ssl_context", lambda: None)
+    slept = []
+    monkeypatch.setattr(m.time, "sleep", lambda s: slept.append(s))
+
+    def script(*replies):
+        it = iter(replies)
+        calls = []
+
+        def rt(*a):
+            calls.append(a[4])
+            return next(it)
+        monkeypatch.setattr(m, "_round_trip", rt)
+        return calls
+
+    calls = script((429, "slow down", None, "3"), (200, '{"ok": true}', None, None))
+    check("a 429 is retried even with retries=0", m.call("GET", "/CMDB/v2/x", retries=0), {"ok": True})
+    check("...after the wait the server asked for", slept, [3.0])
+    check("...exactly once", len(calls), 2)
+    err = capsys.readouterr().err
+    check("...and says so on stderr", "HTTP 429" in err and "3s" in err, True)
+
+    # A throttle doesn't spend the caller's retries: 429 then a 500 then success, with retries=1.
+    slept.clear()
+    calls = script((429, "", None, "1"), (500, "boom", None, None), (200, '{"ok": 1}', None, None))
+    check("a throttle leaves the caller's retry intact", m.call("GET", "/CMDB/v2/x", retries=1), {"ok": 1})
+    check("...so all three round trips happen", len(calls), 3)
+
+    # Bounded: a stack that keeps answering 429 fails after RATE_LIMITED_RETRIES extra tries.
+    slept.clear()
+    calls = script(*[(429, "still busy", None, "2")] * 10)
+    try:
+        m.call("GET", "/CMDB/v2/x", retries=0)
+        check("a persistent 429 raises", False, True)
+    except RuntimeError as e:
+        check("a persistent 429 keeps the HTTP <code> shape", str(e).startswith("HTTP 429:"), True)
+        check("...which classifies as an http_error", m.classify_connect_error(str(e)), ("http_error", 429))
+    check("...after the bounded number of tries", len(calls), 1 + m.RATE_LIMITED_RETRIES)
+    capsys.readouterr()
+
+    # Retry-After parsing: delta-seconds, HTTP-date, absent, garbage -- always within [1, MAX].
+    now = datetime.datetime.now(datetime.timezone.utc)
+    future = (now + datetime.timedelta(seconds=30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    past = (now - datetime.timedelta(hours=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    ra = m._retry_after_seconds
+    check("delta-seconds is used as given", ra("7", 1), 7.0)
+    check("a long ask is clamped to the one-minute window", ra("3600", 1), m.RETRY_AFTER_MAX)
+    check("zero still waits a second", ra("0", 1), 1.0)
+    check("an HTTP-date in the future waits until then", 25 <= ra(future, 1) <= 30, True)
+    check("an HTTP-date in the past waits the minimum", ra(past, 1), 1.0)
+    check("absent backs off 5s", ra(None, 1), 5.0)
+    check("...then 10s", ra(None, 2), 10.0)
+    check("garbage falls back like absent", ra("soon-ish", 1), 5.0)
+    check("a negative number is not delta-seconds", ra("-5", 1), 5.0)
 
 
 def test_pace(m, monkeypatch, tmp_path):
@@ -8791,3 +8936,216 @@ def test_schedule_routing():
     check("...stale vs lastRunOk", ("**`stale`** means the job has stopped" in doc,
                                     "**`lastRunOk`** means the job ran and failed" in doc), (True, True))
     check("...and why cron gets no MAILTO", "does **not** set `MAILTO=\"\"`" in doc, True)
+
+
+def test_stacks_rm(m, monkeypatch, capsys, tmp_path):
+    """`stacks rm` used to leave the removed stack's token in config.json whenever that stack was
+    active -- indefinitely, once no stacks remained -- while the registry named another stack as
+    active, and it left every per-stack file behind. Caches now always go, history only on --purge,
+    and config.json follows the registry."""
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp, "stacks.json"))
+    monkeypatch.setattr(m, "_CFG_CACHE", None)
+    for v in ("MERIDIAN_FQDN", "MERIDIAN_API_TOKEN", "MERIDIAN_ACTION_TOKEN"):
+        monkeypatch.delenv(v, raising=False)
+
+    def add(name, fqdn, token):
+        class A:
+            pass
+        A.name, A.fqdn, A.token, A.action_token = name, fqdn, token, None
+        m.cmd_stacks_add(A())
+        capsys.readouterr()
+
+    def rm(name, purge=False):
+        class A:
+            pass
+        A.name, A.purge = name, purge
+        m.cmd_stacks_rm(A())
+        out = capsys.readouterr().out
+        return json.loads(out), out
+
+    def seed(fqdn, kinds):
+        os.makedirs(os.path.join(tmp, "schedule"), exist_ok=True)
+        names = [k % m._fqdn_slug(fqdn) for k in kinds]
+        for n in names:
+            with open(os.path.join(tmp, n), "w") as f:
+                f.write("{}")
+        return names
+
+    def config():
+        with open(m.CFG_PATH, encoding="utf-8-sig") as f:
+            return json.load(f)
+
+    def exists(n):
+        return os.path.exists(os.path.join(tmp, n))
+
+    # --- removing the ACTIVE stack while another remains ------------------------------------------
+    add("alpha", "alpha.example.com", "tok-alpha-1111")
+    add("beta", "beta.example.com", "tok-beta-2222")
+    caches = seed("alpha.example.com", m.STACK_CACHE_FILES)
+    history = seed("alpha.example.com", m.STACK_HISTORY_FILES)
+    beta_files = seed("beta.example.com", m.STACK_CACHE_FILES + m.STACK_HISTORY_FILES)
+    sched = m.SCHEDULE_LABEL_PREFIX + "alpha.example.com"
+    seed("alpha.example.com", ("schedule/" + m.SCHEDULE_LABEL_PREFIX + "%s.xml",))
+    check("alpha is active before removal", config().get("api_token"), "tok-alpha-1111")
+    out, raw = rm("alpha")
+    check("config.json follows the registry to the remaining stack", config().get("api_token"),
+          "tok-beta-2222")
+    check("...at its address", config().get("fqdn"), "beta.example.com")
+    check("...and the removed token is gone from it",
+          "tok-alpha" in open(m.CFG_PATH, encoding="utf-8").read(), False)
+    check("the result says config.json switched", out["config"], "switched")
+    check("...names the stack queries now go to", out["active"] == "beta" and "'beta'" in out["note"],
+          True)
+    check("no token appears in the output", "tok-alpha" in raw or "tok-beta" in raw, False)
+    check("caches are always deleted", sorted(out["cachesDeleted"]), sorted(caches))
+    check("...and gone from disk", [n for n in caches if exists(n)], [])
+    check("history is kept without --purge", sorted(out["keptOnDisk"]), sorted(history))
+    check("...and still on disk", all(exists(n) for n in history), True)
+    check("...with a note on how to delete it and on the lost salt",
+          "--purge" in out["note"] and "entity salt" in out["note"], True)
+    check("the other stack's files are untouched", all(exists(n) for n in beta_files), True)
+    check("a scheduled job for the stack is flagged", sched in out.get("scheduleWarning", ""), True)
+    check("...with the command that unregisters it on this target",
+          out.get("unregister"), m._schedule_unregister("windows", sched))
+    check("schedule show and stacks rm build the same unregister command",
+          m._schedule_unregister("windows", sched), "Unregister-ScheduledTask -TaskName '%s' "
+          "-Confirm:$false" % sched)
+
+    # --- removing the LAST stack, with --purge ----------------------------------------------------
+    cfg = config()
+    cfg["hand_set"] = "kept"   # a key the registry doesn't own
+    m._private_write(m.CFG_PATH, cfg)
+    out, raw = rm("beta", purge=True)
+    cfg = config()
+    check("the last stack's credentials are removed from config.json",
+          [k for k in m._REGISTRY_CONFIG_KEYS if k in cfg], [])
+    check("...keeping what was set by hand", cfg.get("hand_set"), "kept")
+    check("the result says config.json was cleared", out["config"], "cleared")
+    check("no stack is active", out["active"], None)
+    check("--purge deletes the history", sorted(out["purged"]),
+          sorted(k % "beta.example.com" for k in m.STACK_HISTORY_FILES))
+    check("...from disk", [n for n in beta_files if exists(n)], [])
+    check("connect now reports not_configured, not the removed stack",
+          m.diagnose_connection()["state"], "not_configured")
+
+    # --- two names for one address share files: --purge is refused before anything changes --------
+    add("gamma", "gamma.example.com", "tok-gamma-3333")
+    add("gamma2", "gamma.example.com", "tok-gamma-4444")
+    shared = seed("gamma.example.com", m.STACK_CACHE_FILES + m.STACK_HISTORY_FILES)
+    with pytest.raises(SystemExit):
+        rm("gamma2", purge=True)
+    capsys.readouterr()
+    check("a refused purge leaves the registry alone", "gamma2" in m.load_stacks()["stacks"], True)
+    check("...and every shared file", all(exists(n) for n in shared), True)
+    out, _ = rm("gamma2")
+    check("without --purge the other name's files are kept",
+          all(exists(n) for n in shared) and "cachesDeleted" not in out, True)
+    check("...and the note says why", "gamma" in out["note"] and "kept" in out["note"], True)
+    check("config.json, which holds gamma's token, is unchanged", config().get("api_token"),
+          "tok-gamma-3333")
+
+    # --- removing a stack that isn't active doesn't touch config.json -------------------------------
+    add("delta", "delta.example.com", "tok-delta-5555")
+    out, _ = rm("delta")
+    check("removing an inactive stack leaves config.json", (out["config"], config().get("api_token")),
+          ("unchanged", "tok-gamma-3333"))
+
+    # --- the old bug's leftover state: registry active elsewhere, config.json still the removed one --
+    add("eps", "eps.example.com", "tok-eps-6666")
+    m._private_write(m.CFG_PATH, {"fqdn": "eps.example.com", "api_token": "tok-eps-6666"})
+    out, _ = rm("eps")
+    check("config.json holding the removed stack's token is repaired",
+          (out["config"], config().get("api_token")), ("switched", "tok-gamma-3333"))
+
+    # SKILL.md is what makes the model relay this; no behaviour test notices a dropped rule.
+    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
+        skill = " ".join(f.read().split())
+    for rule in ("`rm` of the active stack makes another saved stack active: **say which** (`active`)",
+                 "add `--purge` only when the user asks to delete them, after saying it can't be undone",
+                 "Relay a `scheduleWarning` with its `unregister` command"):
+        check("SKILL.md carries the stacks rm rule: %s" % rule[:40], rule in skill, True)
+
+
+def test_stack_file_tables_cover_every_writer(m):
+    """Every per-stack filename the skill builds must be in one of the two tables, or `stacks rm`
+    silently leaves it behind -- the duplication that goes wrong without anyone noticing."""
+    with open(MERIDIAN_PY, encoding="utf-8") as f:
+        src = f.read()
+    built = set(re.findall(r'"([A-Za-z_]+\.%s\.[a-z.]+)"', src))
+    built |= set(re.findall(r'schedule/([A-Za-z_]+\.%s\.[a-z.]+)"', src))
+    known = {k.rsplit("/", 1)[-1] for k in m.STACK_CACHE_FILES + m.STACK_HISTORY_FILES}
+    check("found the templates at all", len(built) >= 10, True)
+    check("every per-stack file is covered by stacks rm", sorted(built - known), [])
+    check("cron's log template is the one the table names", "cron.%s.log" in built, True)
+
+
+# Upload fields are not encrypt-marked, so the API returns them as plaintext keys (2026-10-07). The
+# allow-list keeps the fields out of output; these are the messages that quote them anyway. All key
+# material here is made up.
+_FAKE_PEM = ("-----BEGIN PRIVATE KEY-----\nFAKEKEYMATERIALline1abcdefghijklmnop\n"
+             "FAKEKEYMATERIALline2qrstuvwxyz012345\n-----END PRIVATE KEY-----\n")
+_FAKE_RSA = _FAKE_PEM.replace("BEGIN PRIVATE", "BEGIN RSA PRIVATE").replace("END PRIVATE", "END RSA PRIVATE")
+_FAKE_SA = json.dumps({"type": "service_account", "project_id": "scrub-proj",
+                       "private_key_id": "0123456789abcdef0123",
+                       "private_key": _FAKE_PEM, "client_email": "svc-scrub@scrub.example.com"})
+PEM_PROFILES = {"connectorProfiles": [
+    {"display_name": "Google Cloud", "bridge_name": "gcp", "profile_name": "GcpProd", "group": "Cloud",
+     "json_file": _FAKE_SA,
+     "services_list": [
+         {"service": "gcp_instance", "display_name": "GCP Instance", "status": "FAIL", "activity": True,
+          "message": "Permission denied for svc-scrub@scrub.example.com on project scrub-proj"}]},
+    {"display_name": "Oracle Cloud", "bridge_name": "oci", "profile_name": "OciProd", "group": "Cloud",
+     "oracle_key_file": _FAKE_RSA,
+     "services_list": [
+         # A whole key quoted in an error, JSON-escaped as it would be inside a dumped payload.
+         {"service": "oci_instance", "display_name": "OCI Instance", "status": "FAIL", "activity": True,
+          "message": "could not load key %s" % json.dumps(_FAKE_RSA)},
+         # Cut before the END line, as a capped platform message would be.
+         {"service": "oci_bucket", "display_name": "OCI Bucket", "status": "FAIL", "activity": True,
+          "message": "bad key: " + _FAKE_PEM[:70]}]},
+]}
+PEM_RUNS = {"content": [
+    {"bridge_name": "oci_instance", "platform": "api", "profile": "OciProd", "status": "Error",
+     "output_records": 0, "_utc": "2026-10-07T10:00:00.000+00:00", "_time": 1791367200,
+     "event_messages": [{"ERROR": "parse failed: private_key=FAKEKEYMATERIALline1abcdefghijklmnop"}]},
+]}
+
+
+def test_private_key_scrub(m, monkeypatch):
+    """A private key never survives into connector output, by its own shape and by the key names
+    inside a JSON document stored as a string -- `json_file`'s name says nothing about its contents."""
+    def fake_call(method, endpoint, body=None, retries=1):
+        if "connector/profile" in endpoint:
+            return PEM_PROFILES
+        if "metrics/connector" in endpoint:
+            return PEM_RUNS
+        raise AssertionError("unexpected endpoint %r" % endpoint)
+
+    monkeypatch.setattr(m, "call", fake_call)
+    blob = json.dumps(m.summarize_connectors()) + json.dumps(m.summarize_connectors(brief=False))
+    for leak in ("FAKEKEYMATERIAL", "line2qrstuvwxyz", "svc-scrub", "scrub.example.com"):
+        check("scrubbed from connector output: %r" % leak, leak in blob, False)
+    check("...leaving a marker and the diagnostic text", "[redacted]" in blob and
+          "Permission denied for" in blob and "could not load key" in blob, True)
+
+    # The shape pattern on its own, with no profile values to lean on.
+    s = m._scrub
+    for label, text in (("PKCS#8", _FAKE_PEM), ("RSA", _FAKE_RSA), ("JSON-escaped", json.dumps(_FAKE_RSA)),
+                        ("truncated", _FAKE_PEM[:70]),
+                        ("encrypted", _FAKE_PEM.replace("BEGIN PRIVATE", "BEGIN ENCRYPTED PRIVATE")
+                         .replace("END PRIVATE", "END ENCRYPTED PRIVATE")),
+                        ("OpenSSH", _FAKE_PEM.replace("BEGIN PRIVATE", "BEGIN OPENSSH PRIVATE")
+                         .replace("END PRIVATE", "END OPENSSH PRIVATE"))):
+        check("%s key body removed by shape" % label, "FAKEKEYMATERIAL" in s("err: " + text + " tail"),
+              False)
+    two = s("a %s b %s c" % (_FAKE_PEM, _FAKE_RSA))
+    check("two keys in one message: the text between them survives", " b " in two, True)
+    check("a certificate is not a private key and is left alone",
+          "CERTDATA" in s("-----BEGIN CERTIFICATE-----\nCERTDATA\n-----END CERTIFICATE-----"), True)
+    check("private_key=value is a credential name too",
+          "abc123secret" in s("private_key=abc123secret"), False)
+    check("a non-JSON string starting with { is still collected as a plain value",
+          m._profile_secrets({"token": "{not json"}), {"{not json"})

@@ -294,7 +294,10 @@ omitting `--token` uses `MERIDIAN_API_TOKEN` instead. `--action-token -` does th
 action token, read as the next line. A stack with a
 self-signed certificate takes `--insecure-tls`, stored per stack and carried across switches.
 
-`python scripts/meridian.py stacks rm <name>` removes one. Each stack needs a token generated **on
+`python scripts/meridian.py stacks rm <name>` removes one, with its caches. Its snapshot history,
+metrics and alert rules stay on disk unless you add `--purge`, which deletes them for good. If it was
+the active stack, another saved stack becomes active and the output says which; if none remain, its
+credentials are removed from `config.json`. Each stack needs a token generated **on
 that stack** — tokens are not portable between stacks.
 
 ### TLS
