@@ -166,6 +166,8 @@ Match the returned `state` exactly. Frame every message with the §4 visual voca
 | `forbidden` (403) | Token scoped/limited | Suggest a full User Generated token (template D). |
 | `unreachable` | DNS/TLS/network | Re-prompt for the FQDN (template E). |
 | `tls_untrusted` | Reached the address, but Python doesn't trust its certificate — usually a TLS-inspecting proxy | Give the fix (template F). **Don't** re-prompt for the FQDN (it worked), and don't lead with `insecure_tls`, which switches verification off. |
+| `token_unreadable` | A token **is** saved for this stack, but this machine can't decrypt it (Windows encrypts saved tokens to the user's account) | Ask for a fresh token and save it with `stacks add` (template G). **Don't** run first-run onboarding, and don't say the token was rejected: it was never sent. |
+| `stack_moved` | The stack answers with a redirect to its new `meridian-cyderes.com` address (`domainMove.to`); the token was not sent there | Offer to move the saved stack (template H). On a yes, run `domainMove.move`. **Don't** ask for a new token or run onboarding: the move keeps the saved one. |
 | `http_error` | Other HTTP status | Report the status + `detail`; likely a transient stack issue — offer to retry. |
 
 ### Message templates (keep the wording consistent)
@@ -179,6 +181,20 @@ replace the clause with "(data currency could not be confirmed: {reason})".
 
 Add a muted one-liner only if useful: `token from {tokenSource}, ending …{tokenLast4}; action token {set|not set}`.
 
+If the result carries `domainNotice`, the stack still works at a `lucidum.cloud` address that stops
+answering on `domainNotice.retires`. Say so once per session, in one line, and offer to run
+`domainNotice.move` to move it to `domainNotice.to`. The move checks the new address with the saved
+token before it changes anything, so it is safe to try: if the result says `moved: false`, the new
+address isn't live for this stack yet, and the stack is left as it was. Run it only after a yes,
+because it rewrites the saved stack.
+
+An `unreachable` result on a `lucidum.cloud` address carries `domainMove` too. After the retirement
+date that is the likely cause, so offer the move before you re-prompt for the FQDN.
+
+If the result carries `tokensProtected`, add one line, this session only: "Your saved Meridian tokens
+are now encrypted to your Windows account." If it carries `tokenStorageNote`, say plainly that the
+tokens are still saved unencrypted, and give its reason.
+
 Then, on the **first** connect of a session, present the **§1.5 data coverage summary** from the
 `connectors` block, and add one muted discoverability hint so multi-stack users can find the feature
 (once — don't repeat either on later connects):
@@ -189,7 +205,7 @@ Then answer their actual question, or if they haven't asked one, suggest 2–3 s
 **B — not_configured** (first run — ask for the two essentials, *don't* front-load every caveat):
 > 👋 **Let's connect to your Meridian stack.** I need two things:
 >
-> 1. **FQDN** — your Meridian address, like `company.lucidum.cloud` (no `https://`, no path).
+> 1. **FQDN** — your Meridian address, like `company.meridian-cyderes.com` (no `https://`, no path).
 > 2. **API token** — a *User Generated* token from Meridian.
 >
 > Paste both and I'll validate. No token yet? Say **"walk me through it"** for the 4 clicks.
@@ -220,11 +236,17 @@ If they ask for the walkthrough, give this inline quick-path (full detail in
 **F — tls_untrusted:**
 > ⚠️ **`{fqdn}` answered, but Python doesn't trust the certificate it was shown.** {hint}
 
+**G — token_unreadable:**
+> ⚠️ **A token is saved for `{fqdn}`, but this Windows account can't decrypt it**, so it was never sent. That happens after a profile reset, a restore onto another machine, or a copied `~/.meridian` folder. Paste a fresh token and I'll save it again.
+
+**H — stack_moved:**
+> ⚠️ **`{fqdn}` has moved to `{domainMove.to}`.** Meridian is retiring `lucidum.cloud` addresses. Want me to move your saved stack there? It keeps your token, history and alert rules, and I'll check the new address works before changing anything.
+
 ### After you collect new credentials
 
 1. Re-run the connection preflight to confirm you now get `connected`.
 2. **Then** offer to save (its own step, so it isn't skipped):
-   > Save this so you don't re-enter it next time? I'll save it under `~/.meridian/` — note it's **plain text** in your user profile (outside any repo, never committed).
+   > Save this so you don't re-enter it next time? I'll save it under `~/.meridian/` — on Windows it's encrypted to your Windows account; on macOS and Linux it's plain text that only your user can read (outside any repo, never committed).
 
    On yes, save it **through the script — never write `config.json` yourself.** A hand-written file
    skips the owner-only permissions the script applies, and it drops the stack's `entity_salt`, which
@@ -232,7 +254,7 @@ If they ask for the walkthrough, give this inline quick-path (full detail in
    out of the command line (shell history, process listings):
 
    ```bash
-   printf '%s\n' '<api token>' | python scripts/meridian.py stacks add --name <short name, e.g. prod> --fqdn company.lucidum.cloud --token -
+   printf '%s\n' '<api token>' | python scripts/meridian.py stacks add --name <short name, e.g. prod> --fqdn company.meridian-cyderes.com --token -
    ```
 
    The first stack saved becomes active and is mirrored into `config.json`, so every helper picks it
@@ -252,9 +274,10 @@ Trigger on "switch to my prod stack", "use `<name>`", "add another stack", "what
 
 ```bash
 python scripts/meridian.py stacks list                                                  # saved stacks + which is active
-printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.lucidum.cloud --token -  # others untouched
+printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.meridian-cyderes.com --token -  # others untouched
 python scripts/meridian.py stacks switch prod                                           # activate + validate
 python scripts/meridian.py stacks rm prod
+python scripts/meridian.py stacks move prod --fqdn acme.meridian-cyderes.com           # new address, same token + history
 ```
 
 - `switch` mirrors the chosen stack into `config.json` **and** runs the §1 preflight, returning the
@@ -267,6 +290,12 @@ python scripts/meridian.py stacks rm prod
   answer comes from it. `rm` keeps the stack's history, metrics and alert rules (`keptOnDisk`); add
   `--purge` only when the user asks to delete them, after saying it can't be undone. Relay a
   `scheduleWarning` with its `unregister` command.
+- `move` changes a saved stack's address and keeps its token, entity salt, history, metrics and
+  alert rules (`carried`). It checks the new address with the saved token first; `moved: false`
+  means nothing changed, so report its `state` with the §1 templates. A scheduled job is pinned to the
+  old address, so the move retires it: relay the `scheduleWarning` and its `unregister` command, and
+  offer `schedule show` for the new address. Never move a stack with `rm` + `add`: the history stays
+  under the old address, where nothing reads it.
 - Env vars (`MERIDIAN_*`) still override `config.json`; `switch` warns if they'd mask the change.
 - An existing single-stack `config.json` is migrated into the registry automatically on first use,
   so nothing is lost when the feature is first exercised.
@@ -326,7 +355,7 @@ inaccurate or unexplained signal reads as fact.
    ingesting fine. Put the 🟢 picture — sized from the split above, not the raw tally — first, with its
    warning messages, then the real problems:
 
-> ✅ **Connected to Meridian** — `company.lucidum.cloud` is tracking **34,201 assets** and **10,118 users**, data as of **2026-07-27 10:12 UTC** (latest Meridian rebuild).
+> ✅ **Connected to Meridian** — `company.meridian-cyderes.com` is tracking **34,201 assets** and **10,118 users**, data as of **2026-07-27 10:12 UTC** (latest Meridian rebuild).
 >
 > **Feeding that inventory:** **42 of 51 connectors are actively delivering data** — 93,127 records
 > across 51 sources, most recently 27 Jul 14:58 UTC. **9 need attention** (below).
@@ -591,7 +620,7 @@ Structure every findings response like this:
    server-side sort", an incomplete `summary` breakdown, a `truncated` top-N). Mention the query you
    ran only briefly, or on request — the user wants the answer, not the JSON.
 6. **Always name the stack the answer came from** — the FQDN in the caveat line is enough
-   (`_from company.lucidum.cloud_`). The active stack is **sticky**: a `stacks switch` persists in
+   (`_from company.meridian-cyderes.com_`). The active stack is **sticky**: a `stacks switch` persists in
    `config.json` across sessions, so a later question silently answers from whatever stack was left
    active. Unlabeled numbers are how someone reads production data as staging. If more than one
    stack is saved and you're about to report figures the user might act on, confirm the active one
@@ -630,7 +659,7 @@ figure describes one **rebuild**, not the moment you asked. Stacks rebuild anywh
 it into something the user can trust:
 
 1. **Stamp every data answer** in the caveat line, beside the stack name:
-   `_Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild) · company.lucidum.cloud_`. Write
+   `_Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild) · company.meridian-cyderes.com_`. Write
    `ldgRebuiltUtc` in exactly that form: absolute, ISO date, 24-hour, `UTC` spelled out. Never write
    "2 hours ago" (a transcript is re-read later), and never convert to local time. With `mergersSplit`,
    give both times ("Assets as of …; users as of …"). With `lastRebuildFailed`, add "(the newest
@@ -678,7 +707,8 @@ it into something the user can trust:
   the reply; use the `connectors` verb (§1.5), which extracts only names, enablement, status and
   record counts in-process.
 - **Never read the credential files into context.** `~/.meridian/config.json` and `stacks.json`
-  hold plaintext tokens for *every* saved stack. The scripts read them in-process, so there is
+  hold tokens for *every* saved stack: encrypted to the user's account on Windows, plaintext
+  elsewhere. The scripts read them in-process, so there is
   never a reason to open them with a file tool — use `connect` or `stacks list` (both redact to the
   last 4) to inspect configuration. A user-level `permissions.deny` rule enforces this.
 - Respect the 60 req/min limit; on 401/403 stop and re-check the token rather than retrying.
@@ -771,6 +801,7 @@ Pick the script from the question shape; for exact flags run `meridian.py <verb>
 | a periodic/scheduled posture review, or "send me this every week" | `meridian.py digest` → pipe to `report` |
 | "keep tracking this on its own" / "take a snapshot every day" / "set up the schedule" | `meridian.py schedule show` → show the definition; on a yes, `--write` and run its `register` command |
 | "is the scheduled snapshot running" / "did last night's snapshot work" | `meridian.py schedule status` |
+| "stop the scheduled snapshot" / "remove the daily task" | `meridian.py schedule rm` (`--all` for every stack) → run each `unregister` command it prints, after a yes |
 | "how has X changed" / "trend" / "since last month" / "are we getting better" / "what's the direction" | `meridian.py trend` (`--since YYYY-MM-DD`, `--metric <name>`, `--by <field>`) |
 | "**which** assets/users got worse" / "what changed since Friday" / "who's new in the top 10" | `meridian.py trend --name-entities` (needs snapshots taken with `--entities`) |
 | a **shareable trend chart** ("chart this", "trend report for the QBR") | `meridian.py trend ... > t.json` → `report --input t.json --out <name>.pdf` — branded line charts; a break in a line is a not-captured date, and the page says so |
@@ -933,6 +964,10 @@ rule.** Read it when the user asks why, or when you need exact arguments — tho
   when setting one up:
   - **A job collects for one stack and refuses while another is active.** Mention it to anyone who
     switches stacks.
+  - **To stop a job, use `schedule rm`, not just the OS command.** A job is found from its run
+    history, so an unregistered task otherwise reads as `stopped` at every session start. `schedule
+    rm` retires it and keeps the history; it does not touch the OS scheduler, so run the `unregister`
+    command it prints, after a yes.
   - **Alerts from a job need their webhook/SMTP variables in the job's environment, not the shell.**
     The `environment` field says where they go. A `schedule run` that exits 3 with `notSentReason`
     means a firing rule reached nobody.

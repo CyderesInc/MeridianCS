@@ -69,7 +69,7 @@ def derived_public_tree():
 
 PATTERNS = {
     "IPv4 literal":        r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
-    "Meridian stack FQDN": r"\b[a-z0-9][a-z0-9-]*\.lucidum\.cloud\b",
+    "Meridian stack FQDN": r"\b[a-z0-9][a-z0-9-]*\.(?:lucidum\.cloud|meridian-cyderes\.com)\b",
     "asset-id shaped":     r"\bI-[0-9A-Z]{8,}\b",
     "name-shaped ALLCAPS": r"\b[A-Z]{7,}\b",
     "email address":       r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b",
@@ -88,8 +88,10 @@ ALLOWED_CAPS = {
 
 # Deliberate placeholder stacks. The packaged docs must never name a real one, and the walkthroughs
 # need *something* in the example command, so these are the sanctioned stand-ins.
-ALLOWED_FQDN = {"acme.lucidum.cloud", "company.lucidum.cloud", "your-stack.lucidum.cloud",
-                "customer.lucidum.cloud"}
+# Both domains: lucidum.cloud retires on 2026-12-05 in favour of meridian-cyderes.com, and a stack
+# keeps its name across the move, so a real one is as identifying on either.
+ALLOWED_FQDN = {"%s.%s" % (n, d) for n in ("acme", "company", "your-stack", "customer")
+                for d in ("lucidum.cloud", "meridian-cyderes.com")}
 
 # Test fixtures, not disclosures. Explicit rather than a looser pattern, for the same reason the
 # FQDN allowlist is explicit: these are boundary cases the suite deliberately exercises (addresses

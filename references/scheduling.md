@@ -12,6 +12,7 @@ never needs this.
 python scripts/meridian.py schedule show                 # this machine's task definition + register/unregister/status commands
 python scripts/meridian.py schedule show --write         # also write it under ~/.meridian/schedule/ (still not registered)
 python scripts/meridian.py schedule status               # did each job run, did it work, has it stopped
+python scripts/meridian.py schedule rm [--all]           # retire a job (keeps its history; prints the unregister command)
 ```
 
 `schedule show` prints the definition and the exact `register` command; running that command is what
@@ -33,6 +34,14 @@ The task runs one command, `schedule run --expect-stack <fqdn> --cadence daily`,
   has to say which of these happened.
 
 Its flags are a contract: a registered task keeps calling them across self-updates.
+
+**Stopping a job takes `schedule rm` as well as the OS command.** Jobs are found from their heartbeats, so
+a task unregistered by hand reads as `stopped` at every session start, forever. `schedule rm` retires the
+active stack's job (`--stack <fqdn>` for another, `--all` for every one): it appends a `retired` line to
+the heartbeat, which keeps the run history, deletes the written definition, and prints the `unregister`
+command. Like `show`, it never touches the OS scheduler itself. A run logged after the retirement brings
+the job back into `schedule status`, because a job that still fires has to stay visible. `stacks move`
+retires the job for the old address the same way, since a job pinned there can never collect again.
 
 ## One job, one stack
 

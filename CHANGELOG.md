@@ -3,6 +3,20 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.31.0 - 2026-10-13
+
+- **Your saved Meridian tokens are encrypted on Windows.** The first time the skill connects, it
+  encrypts them to your Windows account, so a copied `~/.meridian` folder is useless on another
+  machine or account.
+- **Ready for the move to meridian-cyderes.com.** `lucidum.cloud` addresses stop working on
+  2026-12-05. The skill tells you when a stack is still on one and moves it for you, keeping its
+  token, history and alert rules.
+- **A stack that has already moved is recognised.** When an old address redirects to its new one,
+  the skill says so and offers the move instead of reporting an error. Your token goes to the new
+  address only once you agree.
+- **Scheduled snapshots can be stopped cleanly.** `schedule rm` retires a job, so a task you removed
+  is no longer reported as stopped at every session start. Its history is kept.
+
 ## 2.30.0 - 2026-10-09
 
 - **Large inventories download much less.** The skill now asks Meridian to compress its responses: a

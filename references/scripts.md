@@ -146,6 +146,11 @@ currency-unknown unless paired with `asof`.
   updates it in place, preserving keys it wasn't given (entity salt, action token, TLS posture).
   `switch` also validates via the connect preflight and returns the same `state`. `list` redacts
   tokens to the last 4.
+  `move <name> --fqdn <new>` changes an address and carries the token, salt, history, metrics and
+  alert rules; it checks the new address with the saved token first and changes nothing if that
+  fails (`moved: false`). Built for the `lucidum.cloud` -> `meridian-cyderes.com` retirement
+  (2026-12-05), which `connect` reports as `domainNotice`, or as state `stack_moved` once the old
+  address redirects.
 - `top` — **top-N by a numeric field**
   (riskiest/most-vulnerable/etc.) with automatic threshold-narrowing and client-side sort. Use for
   any "top/highest/riskiest" question instead of hand-writing threshold queries. Reports

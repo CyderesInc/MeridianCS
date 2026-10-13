@@ -139,13 +139,211 @@ def load_config():
         with open(CFG_PATH, encoding="utf-8-sig") as f:  # BOM: written by the retired PS helpers pre-v2.2
             c = json.load(f)
         fqdn = fqdn or c.get("fqdn")
-        api_token = api_token or c.get("api_token")
-        action_token = action_token or c.get("action_token")
+        # The tokens as STORED: a plaintext str, or a protected dict that call() decrypts when a
+        # request needs it. Verbs that only want the fqdn (every history path) never pay for that.
+        api_token = api_token or stored_token(c, "api_token")
+        action_token = action_token or stored_token(c, "action_token")
     if not fqdn:
         die("No Meridian FQDN configured (env MERIDIAN_FQDN or ~/.meridian/config.json).")
     fqdn = re.sub(r"^https?://", "", fqdn).rstrip("/")
     _CFG_CACHE = (fqdn, api_token, action_token)
     return _CFG_CACHE
+
+
+# --- Saved tokens, encrypted at rest on Windows (design/token-encryption.md, phase 1) -------------
+#
+# A protected token lives under `<kind>_protected` and its plaintext key is absent, so an older
+# version reads "no token" (not_configured, nothing sent) instead of a garbage bearer header it would
+# blame on the token. DPAPI, user scope: a copy of the file is useless elsewhere, but any code running
+# as the same user can decrypt it -- this protects copies, not against malware on the machine.
+# macOS (keychain) is phase 2 and Linux keeps the 0600 file; both report tokenStorage "file".
+TOKEN_KINDS = ("api_token", "action_token")
+_PROTECTED = "_protected"
+TOKEN_UNREADABLE = "Saved token could not be decrypted"
+DPAPI_SCHEME = "dpapi-user-v1"
+# Not a secret -- it is right here. It only stops a DPAPI blob another program made for another
+# purpose being accepted as a token.
+_DPAPI_ENTROPY = b"meridiancs-token-v1"
+# Tests: (scheme, protect, unprotect), or False for none. None means this platform's own.
+_TOKEN_PROTECTOR = None
+# Tests set False so their fixtures stay plaintext. Decryption is never switched off: a protected
+# token on disk has to stay readable whatever a caller wants written. There is deliberately no user
+# opt-out (decision 2).
+_PROTECT_WRITES = None
+
+
+def _dpapi(data, decrypt):
+    """CryptProtectData / CryptUnprotectData, current-user scope, never showing UI.
+
+    `ctypes` costs ~17ms to import (Python 3.14, measured), paid only when a saved token is read or
+    written. `ctypes.wintypes` would add ~6ms more, so DWORD is spelled c_uint32 instead.
+    """
+    import ctypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def blob(b):
+        buf = ctypes.create_string_buffer(b, len(b))
+        return Blob(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf
+
+    src, _keep_src = blob(data)
+    ent, _keep_ent = blob(_DPAPI_ENTROPY)
+    out = Blob()
+    crypt32 = ctypes.windll.crypt32
+    fn = crypt32.CryptUnprotectData if decrypt else crypt32.CryptProtectData
+    # 0x1 = CRYPTPROTECT_UI_FORBIDDEN: a scheduled job must fail, never wait on a dialog.
+    if not fn(ctypes.byref(src), None, ctypes.byref(ent), None, None, 0x1, ctypes.byref(out)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def _token_protector():
+    """(scheme, protect, unprotect) for this platform, or None where saved tokens stay plaintext."""
+    if _TOKEN_PROTECTOR is not None:
+        return _TOKEN_PROTECTOR or None
+    if os.name == "nt":
+        return (DPAPI_SCHEME, lambda b: _dpapi(b, False), lambda b: _dpapi(b, True))
+    return None
+
+
+class TokenUnreadable(RuntimeError):
+    """A saved token exists but can't be decrypted here. Never `not_configured`: the user did save
+    one, and asking them to set up from scratch would hide the real cause (a lost key)."""
+
+
+def stored_token(d, kind):
+    """A token as stored in a config or registry entry: a plaintext str, a protected dict, or None.
+
+    Plaintext wins when both are present. This version never writes plaintext where it can protect,
+    so a plaintext value beside a protected one came from an older version after a rotation, and
+    is the newer token. The next write protects it.
+    """
+    if not isinstance(d, dict):
+        return None
+    v = d.get(kind)
+    if isinstance(v, str) and v:
+        return v
+    p = d.get(kind + _PROTECTED)
+    return p if isinstance(p, dict) and p.get("data") else None
+
+
+def token_storage(stored):
+    """Where a stored token's secret lives, for reporting: "dpapi", "file", or None."""
+    if stored is None:
+        return None
+    return "file" if isinstance(stored, str) else "dpapi" if stored.get("scheme") == DPAPI_SCHEME else "unknown"
+
+
+def reveal_token(stored):
+    """The plaintext of a stored token. Raises TokenUnreadable, whose message starts TOKEN_UNREADABLE."""
+    if stored is None or isinstance(stored, str):
+        return stored
+    import binascii
+    scheme, prot = stored.get("scheme"), _token_protector()
+    if not prot or prot[0] != scheme:
+        raise TokenUnreadable("%s: it was saved with %s encryption, which this machine can't read. "
+                              "Re-enter it with `stacks add`." % (TOKEN_UNREADABLE, scheme))
+    try:
+        return prot[2](binascii.a2b_base64(stored["data"])).decode("utf-8")
+    except Exception as e:  # noqa - a lost key, a blob from another machine, a damaged file
+        raise TokenUnreadable("%s (%s). It was encrypted to a Windows account whose key this session "
+                              "can't use -- a profile reset, a restore onto another machine, or a "
+                              "copied ~/.meridian. Re-enter it with `stacks add`."
+                              % (TOKEN_UNREADABLE, _short(str(e), 120)))
+
+
+def _protect_entry(d):
+    """Protect every plaintext token in `d`, in place: (number protected, problem or None).
+
+    Never raises, and never drops a plaintext it hasn't proven it can get back: the new blob is
+    decrypted again and compared before the plaintext key goes. A blob that can't be read back must
+    never replace the only copy of a token.
+    """
+    if _PROTECT_WRITES is False or not isinstance(d, dict):
+        return 0, None
+    prot = _token_protector()
+    if not prot:
+        return 0, None
+    import binascii
+    n = 0
+    for kind in TOKEN_KINDS:
+        v = d.get(kind)
+        if not (isinstance(v, str) and v):
+            continue
+        try:
+            blob = prot[1](v.encode("utf-8"))
+            if prot[2](blob).decode("utf-8") != v:
+                return n, "the encrypted %s did not decrypt back to itself" % kind
+        except Exception as e:  # noqa - left as plaintext and reported, never fatal
+            return n, "could not encrypt %s: %s" % (kind, _short(str(e), 120))
+        d[kind + _PROTECTED] = {"scheme": prot[0],
+                                "data": binascii.b2a_base64(blob, newline=False).decode("ascii")}
+        del d[kind]
+        n += 1
+    return n, None
+
+
+def _copy_tokens(src, dst):
+    """Copy each token from `src` to `dst` in whichever form it is stored, dropping the other form."""
+    for kind in TOKEN_KINDS:
+        dst.pop(kind, None)
+        dst.pop(kind + _PROTECTED, None)
+        s = stored_token(src, kind)
+        if isinstance(s, str):
+            dst[kind] = s
+        elif s:
+            dst[kind + _PROTECTED] = dict(s)
+
+
+def _same_token(a, b, kind="api_token"):
+    """Whether two entries hold the same token, decrypting only if their stored forms differ."""
+    x, y = stored_token(a, kind), stored_token(b, kind)
+    if x is None or y is None:
+        return False
+    if x == y:
+        return True
+    try:
+        return reveal_token(x) == reveal_token(y)
+    except TokenUnreadable:
+        return False
+
+
+def migrate_tokens():
+    """Protect plaintext tokens already on disk (decision 4: on `connect`, which every session runs).
+
+    stacks.json first, then config.json, each in one atomic write. A crash between them leaves
+    config.json plaintext, and the next `connect` finishes the job. A file is rewritten only when it
+    holds a plaintext token, so a migrated install isn't rewritten every session. Never raises.
+    """
+    out = {"protected": 0, "problem": None}
+    if _PROTECT_WRITES is False or not _token_protector():
+        return out
+    for path in (STACKS_PATH, CFG_PATH):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception:  # noqa - missing or unreadable: nothing to migrate here
+            continue
+        if not isinstance(data, dict):
+            continue
+        entries = [e for e in ((data.get("stacks") or {}).values() if path == STACKS_PATH else [data])
+                   if isinstance(e, dict)]
+        n = 0
+        for e in entries:
+            k, problem = _protect_entry(e)
+            n += k
+            out["problem"] = out["problem"] or problem
+        if n:
+            try:
+                _private_write(path, data)
+                out["protected"] += n
+            except Exception as e:  # noqa
+                out["problem"] = out["problem"] or "could not rewrite %s: %s" % (path, _short(str(e), 120))
+    return out
 
 
 # --- Multi-stack registry -------------------------------------------------------------------
@@ -159,9 +357,30 @@ def _clean_fqdn(fqdn):
 
 
 def _stack_name_from_fqdn(fqdn):
-    """Derive a sensible default stack name from an FQDN (first label), e.g. company.lucidum.cloud -> company."""
+    """Derive a sensible default stack name from an FQDN (first label), e.g. company.meridian-cyderes.com -> company."""
     base = _clean_fqdn(fqdn).split(".")[0]
     return re.sub(r"[^A-Za-z0-9_-]", "", base) or "default"
+
+
+# Meridian stacks are leaving lucidum.cloud for meridian-cyderes.com, and the old domain stops
+# answering on the date given. A stack keeps everything left of the domain, so
+# company.lucidum.cloud becomes company.meridian-cyderes.com. Saved stacks don't follow on their own:
+# call() never replays the token to another host, so `connect` names the move and `stacks move`
+# makes it, once the user says yes.
+RETIRING_DOMAINS = {"lucidum.cloud": ("meridian-cyderes.com", "2026-12-05")}
+# The start of call()'s error when a stack redirects to its own successor; classify_connect_error
+# keys on it. A redirect anywhere else keeps the plain HTTP error: only this pair is known to be the
+# same stack.
+STACK_MOVED = "Stack moved"
+
+
+def successor_fqdn(fqdn):
+    """(new fqdn, retirement date) for an address on a retiring domain, else (None, None)."""
+    f = _clean_fqdn(fqdn).lower()
+    for old, (new, date) in RETIRING_DOMAINS.items():
+        if f.endswith("." + old) and len(f) > len(old) + 1:
+            return f[:-len(old)] + new, date
+    return None, None
 
 
 def load_stacks():
@@ -185,10 +404,10 @@ def load_stacks():
                 c = json.load(f)
         except Exception:
             c = {}
-        if c.get("fqdn") and c.get("api_token"):
+        if c.get("fqdn") and stored_token(c, "api_token"):
             name = _stack_name_from_fqdn(c.get("fqdn"))
-            entry = {"fqdn": _clean_fqdn(c["fqdn"]), "api_token": c.get("api_token"),
-                     "action_token": c.get("action_token")}
+            entry = {"fqdn": _clean_fqdn(c["fqdn"])}
+            _copy_tokens(c, entry)
             # The migration must carry everything the mirror carries, or the first `stacks add` on
             # an upgraded install strips it from the registry and the next switch strips it from
             # config.json. For entity_salt that loss is unrecoverable -- every earlier entity
@@ -284,9 +503,15 @@ def _private_write(path, payload):
 
 
 def save_stacks(reg):
+    """Write the registry; every plaintext token in it is protected first where this platform can.
+    Returns the protection problem, if any (the token is then saved as it was, never lost)."""
     # The registry holds EVERY stack's token, and it used to get a plain truncate-then-write --
     # while config.json two functions away was protected for exactly this reason.
+    problem = None
+    for entry in (reg.get("stacks") or {}).values():
+        problem = _protect_entry(entry)[1] or problem
     _private_write(STACKS_PATH, reg)
+    return problem
 
 
 def mirror_active_to_config(reg):
@@ -325,10 +550,9 @@ def mirror_active_to_config(reg):
     # config.json is still pointing at THIS stack. Mirroring a different stack must not inherit the
     # previous one's settings.
     payload = {k: v for k, v in prior.items() if same_stack} if same_stack else {}
-    payload.update({"fqdn": s.get("fqdn"), "api_token": s.get("api_token")})
-    payload.pop("action_token", None)
-    if s.get("action_token"):
-        payload["action_token"] = s.get("action_token")
+    payload["fqdn"] = s.get("fqdn")
+    _copy_tokens(s, payload)
+    _protect_entry(payload)   # a no-op unless the registry copy is still plaintext
     if s.get("entity_salt"):
         # Carried across a switch, per stack. This rewrite is a full replacement, so leaving the salt out
         # would silently regenerate it on the next entity snapshot -- and a new salt makes every earlier
@@ -653,7 +877,7 @@ def _config_resolvable():
                 c = json.load(f)
         except Exception:  # noqa - unreadable config is "not configured" here, never a crash
             c = {}
-        fqdn, tok = fqdn or c.get("fqdn"), tok or c.get("api_token")
+        fqdn, tok = fqdn or c.get("fqdn"), tok or stored_token(c, "api_token")
     return bool(fqdn and tok)
 
 
@@ -1120,12 +1344,15 @@ def parallel(tasks):
 
 
 _SSL_CTX = {}   # one context per posture, built once -- see _ssl_context
+_PROBE_INSECURE_TLS = None
 
 
 def insecure_tls():
     """True only if certificate verification has been explicitly disabled for this stack."""
     if os.environ.get("MERIDIAN_INSECURE_TLS", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
+    if _PROBE_INSECURE_TLS is not None:
+        return _PROBE_INSECURE_TLS    # _probe_stack: a saved stack that isn't the one in config.json
     try:
         with open(CFG_PATH, encoding="utf-8-sig") as f:
             return bool(json.load(f).get("insecure_tls"))
@@ -1442,6 +1669,7 @@ def call(method, endpoint, body=None, retries=1):
         if is_ldg:
             die("The /CMDB/v2/data/ldg endpoint needs an Action token. Use /CMDB/v2/data/cmdb instead.")
         die("No API token configured (env MERIDIAN_API_TOKEN or ~/.meridian/config.json).")
+    token = reveal_token(token)   # raises TokenUnreadable; never sends a header it couldn't build
     data = body.encode("utf-8") if isinstance(body, str) else (json.dumps(body).encode("utf-8") if body is not None else None)
     ctx = _ssl_context()
     key = (fqdn, insecure_tls())
@@ -1466,6 +1694,12 @@ def call(method, endpoint, body=None, retries=1):
             while status in (301, 302, 303, 307, 308) and loc and hops < 3:
                 nxt = urllib.parse.urlparse(loc)
                 if nxt.netloc and nxt.netloc != fqdn:
+                    if nxt.netloc.lower() == (successor_fqdn(fqdn)[0] or ""):
+                        # Still not followed: the user moves the stack, and the token goes there then.
+                        redirect_err = ("%s to %s: %s answers with an HTTP %s redirect there. The token "
+                                        "was not sent to the new address." % (STACK_MOVED, nxt.netloc,
+                                                                               fqdn, status))
+                        break
                     redirect_err = ("HTTP %s: refused to follow a redirect to another host (%s) -- the "
                                     "API token must not be replayed off this stack." % (status, nxt.netloc))
                     break
@@ -5721,7 +5955,7 @@ def _credential_sources():
     """
     cfg = _config_file()
     fsrc = "env" if os.environ.get("MERIDIAN_FQDN") else ("config" if cfg.get("fqdn") else None)
-    tsrc = "env" if os.environ.get("MERIDIAN_API_TOKEN") else ("config" if cfg.get("api_token") else None)
+    tsrc = "env" if os.environ.get("MERIDIAN_API_TOKEN") else ("config" if stored_token(cfg, "api_token") else None)
     return fsrc, tsrc
 
 
@@ -5968,7 +6202,9 @@ def collection_status(now=None):
     for n in names:
         if n.startswith("heartbeat.") and n.endswith(".jsonl"):
             entries = load_heartbeat(os.path.join(CFG_DIR, n))
-            if entries:
+            # A retired job is gone on purpose (`schedule rm`), not stopped. A run logged after the
+            # retirement puts it back, since a job that still fires has to stay visible.
+            if entries and entries[-1].get("event") != "retired":
                 jobs.append(heartbeat_summary(entries, now))
     cfg = _config_file()
     active = _clean_fqdn(os.environ.get("MERIDIAN_FQDN") or cfg.get("fqdn") or "") or None
@@ -5999,6 +6235,68 @@ def collection_for(fqdn=None):
     if any(os.path.exists(base + ext) for ext in SCHEDULE_DEFINITION_EXT.values()):
         # Written, and perhaps registered, but it has never run: offering a second one would be wrong.
         out["definitionWritten"] = True
+    return out
+
+
+def _schedule_here():
+    return "windows" if os.name == "nt" else ("macos" if sys.platform == "darwin" else "linux")
+
+
+def retire_schedule(fqdn, target=None):
+    """Stop reporting a stack's scheduled job, keeping its run history.
+
+    Jobs are found from their heartbeats, so an unregistered task used to read as `stopped` at every
+    session start, indefinitely -- there was no way to say a job was gone on purpose. This appends a
+    `retired` line to the heartbeat and deletes the written definition. It does NOT touch the OS
+    scheduler (registering never does either); the caller runs the returned `unregister` command.
+    None when this machine shows no job for the stack."""
+    fq = _clean_fqdn(fqdn)
+    label = SCHEDULE_LABEL_PREFIX + _fqdn_slug(fq)
+    defs = [(t, label + ext) for t, ext in SCHEDULE_DEFINITION_EXT.items()
+            if os.path.exists(os.path.join(_schedule_dir(), label + ext))]
+    entries = load_heartbeat(_heartbeat_path(fq))
+    live = bool(entries) and entries[-1].get("event") != "retired"
+    if not defs and not live:
+        return None
+    if live:
+        _append_heartbeat(fq, {"event": "retired", "ts": _utc_iso(), "stack": fq})
+    deleted = []
+    for _, d in defs:
+        try:
+            os.remove(os.path.join(_schedule_dir(), d))
+            deleted.append(d)
+        except OSError:
+            pass
+    # The written definition says which scheduler it was for; without one, this machine's.
+    target = target or (defs[0][0] if defs else _schedule_here())
+    return {"stack": fq, "label": label, "os": target,
+            "unregister": _schedule_unregister(target, label), "definitionsDeleted": deleted}
+
+
+def schedule_rm(stack=None, all_jobs=False, target=None):
+    if all_jobs:
+        stacks = {j.get("stack") for j in collection_status()["jobs"] if j.get("stack")}
+        try:
+            names = os.listdir(_schedule_dir())
+        except OSError:
+            names = []
+        for n in names:
+            for ext in SCHEDULE_DEFINITION_EXT.values():
+                if n.startswith(SCHEDULE_LABEL_PREFIX) and n.endswith(ext):
+                    stacks.add(n[len(SCHEDULE_LABEL_PREFIX):-len(ext)])
+    else:
+        stacks = {_clean_fqdn(stack or load_config()[0])}
+    retired, none = [], []
+    for fq in sorted(s for s in stacks if s):
+        r = retire_schedule(fq, target)
+        (retired.append(r) if r else none.append(fq))
+    out = {"retired": retired}
+    if none:
+        out["noJob"] = none
+    out["note"] = ("Retired %d job(s): `schedule status` and `connect` stop reporting them, and their run "
+                   "history is kept. The OS scheduler was not touched; run each `unregister` command to "
+                   "stop the task itself." % len(retired) if retired
+                   else "No scheduled job was found on this machine for %s." % ", ".join(none or ["any stack"]))
     return out
 
 
@@ -6220,7 +6518,7 @@ def schedule_show(target=None, at="09:00", weekly=None, entities=None, write=Fal
             "MERIDIAN_API_TOKEN), which a scheduled job won't have. Save it with `stacks add`, unset "
             "them, and create the schedule from the saved stack.")
     fqdn = _clean_fqdn(load_config()[0])
-    here = "windows" if os.name == "nt" else ("macos" if sys.platform == "darwin" else "linux")
+    here = _schedule_here()
     target = target or here
     hm = _parse_at(at)
     weekday = weekly.upper() if weekly else None
@@ -6337,6 +6635,9 @@ def cmd_schedule(a):
         sys.exit(res["exit"])
     if a.schedule_cmd == "status":
         jout(collection_status())
+        return
+    if a.schedule_cmd == "rm":
+        jout(schedule_rm(a.stack, a.all_jobs, a.target_os))
         return
     try:
         jout(schedule_show(a.target_os, a.at, a.weekly, getattr(a, "entities", None), a.write))
@@ -9142,6 +9443,12 @@ def classify_connect_error(err_str):
     # through to `unreachable`, whose advice (re-enter the FQDN) cannot fix it.
     if (err_str or "").startswith((TLS_VERIFY_FAILED, TLS_BUNDLE_PROBLEM)):
         return "tls_untrusted", None
+    # Nothing was sent: the token never left the machine. Not auth_error, whose advice blames the token.
+    if (err_str or "").startswith(TOKEN_UNREADABLE):
+        return "token_unreadable", None
+    # Not http_error: the address is what's wrong, and the fix is a known command, not a retry.
+    if (err_str or "").startswith(STACK_MOVED):
+        return "stack_moved", None
     m = re.match(r"HTTP (\d{3}):", err_str or "") or re.search(r"\bHTTP (\d{3})\b", err_str or "")
     status = int(m.group(1)) if m else None
     state = ("auth_error" if status == 401 else "forbidden" if status == 403
@@ -9164,11 +9471,25 @@ def diagnose_connection():
         except Exception:
             c = {}
         if not fqdn and c.get("fqdn"): fqdn = c["fqdn"]
-        if not api_token and c.get("api_token"): api_token, token_src = c["api_token"], "config"
-        if not action_token and c.get("action_token"): action_token = c["action_token"]
+        if not api_token and stored_token(c, "api_token"):
+            api_token, token_src = stored_token(c, "api_token"), "config"
+        if not action_token: action_token = stored_token(c, "action_token")
     if fqdn:
         fqdn = re.sub(r"^https?://", "", fqdn).rstrip("/")
-    last4 = api_token[-4:] if api_token else None
+    storage = "env" if token_src == "env" else token_storage(api_token)
+    if api_token and fqdn:
+        try:
+            plain = reveal_token(api_token)
+        except TokenUnreadable as e:
+            return {"state": "token_unreadable", "fqdn": fqdn, "tokenSource": token_src,
+                    "tokenStorage": storage, "configPath": CFG_PATH, "message": str(e),
+                    "hint": "A token IS saved for this stack, but this Windows account can't decrypt it. "
+                            "Ask the user for a fresh User Generated token and save it with `stacks add` "
+                            "(same name and FQDN). Don't treat this as first-run setup, and don't say "
+                            "the token was rejected: it was never sent."}
+    else:
+        plain = api_token if isinstance(api_token, str) else None
+    last4 = plain[-4:] if plain else None
 
     missing = ([] if fqdn else ["fqdn"]) + ([] if api_token else ["api_token"])
     if missing:
@@ -9179,7 +9500,7 @@ def diagnose_connection():
             "hint": "Collect the FQDN and a User Generated API token, then offer to save them to config.",
         }
 
-    base = {"fqdn": fqdn, "tokenSource": token_src, "tokenLast4": last4,
+    base = {"fqdn": fqdn, "tokenSource": token_src, "tokenLast4": last4, "tokenStorage": storage,
             "actionTokenConfigured": bool(action_token), "configPath": CFG_PATH,
             # Reported on every connect: an opt-out set once in config would otherwise apply to
             # every later session silently, which is exactly how an insecure posture becomes default.
@@ -9195,10 +9516,15 @@ def diagnose_connection():
         base["tlsWarning"] = ("Certificate verification is DISABLED for this stack (insecure_tls). "
                               "The API token is sent over an unverified connection - only keep this "
                               "if the certificate is self-signed and the network path is trusted.")
+    move = _domain_move(fqdn, from_env=bool(os.environ.get("MERIDIAN_FQDN")))
     try:
         out = call("GET", "/CMDB/v2/system/metrics/data", retries=0)
         base.update({"state": "connected", "assetCount": out.get("assetCount"), "userCount": out.get("userCount"),
                      "message": "Connected to %s - tracking %s assets and %s users." % (fqdn, out.get("assetCount"), out.get("userCount"))})
+        if move:
+            # Working today, gone on the retirement date. Said while it still works, because after
+            # that date the old address can't even redirect.
+            base["domainNotice"] = move
         return base
     except Exception as e:  # noqa
         s = str(e)
@@ -9207,14 +9533,51 @@ def diagnose_connection():
             "forbidden": "Reached %s but this token is forbidden (HTTP 403)." % fqdn,
             "unreachable": "Couldn't reach %s (DNS/TLS/network error)." % fqdn,
             "tls_untrusted": "Reached %s, but Python doesn't trust the certificate it was shown." % fqdn,
+            "token_unreadable": s,
+            "stack_moved": "%s has moved to %s." % (fqdn, (move or {}).get("to")),
             "http_error": "Reached %s but got HTTP %s." % (fqdn, status)}
     hints = {"auth_error": "Token expired/mistyped, account missing the Api_Users role, or an SSO account (SSO cannot use the API). Re-prompt for a fresh User Generated token.",
              "forbidden": "Usually a scoped/Limited token or a missing role. Try a full User Generated token.",
              "unreachable": "Check the FQDN is exact (no https://, no path) and the stack is reachable from this network. Re-prompt for the FQDN.",
              "tls_untrusted": tls_trust_hint(),
+             "token_unreadable": "Re-enter the token with `stacks add`; it was never sent.",
+             "stack_moved": "Offer to run the `move` command: it keeps the token, history and alert rules, "
+                            "and checks the new address before it changes anything. Don't ask for a new "
+                            "token or re-run onboarding.",
              "http_error": "Inspect `detail` for the API error body."}
+    if state == "unreachable" and move:
+        # After the retirement date the old address won't answer at all, so there is no redirect to
+        # recognise. Offered, not asserted: `stacks move` checks the new address before using it.
+        hints["unreachable"] = ("%s addresses stop working on %s, and this stack's new address is "
+                                "probably %s. Offer to run the `move` command, which checks the new "
+                                "address before changing anything; re-prompt for the FQDN only if that "
+                                "fails." % (move["retiringDomain"], move["retires"], move["to"]))
     base.update({"state": state, "httpStatus": status, "message": msgs[state], "hint": hints[state], "detail": s[:300]})
+    if move and state in ("stack_moved", "unreachable"):
+        base["domainMove"] = move
     return base
+
+
+def _domain_move(fqdn, from_env=False):
+    """What moving this stack to its new domain means, or None if it isn't on a retiring one."""
+    new, date = successor_fqdn(fqdn)
+    if not new:
+        return None
+    old_domain = next(d for d in RETIRING_DOMAINS if _clean_fqdn(fqdn).lower().endswith("." + d))
+    out = {"from": _clean_fqdn(fqdn), "to": new, "retiringDomain": old_domain, "retires": date}
+    if from_env:
+        out["note"] = "MERIDIAN_FQDN sets this address; change it there to %s." % new
+        return out
+    try:
+        reg = load_stacks()
+    except Exception:
+        reg = {"stacks": {}}
+    name = next((n for n, s in (reg.get("stacks") or {}).items()
+                 if _clean_fqdn((s or {}).get("fqdn") or "").lower() == _clean_fqdn(fqdn).lower()), None)
+    if name:
+        out["stack"] = name
+        out["move"] = "python scripts/meridian.py stacks move %s --fqdn %s" % (name, new)
+    return out
 
 
 def cmd_asof(a):
@@ -9238,6 +9601,12 @@ def cmd_connect(a):
     """Onboarding preflight: resolve config, validate in one cheap call, report a single state.
     With --with-connectors, append the data-coverage summary the skill opens a session with. The
     summary is best-effort: a scoped token that can't read the connector endpoints still connects."""
+    global _CFG_CACHE
+    # Before anything reads the files, and not in parallel with those reads: every session starts
+    # here, so an existing install is protected in its first session on this version.
+    mig = migrate_tokens()
+    if mig["protected"]:
+        _CFG_CACHE = None
     want = getattr(a, "with_connectors", False)
     if not want:
         out, stamp = parallel([diagnose_connection, ldg_rebuild])
@@ -9245,7 +9614,7 @@ def cmd_connect(a):
             raise out
         if out.get("state") == "connected":
             out = _attach_schedule_issues(attach_currency(out, data_currency(stamp, ["asset", "user"])))
-        jout(out); return
+        jout(_attach_migration(out, mig)); return
     # The coverage lookup doesn't depend on the validation call, and this runs on the first question
     # of every session - so all three round trips go out together instead of one after another. On a
     # bad token the coverage result is simply discarded.
@@ -9263,7 +9632,16 @@ def cmd_connect(a):
             out["connectors"] = cov
         else:
             out["connectors"] = _preflight_coverage(cov)
-    jout(out)
+    jout(_attach_migration(out, mig))
+
+
+def _attach_migration(out, mig):
+    """Say once that tokens were just protected, and always say when protection failed."""
+    if mig["protected"]:
+        out["tokensProtected"] = mig["protected"]
+    if mig["problem"]:
+        out["tokenStorageNote"] = "Saved tokens were left unencrypted: %s." % mig["problem"]
+    return out
 
 
 def _env_override_warning():
@@ -9279,9 +9657,16 @@ def cmd_stacks_list(a):
     reg = load_stacks()
     rows = []
     for name, s in reg.get("stacks", {}).items():
-        tok = s.get("api_token") or ""
-        rows.append({"name": name, "active": name == reg.get("active"), "fqdn": s.get("fqdn"),
-                     "tokenLast4": tok[-4:] if tok else None, "actionToken": bool(s.get("action_token"))})
+        stored = stored_token(s, "api_token")
+        row = {"name": name, "active": name == reg.get("active"), "fqdn": s.get("fqdn"),
+               "tokenLast4": None, "tokenStorage": token_storage(stored),
+               "actionToken": bool(stored_token(s, "action_token"))}
+        try:
+            tok = reveal_token(stored) or ""
+            row["tokenLast4"] = tok[-4:] if tok else None
+        except TokenUnreadable:
+            row["tokenUnreadable"] = True
+        rows.append(row)
     jout({"active": reg.get("active"), "storePath": STACKS_PATH, "stacks": rows})
 
 
@@ -9320,6 +9705,7 @@ def cmd_stacks_add(a):
     entry = dict(reg["stacks"].get(a.name) or {})
     entry["fqdn"] = fqdn
     entry["api_token"] = token
+    entry.pop("api_token" + _PROTECTED, None)   # replaced, not kept beside the new one
     action = a.action_token
     if action == "-":
         # Same stdin channel as `--token -`, for the more powerful of the two tokens, which had no
@@ -9330,6 +9716,7 @@ def cmd_stacks_add(a):
                 "the API token on the first line and the action token on the second).")
     if action:
         entry["action_token"] = action
+        entry.pop("action_token" + _PROTECTED, None)
     if getattr(a, "insecure_tls", False):
         # Set-only, like the action token: an update that omits the flag preserves the stored
         # posture rather than silently re-enabling verification on a stack that can't pass it.
@@ -9339,7 +9726,7 @@ def cmd_stacks_add(a):
     first = reg.get("active") is None
     if first:
         reg["active"] = a.name
-    save_stacks(reg)
+    problem = save_stacks(reg)
     if reg.get("active") == a.name:
         # First stack, or an update to the already-active one (token rotation): either way
         # config.json must reflect it now, not after the next `stacks switch`.
@@ -9347,10 +9734,17 @@ def cmd_stacks_add(a):
     note = ("Saved and set active (first stack); config.json now points at it." if first
             else "Updated the active stack; config.json refreshed." if reg.get("active") == a.name
             else "Saved without touching other stacks. Run `stacks switch %s` to activate it." % a.name)
-    jout({
+    result = {
         "saved": a.name, "updated": existed, "fqdn": fqdn, "active": reg["active"],
         "activatedNow": first, "storePath": STACKS_PATH, "note": note,
-    })
+        "tokenStorage": token_storage(stored_token(entry, "api_token")),
+    }
+    if problem:
+        result["tokenStorageNote"] = "Saved unencrypted: %s." % problem
+    move = _domain_move(fqdn)
+    if move:
+        result["domainNotice"] = move
+    jout(result)
 
 
 def cmd_stacks_switch(a):
@@ -9388,7 +9782,8 @@ STACK_HISTORY_FILES = ("snapshots.%s.jsonl", "metrics.%s.json", "alerts.%s.json"
                        # A scheduled job's own output on macOS and cron; Windows keeps none.
                        "schedule/launchd.%s.log", "schedule/cron.%s.log")
 # The config.json keys mirror_active_to_config owns. Anything else there was set by hand.
-_REGISTRY_CONFIG_KEYS = ("fqdn", "api_token", "action_token", "entity_salt", "insecure_tls")
+_REGISTRY_CONFIG_KEYS = ("fqdn", "api_token", "action_token", "api_token" + _PROTECTED,
+                         "action_token" + _PROTECTED, "entity_salt", "insecure_tls")
 
 
 def _stack_files(fqdn, kinds):
@@ -9440,8 +9835,7 @@ def cmd_stacks_rm(a):
             cfg = json.load(f) or {}
     except Exception:
         cfg = {}
-    holds = (bool(fqdn) and _clean_fqdn(cfg.get("fqdn") or "") == fqdn
-             and cfg.get("api_token") == entry.get("api_token"))
+    holds = (bool(fqdn) and _clean_fqdn(cfg.get("fqdn") or "") == fqdn and _same_token(cfg, entry))
     if (was_active or holds) and reg.get("active"):
         mirror_active_to_config(reg)
         result["config"] = "switched"
@@ -9492,6 +9886,106 @@ def cmd_stacks_rm(a):
     jout(result)
 
 
+# What `stacks move` carries to the new address: everything in STACK_HISTORY_FILES that belongs to
+# the stack rather than to a scheduled job. The heartbeat stays with the job, which is pinned to the
+# old address and can never collect again, so the job is retired instead (see retire_schedule).
+STACK_MOVED_FILES = ("snapshots.%s.jsonl", "metrics.%s.json", "alerts.%s.json", "alertstate.%s.json")
+
+
+def _probe_stack(fqdn, entry):
+    """call() against a saved stack's token at `fqdn`, whichever stack config.json holds.
+    Raises what call() raises."""
+    global _CFG_CACHE, _PROBE_INSECURE_TLS
+    saved = (_CFG_CACHE, _PROBE_INSECURE_TLS)
+    _CFG_CACHE = (fqdn, stored_token(entry, "api_token"), stored_token(entry, "action_token"))
+    _PROBE_INSECURE_TLS = bool(entry.get("insecure_tls"))
+    try:
+        return call("GET", "/CMDB/v2/system/metrics/data", retries=0)
+    finally:
+        _CFG_CACHE, _PROBE_INSECURE_TLS = saved
+
+
+def cmd_stacks_move(a):
+    """Give a saved stack a new address, keeping its token, salt, history and alert rules.
+
+    Built for the lucidum.cloud -> meridian-cyderes.com retirement, but any move works. Files are keyed
+    on the address, so a plain `stacks add` with the new FQDN would start every trend from nothing
+    and leave the old history under a name nothing reads. The new address is checked with the saved
+    token BEFORE anything changes: a move to an address that doesn't answer for this token would
+    leave a stack that can't connect anywhere."""
+    reg = load_stacks()
+    if a.name not in reg.get("stacks", {}):
+        avail = ", ".join(reg.get("stacks", {})) or "(none saved yet)"
+        die("No stack named '%s'. Saved stacks: %s" % (a.name, avail))
+    entry = reg["stacks"][a.name] or {}
+    old = _clean_fqdn(entry.get("fqdn") or "")
+    new = _clean_fqdn(a.fqdn).lower()
+    if not new or "/" in new:
+        die("--fqdn takes a bare address, like company.meridian-cyderes.com (no path).")
+    if new == old.lower():
+        die("'%s' is already at %s." % (a.name, new))
+    other = sorted(n for n, s in reg["stacks"].items()
+                   if n != a.name and _clean_fqdn((s or {}).get("fqdn") or "").lower() == new)
+    if other:
+        die("Not moved: stack(s) %s already use %s. Remove or move that one first; two names for one "
+            "address share its history files." % (", ".join(other), new))
+    if old and _fqdn_slug(old) == _fqdn_slug(new):
+        clash = []     # same files (the address differs only in case): nothing to carry
+    else:
+        clash = _stack_files(new, STACK_MOVED_FILES)
+    if clash:
+        die("Not moved: %s already has history here (%s), and merging two histories isn't supported. "
+            "`stacks rm` the stack that wrote it with --purge if it isn't wanted." % (new, ", ".join(clash)))
+    try:
+        _probe_stack(new, entry)
+    except TokenUnreadable as e:
+        die("Not moved: %s" % e)
+    except Exception as e:  # noqa - reported, nothing changed
+        state, status = classify_connect_error(str(e))
+        jout({"moved": False, "name": a.name, "from": old, "to": new, "state": state, "httpStatus": status,
+              "detail": _short(str(e), 300),
+              "note": "Nothing changed: %s didn't answer for this stack's token, so '%s' stays at %s."
+                      % (new, a.name, old)})
+        return
+
+    entry["fqdn"] = new
+    reg["stacks"][a.name] = entry
+    save_stacks(reg)
+    active = reg.get("active") == a.name
+    if active:
+        mirror_active_to_config(reg)
+    result = {"moved": True, "name": a.name, "from": old, "to": new, "active": active}
+    if old and _fqdn_slug(old) != _fqdn_slug(new):
+        carried, failed = [], []
+        for kind in STACK_MOVED_FILES:
+            src = os.path.join(CFG_DIR, kind % _fqdn_slug(old))
+            if os.path.exists(src):
+                try:
+                    os.replace(src, os.path.join(CFG_DIR, kind % _fqdn_slug(new)))
+                    carried.append(kind % _fqdn_slug(new))
+                except OSError:
+                    failed.append(kind % _fqdn_slug(old))
+        result["carried"] = carried
+        if failed:
+            # The registry already points at the new address, so these are history nothing reads.
+            result["notCarried"] = failed
+            result["notCarriedNote"] = ("These stayed under the old address; move them by hand to "
+                                        "the new name in %s, or the history in them is not used." % CFG_DIR)
+        result["cachesDeleted"], _ = _delete_stack_files(_stack_files(old, STACK_CACHE_FILES))
+        retired = retire_schedule(old)
+        if retired:
+            result["scheduleWarning"] = ("The scheduled job for %s is pinned to the old address and "
+                                         "can't collect again. Unregister it, then run `schedule show` "
+                                         "to set one up for %s." % (old, new))
+            result["unregister"] = retired["unregister"]
+    warn = _env_override_warning() if active else None
+    if warn:
+        result["warning"] = warn
+    result["note"] = ("Moved '%s' from %s to %s, and checked that the new address answers for its "
+                      "token. Its token, history and alert rules came with it." % (a.name, old, new))
+    jout(result)
+
+
 def cmd_check(a):
     fqdn, api_token, action_token = load_config()
     probes = [
@@ -9510,7 +10004,8 @@ def cmd_check(a):
             # "code":403001 was misreported as FORBIDDEN -- blaming the token for a server fault.
             state, code = classify_connect_error(str(out))
             st = {"auth_error": "UNAUTHORIZED", "forbidden": "FORBIDDEN",
-                  "tls_untrusted": "TLS_UNTRUSTED"}.get(state) or \
+                  "tls_untrusted": "TLS_UNTRUSTED", "token_unreadable": "TOKEN_UNREADABLE",
+                  "stack_moved": "STACK_MOVED"}.get(state) or \
                  ("NOT_FOUND" if code == 404 else "HTTP_ERROR" if state == "http_error" else "UNREACHABLE")
             caps.append({"area": label, "status": st} if code is None
                         else {"area": label, "status": st, "httpStatus": code})
@@ -10727,6 +11222,16 @@ def build_parser():
     sh.set_defaults(func=cmd_schedule)
     scs.add_parser("status", help="when each scheduled job last ran, whether it worked, and whether it "
                                   "has stopped").set_defaults(func=cmd_schedule)
+    sx = scs.add_parser("rm", help="retire a scheduled job: stop reporting it and delete its written "
+                                   "definition, keeping its run history; prints the OS unregister command "
+                                   "(never runs it)")
+    sx.add_argument("--stack", metavar="FQDN", help="the job's stack (default: the active stack)")
+    sx.add_argument("--all", dest="all_jobs", action="store_true",
+                    help="every scheduled job this machine knows of, for any stack")
+    sx.add_argument("--os", dest="target_os", choices=("windows", "macos", "linux", "cron"),
+                    help="which scheduler's unregister command to print, when no written definition "
+                         "says (default: this machine's)")
+    sx.set_defaults(func=cmd_schedule)
 
     al = sub.add_parser("alerts", help="threshold rules evaluated against this stack's local history")
     als = al.add_subparsers(dest="alerts_cmd", required=True)
@@ -10895,6 +11400,12 @@ def build_parser():
                     help="also delete this stack's snapshot history, metrics, alert rules and "
                          "heartbeat (cannot be undone; caches are always deleted)")
     sr.set_defaults(func=cmd_stacks_rm)
+    sm = sksub.add_parser("move", help="give a saved stack a new address (e.g. its meridian-cyderes.com "
+                                       "one), keeping its token, history and alert rules; checks the "
+                                       "new address first")
+    sm.add_argument("name")
+    sm.add_argument("--fqdn", required=True, help="the new address, e.g. company.meridian-cyderes.com")
+    sm.set_defaults(func=cmd_stacks_move)
 
     s = sub.add_parser("report", help="branded PDF from any verb's JSON -- the shareable deliverable")
     s.add_argument("--input", nargs="+",

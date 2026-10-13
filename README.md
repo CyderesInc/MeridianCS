@@ -171,7 +171,7 @@ Two things catch people out. Meridian shows the token **once** — copy it befor
 **SSO accounts cannot use the API at all**; the token must come from a local Meridian account holding
 the `Api_Users` role.
 
-You will also be asked for your **FQDN** — e.g. `company.lucidum.cloud`, with no `https://` and no
+You will also be asked for your **FQDN** — e.g. `company.meridian-cyderes.com`, with no `https://` and no
 trailing path.
 
 ### Staying up to date
@@ -274,7 +274,7 @@ them. Save them with `stacks add` (below) rather than writing the file by hand: 
 it owner-only and keeps the per-stack `entity_salt` that entity snapshots depend on.
 
 ```json
-{ "fqdn": "company.lucidum.cloud", "api_token": "…", "action_token": "…(optional, LDG only)" }
+{ "fqdn": "company.meridian-cyderes.com", "api_token": "…", "action_token": "…(optional, LDG only)" }
 ```
 
 ### Multiple stacks
@@ -284,7 +284,7 @@ stacks' credentials are never overwritten. All named stacks live in `~/.meridian
 existing single-stack `config.json` is migrated in automatically on first use.
 
 ```bash
-printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.lucidum.cloud --token -
+printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.meridian-cyderes.com --token -
 python scripts/meridian.py stacks switch prod        # activate + validate
 python scripts/meridian.py stacks list               # tokens redacted to last 4
 ```
@@ -293,6 +293,12 @@ python scripts/meridian.py stacks list               # tokens redacted to last 4
 omitting `--token` uses `MERIDIAN_API_TOKEN` instead. `--action-token -` does the same for the
 action token, read as the next line. A stack with a
 self-signed certificate takes `--insecure-tls`, stored per stack and carried across switches.
+
+`python scripts/meridian.py stacks move <name> --fqdn <new address>` changes a saved stack's
+address and keeps its token, history and alert rules. Meridian is retiring `lucidum.cloud` addresses
+on 2026-12-05 in favour of `meridian-cyderes.com` (`company.lucidum.cloud` becomes
+`company.meridian-cyderes.com`); the skill says so when it connects to an old address, and the move
+checks that the new one answers before it changes anything.
 
 `python scripts/meridian.py stacks rm <name>` removes one, with its caches. Its snapshot history,
 metrics and alert rules stay on disk unless you add `--purge`, which deletes them for good. If it was
@@ -327,9 +333,11 @@ Both apply to every verified connection: your stack, update checks, and alert we
 
 ### Recommended hardening
 
-`config.json` and `stacks.json` hold plaintext tokens for *every* saved stack, so a single leak now
-exposes each one. The scripts read these files in-process and never need an agent to open them —
-so denying agent read access costs no functionality. Add to `~/.claude/settings.json` (macOS) or
+`config.json` and `stacks.json` hold the tokens for *every* saved stack. On Windows they are encrypted
+to your Windows account, so a copy of the files is useless anywhere else. On macOS and Linux they are
+plain text that only your user can read, so a single leaked copy exposes each one. Either way,
+anything running as you can still use them. The scripts read these files in-process and never need
+an agent to open them, so denying agent read access costs no functionality. Add to `~/.claude/settings.json` (macOS) or
 `%USERPROFILE%\.claude\settings.json` (Windows):
 
 ```json

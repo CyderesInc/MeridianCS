@@ -302,6 +302,34 @@ Two things this does **not** change:
 Add new output through `jout()` rather than a bare `print(json.dumps(...))`, or that verb quietly
 becomes the expensive one again.
 
+## Token storage
+
+Saved tokens are encrypted at rest on Windows with DPAPI, current-user scope
+(`design/token-encryption.md`, phase 1). macOS (keychain) is phase 2; Linux keeps the `0600` file.
+
+- **A protected token lives under `<kind>_protected`** (`{"scheme": "dpapi-user-v1", "data":
+  <base64>}`), and its plaintext key is absent. An older version therefore reads "no token" and
+  reports `not_configured`, instead of sending a garbage bearer header and blaming the token. When
+  both forms are present, **plaintext wins**: only an older version writes plaintext beside a
+  protected value, after a rotation, so it is the newer token. The next write protects it.
+- **Every reader goes through `stored_token()`,** and only `call()` and `connect`'s last-4 decrypt
+  (`reveal_token()`). `load_config()` returns the stored form, so verbs that only want the fqdn
+  (every history path) never import `ctypes`. That import is the real cost: ~17ms on Python 3.14,
+  against 0.4ms per decrypt. `ctypes.wintypes` would add ~6ms, so it isn't imported.
+- **Writes protect in `save_stacks()` and the mirror.** `_protect_entry()` decrypts each new blob
+  and compares it before dropping the plaintext, and on any failure it keeps the plaintext and
+  reports why. A token is never lost to its own protection.
+- **`connect` migrates** (`migrate_tokens()`): `stacks.json`, then `config.json`, each rewritten only
+  if it holds a plaintext token. It reports `tokensProtected` once, `tokenStorageNote` on failure,
+  and never fails `connect`.
+- **A token that can't be decrypted is `token_unreadable`,** and never `not_configured`. It is
+  raised before any request, so it never reaches the stack.
+- **Tests:** the suite's module fixture sets `_PROTECT_WRITES = False`, so fixtures stay plaintext.
+  Decryption is never switched off, because `--live` reads the operator's real, protected config.
+  `test_live` runs `connect` with credentials in env vars and an empty `HOME`: run against the real
+  `~/.meridian`, it would migrate the operator's files from whatever branch the suite runs on.
+  There is deliberately no user-facing opt-out (decision 2).
+
 ## Rate limiting
 
 `meridian.py` self-paces every request through `pace()`, a file-based token bucket

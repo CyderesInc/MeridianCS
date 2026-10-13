@@ -26,7 +26,7 @@
 >
 > **To point me at your Meridian stack, I need two things:**
 >
-> 1. **FQDN** — your Meridian address, e.g. `company.lucidum.cloud` (no `https://`, no path).
+> 1. **FQDN** — your Meridian address, e.g. `company.meridian-cyderes.com` (no `https://`, no path).
 > 2. **API token** — a *User Generated* token. In Meridian: **Settings → User Management →** your
 >    account **→ Edit**, make sure the **`Api_Users`** role is assigned, then **Generate Token** and
 >    copy it (Meridian shows it only once).

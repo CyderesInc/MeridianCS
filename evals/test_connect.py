@@ -62,6 +62,9 @@ def load_meridian():
     spec = importlib.util.spec_from_file_location("meridian", MERIDIAN_PY)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # Fixtures write tokens and assert on them, so writes stay plaintext unless a test opts in
+    # (test_token_*). Decryption stays on: --live reads the operator's real, protected config.
+    mod._PROTECT_WRITES = False
     return mod
 
 
@@ -5664,8 +5667,19 @@ def test_retention(m, monkeypatch, capsys, tmp_path):
 
 @pytest.mark.live
 def test_live():
-    proc = subprocess.run([sys.executable, MERIDIAN_PY, "connect"],
-                          capture_output=True, text=True, timeout=60)
+    # Credentials go in through the env-var path, with HOME pointed at an empty directory. Run against
+    # the real ~/.meridian, `connect` would migrate the operator's token files in place -- and a run
+    # from a branch would leave them in a format the deployed skill on `main` may not read yet.
+    mod = load_meridian()
+    fqdn, stored, _ = mod.load_config()
+    with tempfile.TemporaryDirectory() as home:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MERIDIAN_")}
+        env.update({"HOME": home, "USERPROFILE": home, "MERIDIAN_FQDN": fqdn,
+                    "MERIDIAN_API_TOKEN": mod.reveal_token(stored)})
+        env.pop("HOMEDRIVE", None)
+        env.pop("HOMEPATH", None)
+        proc = subprocess.run([sys.executable, MERIDIAN_PY, "connect"],
+                              capture_output=True, text=True, timeout=60, env=env)
     out = json.loads(proc.stdout)
     check("state == connected", out.get("state"), "connected")
     check("assetCount is a number", isinstance(out.get("assetCount"), (int, float)), True)
@@ -6403,7 +6417,7 @@ CURRENCY_RULES = (
     ("...and says what to write when it's unknown", "(data currency could not be confirmed: {reason})"),
     ("...and names it the baseline for later answers", "baseline every later answer's rebuild is compared against"),
     ("rule 1: stamp every data answer", "**Stamp every data answer**"),
-    ("...in the approved label form", "_Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild) · company.lucidum.cloud_"),
+    ("...in the approved label form", "_Data as of 2026-09-24 10:12 UTC (latest Meridian rebuild) · company.meridian-cyderes.com_"),
     ("...UTC spelled out", "`UTC` spelled out"),
     ("...never relative", 'Never write "2 hours ago"'),
     ("...never local time", "never convert to local time"),
@@ -9082,6 +9096,273 @@ def test_stack_file_tables_cover_every_writer(m):
     check("cron's log template is the one the table names", "cron.%s.log" in built, True)
 
 
+def test_stack_move_tables(m):
+    """Every history file is either carried by `stacks move` or deliberately left with the job.
+    A new kind of history added to STACK_HISTORY_FILES has to be decided here, or a move would leave
+    it under the old address where nothing reads it."""
+    job_owned = {"heartbeat.%s.jsonl", "heartbeat.%s.jsonl.lock", "schedule/launchd.%s.log",
+                 "schedule/cron.%s.log"}
+    check("every history file is moved or belongs to the scheduled job",
+          sorted(set(m.STACK_HISTORY_FILES) - set(m.STACK_MOVED_FILES) - job_owned), [])
+    check("nothing is moved that stacks rm doesn't know about",
+          sorted(set(m.STACK_MOVED_FILES) - set(m.STACK_HISTORY_FILES)), [])
+
+
+def test_successor_fqdn(m):
+    """The lucidum.cloud -> meridian-cyderes.com mapping is the only thing that lets a redirect be
+    recognised as the same stack, so its edges are pinned: a lookalike must not match."""
+    for fqdn, want in (("acme.lucidum.cloud", "acme.meridian-cyderes.com"),
+                       ("https://Company.lucidum.cloud/", "company.meridian-cyderes.com"),
+                       ("acme.company.lucidum.cloud", "acme.company.meridian-cyderes.com"),
+                       ("lucidum.cloud", None),
+                       ("evil-lucidum.cloud", None),
+                       ("acme.lucidum.cloud.evil.example", None),
+                       ("acme.meridian-cyderes.com", None),
+                       ("stack.example", None)):
+        check("successor of %s" % fqdn, m.successor_fqdn(fqdn)[0], want)
+    check("the retirement date travels with it", m.successor_fqdn("acme.lucidum.cloud")[1], "2026-12-05")
+
+
+def _domain_env(m, monkeypatch, tmp_path):
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp, "stacks.json"))
+    monkeypatch.setattr(m, "_CFG_CACHE", None)
+    monkeypatch.setattr(m, "pace", lambda: None)
+    monkeypatch.setattr(m, "_ssl_context", lambda: None)
+    for v in ("MERIDIAN_FQDN", "MERIDIAN_API_TOKEN", "MERIDIAN_ACTION_TOKEN", "MERIDIAN_INSECURE_TLS"):
+        monkeypatch.delenv(v, raising=False)
+    return tmp
+
+
+def _domain_add(m, capsys, name, fqdn, token):
+    class A:
+        pass
+    A.name, A.fqdn, A.token, A.action_token = name, fqdn, token, None
+    m.cmd_stacks_add(A())
+    return json.loads(capsys.readouterr().out)
+
+
+def test_stack_moved_state(m, monkeypatch, capsys, tmp_path):
+    """acme.lucidum.cloud began answering with a 301 to acme.meridian-cyderes.com (2026-10-13), and
+    connect reported it as a generic http_error whose advice was to retry. A redirect to the stack's
+    own successor is now `stack_moved`, still without sending the token there."""
+    _domain_env(m, monkeypatch, tmp_path)
+    add = _domain_add(m, capsys, "acme", "acme.lucidum.cloud", "tok-acme-1111")
+    check("stacks add on a retiring domain names the new address",
+          (add.get("domainNotice") or {}).get("to"), "acme.meridian-cyderes.com")
+    sent = []
+
+    def moved(fqdn, key, ctx, method, endpoint, data, headers):
+        sent.append(fqdn)
+        return 301, "", "https://acme.meridian-cyderes.com" + endpoint, None
+
+    monkeypatch.setattr(m, "_round_trip", moved)
+    try:
+        m.call("GET", "/CMDB/v2/system/metrics/data", retries=0)
+        check("a redirect to the successor raises", False, True)
+    except RuntimeError as e:
+        check("...as a stack move", m.classify_connect_error(str(e)), ("stack_moved", None))
+    check("the token never went to the new address", sent, ["acme.lucidum.cloud"])
+
+    m._CFG_CACHE = None
+    out = m.diagnose_connection()
+    check("connect reports stack_moved", out["state"], "stack_moved")
+    check("...naming the new address", out["domainMove"]["to"], "acme.meridian-cyderes.com")
+    check("...with the command that moves this saved stack", out["domainMove"].get("move"),
+          "python scripts/meridian.py stacks move acme --fqdn acme.meridian-cyderes.com")
+    check("...and no advice to ask for a token", "Don't ask for a new token" in out["hint"], True)
+    check("no token in the result", "tok-acme" in json.dumps(out), False)
+
+    # A redirect anywhere else is still the plain refusal: only the successor is known to be the stack.
+    monkeypatch.setattr(m, "_round_trip", lambda *a: (301, "", "https://acme.meridian-cyderes.com.evil.example/x", None))
+    m._CFG_CACHE = None
+    out = m.diagnose_connection()
+    check("a lookalike redirect is not a stack move", out["state"], "http_error")
+    check("...and offers no move", "domainMove" in out, False)
+
+    # After retirement the old address won't answer at all; unreachable then suggests the move.
+    def gone(*a):
+        raise OSError("[Errno 11001] getaddrinfo failed")
+    monkeypatch.setattr(m, "_round_trip", gone)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    m._CFG_CACHE = None
+    out = m.diagnose_connection()
+    check("an unreachable retiring address stays unreachable", out["state"], "unreachable")
+    check("...but its hint names the new address", "acme.meridian-cyderes.com" in out["hint"], True)
+    check("...and carries the move", out["domainMove"].get("stack"), "acme")
+
+    # Still working: connected, with a notice so the move happens before the date.
+    monkeypatch.setattr(m, "_round_trip", lambda *a: (200, '{"assetCount": 5, "userCount": 2}', None, None))
+    m._CFG_CACHE = None
+    out = m.diagnose_connection()
+    check("a working retiring address connects", out["state"], "connected")
+    check("...with a domain notice", out["domainNotice"]["retires"], "2026-12-05")
+
+    # A stack on any other domain hears nothing about it.
+    _domain_add(m, capsys, "other", "other.example.com", "tok-other-2222")
+    monkeypatch.setattr(m, "_round_trip", gone)
+    class S:
+        name = "other"
+    m.cmd_stacks_switch(S())
+    out = json.loads(capsys.readouterr().out)
+    check("another domain's unreachable carries no move", "domainMove" in out, False)
+
+
+def test_stacks_move(m, monkeypatch, capsys, tmp_path):
+    """A plain `stacks add` with the new address would start every trend from nothing, because
+    history files are keyed on the address. `stacks move` keeps the token and salt, carries the
+    history, retires the scheduled job pinned to the old address, and checks the new address
+    answers for the stack's token before any of it happens."""
+    tmp = _domain_env(m, monkeypatch, tmp_path)
+    _domain_add(m, capsys, "acme", "acme.lucidum.cloud", "tok-acme-1111")
+    _domain_add(m, capsys, "beta", "beta.example.com", "tok-beta-2222")
+    reg = m.load_stacks()
+    reg["stacks"]["acme"]["entity_salt"] = "salt-acme"
+    m.save_stacks(reg)
+    m.mirror_active_to_config(reg)
+    old, new = "acme.lucidum.cloud", "acme.meridian-cyderes.com"
+
+    def write(name, text):
+        os.makedirs(os.path.dirname(os.path.join(tmp, name)), exist_ok=True)
+        with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    for k in m.STACK_MOVED_FILES:
+        write(k % old, "history:" + k)
+    for k in m.STACK_CACHE_FILES:
+        write(k % old, "{}")
+    label = m.SCHEDULE_LABEL_PREFIX + old
+    write("schedule/%s.xml" % label, "<Task/>")
+    write("heartbeat.%s.jsonl" % old, json.dumps({"event": "finished", "run": "r1", "ok": True,
+                                                  "ts": "2026-10-12T17:00:41Z", "stack": old,
+                                                  "cadence": "daily"}) + "\n")
+
+    def move(name, fqdn):
+        class A:
+            pass
+        A.name, A.fqdn = name, fqdn
+        m.cmd_stacks_move(A())
+        raw = capsys.readouterr().out
+        return json.loads(raw), raw
+
+    # --- the new address doesn't answer for this token: nothing changes ----------------------------
+    probed = []
+    monkeypatch.setattr(m, "_round_trip", lambda fq, k, c, meth, ep, d, h:
+                        probed.append((fq, h.get("Authorization"))) or (401, '{"status":401}', None, None))
+    out, raw = move("acme", new)
+    check("a failed check does not move", out["moved"], False)
+    check("...says why", out["state"], "auth_error")
+    check("...and the registry still has the old address", m.load_stacks()["stacks"]["acme"]["fqdn"], old)
+    check("...and the history is where it was", all(os.path.exists(os.path.join(tmp, k % old))
+                                                     for k in m.STACK_MOVED_FILES), True)
+    check("the check went to the new address with this stack's token", probed,
+          [(new, "Bearer tok-acme-1111")])
+
+    # --- refusals before any request ---------------------------------------------------------------
+    for args, why in ((("acme", old), "same address"), (("acme", "beta.example.com"), "address in use"),
+                      (("nope", new), "unknown stack")):
+        probed.clear()
+        with pytest.raises(SystemExit):
+            move(*args)
+        capsys.readouterr()
+        check("refused (%s) without a request" % why, probed, [])
+    write("snapshots.%s.jsonl" % "clash.example.com", "x")
+    probed.clear()
+    with pytest.raises(SystemExit):
+        move("beta", "clash.example.com")
+    check("refused onto an address that already has history", "merging" in capsys.readouterr().err, True)
+
+    # --- the move -----------------------------------------------------------------------------------
+    probed.clear()
+    monkeypatch.setattr(m, "_round_trip", lambda fq, k, c, meth, ep, d, h:
+                        probed.append(fq) or (200, '{"assetCount": 5, "userCount": 2}', None, None))
+    out, raw = move("acme", new)
+    check("moved", out["moved"], True)
+    check("checked the new address first", probed, [new])
+    entry = m.load_stacks()["stacks"]["acme"]
+    check("the registry has the new address", entry["fqdn"], new)
+    check("...the same token", m.reveal_token(m.stored_token(entry, "api_token")), "tok-acme-1111")
+    check("...and the same salt", entry.get("entity_salt"), "salt-acme")
+    with open(m.CFG_PATH, encoding="utf-8") as f:
+        cfg = json.load(f)
+    check("config.json follows the active stack", (cfg["fqdn"], cfg.get("entity_salt")), (new, "salt-acme"))
+    for k in m.STACK_MOVED_FILES:
+        p = os.path.join(tmp, k % new)
+        check("%s carried" % k, open(p, encoding="utf-8").read() if os.path.exists(p) else None,
+              "history:" + k)
+        check("%s gone from the old name" % k, os.path.exists(os.path.join(tmp, k % old)), False)
+    check("old caches deleted", [k for k in m.STACK_CACHE_FILES if os.path.exists(os.path.join(tmp, k % old))], [])
+    check("the pinned job is retired", [j["stack"] for j in m.collection_status()["jobs"]], [])
+    check("...its definition deleted", os.path.exists(os.path.join(tmp, "schedule", label + ".xml")), False)
+    check("...and the unregister command handed over", out.get("unregister"),
+          m._schedule_unregister("windows", label))
+    check("no token in the output", "tok-acme" in raw, False)
+
+    # Moving a stack that isn't active leaves config.json alone and uses that stack's own token.
+    probed.clear()
+    monkeypatch.setattr(m, "_round_trip", lambda fq, k, c, meth, ep, d, h:
+                        probed.append(h.get("Authorization")) or (200, "{}", None, None))
+    out, _ = move("beta", "beta2.example.com")
+    check("an inactive stack moves", (out["moved"], out["active"]), (True, False))
+    check("...checked with its own token", probed, ["Bearer tok-beta-2222"])
+    with open(m.CFG_PATH, encoding="utf-8") as f:
+        check("...and config.json still points at the active stack", json.load(f)["fqdn"], new)
+
+
+def test_schedule_rm(m, monkeypatch, capsys, tmp_path):
+    """Jobs are found from their heartbeats, so an unregistered task read as `stopped` at every
+    session start for good. `schedule rm` retires it: history kept, the definition deleted, and
+    nothing done to the OS scheduler."""
+    tmp = _domain_env(m, monkeypatch, tmp_path)
+    _domain_add(m, capsys, "demo", "demo.example.com", "tok-acme-1111")
+
+    def beat(fq, ts, event="finished"):
+        with open(os.path.join(tmp, "heartbeat.%s.jsonl" % fq), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": event, "run": ts, "ok": False, "ts": ts, "stack": fq,
+                                "cadence": "daily"}) + "\n")
+
+    beat("demo.example.com", "2026-10-01T10:00:00Z")
+    beat("gone.example.com", "2026-10-02T10:00:00Z")
+    os.makedirs(os.path.join(tmp, "schedule"))
+    only_def = m.SCHEDULE_LABEL_PREFIX + "written.example.com.plist"
+    open(os.path.join(tmp, "schedule", only_def), "w").close()
+    check("two jobs report before", len(m.collection_status()["jobs"]), 2)
+
+    out = m.schedule_rm(all_jobs=True)
+    check("--all retires every job and every written definition",
+          sorted(r["stack"] for r in out["retired"]),
+          ["demo.example.com", "gone.example.com", "written.example.com"])
+    check("...the definition's own scheduler names its unregister command",
+          next(r for r in out["retired"] if r["stack"] == "written.example.com")["os"], "macos")
+    check("nothing reports afterwards", m.collection_status()["jobs"], [])
+    check("...and connect carries no schedule issue", m.schedule_issues(), None)
+    check("history is kept", sum(1 for _ in open(os.path.join(tmp, "heartbeat.demo.example.com.jsonl"))), 2)
+    again = m.schedule_rm()
+    check("a second rm finds nothing for the active stack", again.get("noJob"), ["demo.example.com"])
+
+    beat("demo.example.com", "2026-10-14T10:00:00Z")
+    check("a run after retirement brings the job back",
+          [j["stack"] for j in m.collection_status()["jobs"]], ["demo.example.com"])
+
+
+def test_domain_move_routing():
+    """The move is persistent configuration, and stack_moved must not send the user through
+    onboarding for a token they already have. SKILL.md carries both; nothing else would notice
+    either rule being dropped."""
+    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
+        skill = " ".join(f.read().split())
+    for rule in ("| `stack_moved` |",
+                 "**H — stack_moved:**",
+                 "If the result carries `domainNotice`",
+                 "stacks move",
+                 "schedule rm",
+                 "company.meridian-cyderes.com"):
+        check("SKILL.md carries: %s" % rule[:50], rule in skill, True)
+    check("SKILL.md's examples no longer teach the retiring domain", "company.lucidum.cloud" in skill, False)
+
+
 # Upload fields are not encrypt-marked, so the API returns them as plaintext keys (2026-10-07). The
 # allow-list keeps the fields out of output; these are the messages that quote them anyway. All key
 # material here is made up.
@@ -9149,3 +9430,261 @@ def test_private_key_scrub(m, monkeypatch):
           "abc123secret" in s("private_key=abc123secret"), False)
     check("a non-JSON string starting with { is still collected as a plain value",
           m._profile_secrets({"token": "{not json"}), {"{not json"})
+
+
+def _token_sandbox(m, monkeypatch, tmp_path):
+    """A temp ~/.meridian with protected writes ON and no MERIDIAN_* env, for the token tests."""
+    tmp = tempfile.mkdtemp(dir=tmp_path)
+    monkeypatch.setattr(m, "CFG_DIR", tmp)
+    monkeypatch.setattr(m, "CFG_PATH", os.path.join(tmp, "config.json"))
+    monkeypatch.setattr(m, "STACKS_PATH", os.path.join(tmp, "stacks.json"))
+    monkeypatch.setattr(m, "_CFG_CACHE", None)
+    monkeypatch.setattr(m, "_PROTECT_WRITES", None)
+    for v in ("MERIDIAN_FQDN", "MERIDIAN_API_TOKEN", "MERIDIAN_ACTION_TOKEN"):
+        monkeypatch.delenv(v, raising=False)
+    return tmp
+
+
+class _FakeDpapi:
+    """Stands in for DPAPI: reversible, refuses anything it didn't make, and counts decrypts."""
+    def __init__(self, scheme, lie=False, fail=False):
+        self.scheme, self.lie, self.fail, self.decrypts = scheme, lie, fail, 0
+
+    def protect(self, b):
+        if self.fail:
+            raise OSError("simulated DPAPI failure")
+        return b"FAKE:" + b[::-1]
+
+    def unprotect(self, b):
+        self.decrypts += 1
+        if not b.startswith(b"FAKE:"):
+            raise OSError("not a blob this key made")
+        return b"wrong" if self.lie else b[5:][::-1]
+
+    def tuple(self):
+        return (self.scheme, self.protect, self.unprotect)
+
+
+def _add_stack(m, capsys, name, fqdn, token, action=None):
+    class A:
+        pass
+    A.name, A.fqdn, A.token, A.action_token = name, fqdn, token, action
+    m.cmd_stacks_add(A())
+    return json.loads(capsys.readouterr().out)
+
+
+def _raw(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def test_token_storage(m, monkeypatch, capsys, tmp_path):
+    """design/token-encryption.md, phase 1: tokens are protected on every write, readers decrypt
+    only at the point of use, and an undecryptable token is token_unreadable, never not_configured.
+    A fake protector stands in for DPAPI; test_token_dpapi_real runs the real one on Windows."""
+    _token_sandbox(m, monkeypatch, tmp_path)
+    fake = _FakeDpapi(m.DPAPI_SCHEME)
+    monkeypatch.setattr(m, "_TOKEN_PROTECTOR", fake.tuple())
+
+    # --- every write path protects -----------------------------------------------------------------
+    out = _add_stack(m, capsys, "alpha", "alpha.example.com", "tok-alpha-secret-1111", action="act-alpha-9999")
+    check("stacks add reports the token as protected", out.get("tokenStorage"), "dpapi")
+    for path in (m.STACKS_PATH, m.CFG_PATH):
+        raw = _raw(path)
+        check("%s holds no plaintext token" % os.path.basename(path), b"tok-alpha" in raw, False)
+        check("%s holds no plaintext action token" % os.path.basename(path), b"act-alpha" in raw, False)
+    cfg = json.loads(_raw(m.CFG_PATH))
+    reg = m.load_stacks()
+    check("config.json carries the registry's protected value, not a second encryption",
+          cfg.get("api_token_protected"), reg["stacks"]["alpha"].get("api_token_protected"))
+    check("...and no plaintext key at all", "api_token" in cfg or "action_token" in cfg, False)
+
+    # --- reading the fqdn decrypts nothing; a request decrypts at the point of use ------------------
+    fake.decrypts = 0
+    fqdn, api, action = m.load_config()
+    m._snapshots_path()
+    check("load_config hands back the stored form", isinstance(api, dict), True)
+    check("...and offline paths never decrypt", fake.decrypts, 0)
+    sent = []
+    monkeypatch.setattr(m, "pace", lambda: None)
+    monkeypatch.setattr(m, "_ssl_context", lambda: None)
+    monkeypatch.setattr(m, "_round_trip", lambda fq, k, c, meth, ep, data, headers:
+                        (sent.append(headers["Authorization"]), (200, '{"ok": 1}', None, None))[1])
+    check("call() works with a protected token", m.call("GET", "/CMDB/v2/x"), {"ok": 1})
+    check("...sending the decrypted token", sent[-1], "Bearer tok-alpha-secret-1111")
+    m.call("GET", "/CMDB/v2/data/ldg/x")
+    check("...and the action token for LDG", sent[-1], "Bearer act-alpha-9999")
+
+    # --- stacks list: last 4 from the decrypted token, storage reported, nothing else leaks ----------
+    m.cmd_stacks_list(None)
+    raw_out = capsys.readouterr().out
+    row = json.loads(raw_out)["stacks"][0]
+    check("stacks list shows the last 4", row["tokenLast4"], "1111")
+    check("...and where the token lives", row["tokenStorage"], "dpapi")
+    check("...and never the token", "tok-alpha" in raw_out or "FAKE:" in raw_out, False)
+
+    # --- plaintext beside protected: plaintext wins, then gets protected -----------------------------
+    cfg = json.loads(_raw(m.CFG_PATH))
+    cfg["api_token"] = "tok-rotated-by-old-version"   # what an older install writes after a rotation
+    m._private_write(m.CFG_PATH, cfg)
+    monkeypatch.setattr(m, "_CFG_CACHE", None)
+    check("plaintext wins over a protected value", m.load_config()[1], "tok-rotated-by-old-version")
+    mig = m.migrate_tokens()
+    check("...and the next migration protects it", mig, {"protected": 1, "problem": None})
+    cfg = json.loads(_raw(m.CFG_PATH))
+    check("...replacing the stale protected value",
+          m.reveal_token(cfg["api_token_protected"]), "tok-rotated-by-old-version")
+    check("...with no plaintext left", "api_token" in cfg, False)
+
+    # --- token_unreadable: never not_configured, never sent ------------------------------------------
+    cfg["api_token_protected"] = {"scheme": m.DPAPI_SCHEME, "data": "Tk9UQUJMT0I="}   # "NOTABLOB"
+    m._private_write(m.CFG_PATH, cfg)
+    monkeypatch.setattr(m, "_CFG_CACHE", None)
+    called = []
+    monkeypatch.setattr(m, "_round_trip", lambda *a: called.append(a) or (200, "{}", None, None))
+    diag = m.diagnose_connection()
+    check("an undecryptable token is token_unreadable", diag["state"], "token_unreadable")
+    check("...not not_configured", diag["state"] == "not_configured", False)
+    check("...says a token IS saved and how to replace it",
+          "IS saved" in diag["hint"] and "stacks add" in diag["hint"], True)
+    check("...and makes no request", called, [])
+    try:
+        m.call("GET", "/CMDB/v2/x")
+        check("call() refuses an undecryptable token", False, True)
+    except m.TokenUnreadable as e:
+        check("call()'s error classifies as token_unreadable", m.classify_connect_error(str(e)),
+              ("token_unreadable", None))
+    check("...still without a request", called, [])
+    # A value naming another scheme is never handed to this protector, even if its bytes would
+    # decrypt: a phase-2 keychain reference is not a DPAPI blob.
+    good = json.loads(_raw(m.STACKS_PATH))["stacks"]["alpha"]["api_token_protected"]
+    try:
+        m.reveal_token({"scheme": "keychain-v1", "data": good["data"]})
+        check("another scheme's value is refused", False, True)
+    except m.TokenUnreadable as e:
+        check("another scheme's value is refused, naming it", "keychain-v1" in str(e), True)
+    # Saved on Windows, read where there is no DPAPI (a copied ~/.meridian): the same state.
+    monkeypatch.setattr(m, "_TOKEN_PROTECTOR", False)
+    cfg["api_token_protected"] = json.loads(_raw(m.STACKS_PATH))["stacks"]["alpha"]["api_token_protected"]
+    m._private_write(m.CFG_PATH, cfg)
+    check("a protected token on a machine without DPAPI is token_unreadable",
+          m.diagnose_connection()["state"], "token_unreadable")
+    monkeypatch.setattr(m, "_TOKEN_PROTECTOR", fake.tuple())
+
+    # --- stacks rm sees through the protection ------------------------------------------------------
+    _add_stack(m, capsys, "beta", "beta.example.com", "tok-beta-secret-2222")
+    reg = m.load_stacks()
+    reg["active"] = "alpha"
+    m.save_stacks(reg)
+    m.mirror_active_to_config(reg)
+
+    class R:
+        name, purge = "alpha", False
+    m.cmd_stacks_rm(R())
+    out = json.loads(capsys.readouterr().out)
+    check("rm recognises the protected token config.json holds", out["config"], "switched")
+    check("...and config.json now decrypts to the remaining stack",
+          m.reveal_token(m.stored_token(json.loads(_raw(m.CFG_PATH)), "api_token")), "tok-beta-secret-2222")
+    R.name = "beta"
+    m.cmd_stacks_rm(R())
+    out = json.loads(capsys.readouterr().out)
+    cfg = json.loads(_raw(m.CFG_PATH))
+    check("removing the last stack clears the protected keys too",
+          (out["config"], [k for k in cfg if "token" in k]), ("cleared", []))
+
+
+def test_token_migration_on_connect(m, monkeypatch, capsys, tmp_path):
+    """Decision 4: connect protects plaintext tokens already on disk, verifies each before dropping
+    the plaintext, rewrites nothing once migrated, and never fails because protection did."""
+    _token_sandbox(m, monkeypatch, tmp_path)
+    monkeypatch.setattr(m, "diagnose_connection", lambda: {"state": "connected"})
+    monkeypatch.setattr(m, "ldg_rebuild", lambda: {})
+    monkeypatch.setattr(m, "attach_currency", lambda out, *a, **k: out)
+    monkeypatch.setattr(m, "data_currency", lambda *a, **k: {})
+    monkeypatch.setattr(m, "_attach_schedule_issues", lambda out: out)
+
+    def connect():
+        m.cmd_connect(argparse.Namespace(with_connectors=False))
+        return json.loads(capsys.readouterr().out)
+
+    def seed_plaintext():
+        monkeypatch.setattr(m, "_PROTECT_WRITES", False)   # what an older version left on disk
+        _add_stack(m, capsys, "one", "one.example.com", "tok-one-plain-3333")
+        _add_stack(m, capsys, "two", "two.example.com", "tok-two-plain-4444")
+        monkeypatch.setattr(m, "_PROTECT_WRITES", None)
+
+    fake = _FakeDpapi(m.DPAPI_SCHEME)
+    monkeypatch.setattr(m, "_TOKEN_PROTECTOR", fake.tuple())
+    seed_plaintext()
+    check("seeded files are plaintext", b"tok-one-plain" in _raw(m.STACKS_PATH), True)
+    out = connect()
+    check("connect protects every plaintext token (two stacks + config.json's copy)",
+          out.get("tokensProtected"), 3)
+    for path in (m.STACKS_PATH, m.CFG_PATH):
+        check("...leaving none in %s" % os.path.basename(path), b"-plain-" in _raw(path), False)
+    before = (_raw(m.STACKS_PATH), _raw(m.CFG_PATH))
+    stamps = [os.stat(p).st_mtime_ns for p in (m.STACKS_PATH, m.CFG_PATH)]
+    time.sleep(0.05)   # so a rewrite would show in the timestamps, not just (identical) bytes
+    out = connect()
+    check("the next connect says nothing", "tokensProtected" in out, False)
+    check("...and rewrites nothing", (_raw(m.STACKS_PATH), _raw(m.CFG_PATH)), before)
+    check("...not even with identical bytes",
+          [os.stat(p).st_mtime_ns for p in (m.STACKS_PATH, m.CFG_PATH)], stamps)
+
+    # A blob that doesn't decrypt back must never replace the only copy.
+    for label, bad in (("decrypts to something else", _FakeDpapi(m.DPAPI_SCHEME, lie=True)),
+                       ("encryption fails", _FakeDpapi(m.DPAPI_SCHEME, fail=True))):
+        _token_sandbox(m, monkeypatch, tmp_path)
+        monkeypatch.setattr(m, "_TOKEN_PROTECTOR", bad.tuple())
+        seed_plaintext()
+        out = connect()
+        check("%s: connect still succeeds" % label, out.get("state"), "connected")
+        check("%s: the plaintext is kept" % label, b"tok-one-plain" in _raw(m.STACKS_PATH), True)
+        check("%s: and it says so" % label, "left unencrypted" in out.get("tokenStorageNote", ""), True)
+        check("%s: nothing claims protection" % label, "tokensProtected" in out, False)
+
+    # No protector (macOS and Linux in phase 1): nothing moves, the file is reported as it is.
+    _token_sandbox(m, monkeypatch, tmp_path)
+    monkeypatch.setattr(m, "_TOKEN_PROTECTOR", False)
+    seed_plaintext()
+    before = _raw(m.STACKS_PATH)
+    out = connect()
+    check("without a protector connect migrates nothing", ("tokensProtected" in out, _raw(m.STACKS_PATH)),
+          (False, before))
+    out = _add_stack(m, capsys, "three", "three.example.com", "tok-three-5555")
+    check("...and stacks add reports the file", out.get("tokenStorage"), "file")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real DPAPI exists only on Windows")
+def test_token_dpapi_real(m, monkeypatch, capsys, tmp_path):
+    """The real CryptProtectData/CryptUnprotectData path, end to end in a temp ~/.meridian."""
+    _token_sandbox(m, monkeypatch, tmp_path)
+    monkeypatch.setattr(m, "_TOKEN_PROTECTOR", None)   # this platform's own: DPAPI
+    blob = m._dpapi(b"dummy-not-a-token", False)
+    check("DPAPI round-trips", m._dpapi(blob, True), b"dummy-not-a-token")
+    tampered = blob[:-1] + bytes([blob[-1] ^ 1])
+    try:
+        m._dpapi(tampered, True)
+        check("a tampered blob is refused", False, True)
+    except OSError:
+        check("a tampered blob is refused", True, True)
+    out = _add_stack(m, capsys, "real", "real.example.com", "tok-real-dpapi-7777")
+    check("stacks add protects with DPAPI", out.get("tokenStorage"), "dpapi")
+    check("no plaintext on disk", b"tok-real-dpapi" in _raw(m.STACKS_PATH) + _raw(m.CFG_PATH), False)
+    check("and it decrypts back", m.reveal_token(m.load_config()[1]), "tok-real-dpapi-7777")
+
+
+def test_token_routing(m):
+    """SKILL.md is what makes the model handle token_unreadable and say where a token is saved; no
+    behaviour test notices one of these rules being dropped."""
+    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
+        skill = " ".join(f.read().split())
+    for rule in ("| `token_unreadable` |",
+                 "**G — token_unreadable:**",
+                 "it was never sent",
+                 "on Windows it's encrypted to your Windows account",
+                 "If the result carries `tokensProtected`",
+                 "If it carries `tokenStorageNote`"):
+        check("SKILL.md carries: %s" % rule[:50], rule in skill, True)
+    check("SKILL.md no longer calls every saved token plain text",
+          "note it's **plain text** in your user profile" in skill, False)
