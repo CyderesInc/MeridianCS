@@ -21,6 +21,22 @@ def tracked_files(cwd=ROOT):
     return git("ls-files", cwd=cwd).splitlines()
 
 
+def tracked_symlinks(cwd=ROOT):
+    """Tracked paths git stores as symlinks (mode 120000). A Linux checkout makes them real links,
+    and open() follows one, so a package built there would carry whatever the link points at."""
+    return set(symlink_entries(git("ls-files", "-s", "-z", cwd=cwd)))
+
+
+def symlink_entries(ls_files_s_z):
+    """Paths with mode 120000 in `git ls-files -s -z` output (`<mode> <sha> <stage>\\t<path>\\0`)."""
+    out = []
+    for entry in ls_files_s_z.split("\0"):
+        meta, _, path = entry.partition("\t")
+        if path and meta.split(" ", 1)[0] == "120000":
+            out.append(path)
+    return out
+
+
 def is_dirty(cwd=ROOT):
     return bool(git("status", "--porcelain", cwd=cwd))
 

@@ -16,6 +16,7 @@ test = [
     "cryptography>=44",
     "pytest>=8",
     "pytest-check>=2",
+    "strictyaml>=1.7.3",
 ]
 release = ["hvac>=2.4"]
 dev = [

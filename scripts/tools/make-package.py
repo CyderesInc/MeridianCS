@@ -46,8 +46,19 @@ def parse_args():
 
 def packaged_files():
     # Tracked files only: generated report PDFs carry customer data and are untracked by policy.
-    return [f for f in toolkit.tracked_files() if f not in EXCLUDE
-            and not f.startswith(EXCLUDE_DIRS) and not f.endswith(EXCLUDE_SUFFIXES)]
+    files = [f for f in toolkit.tracked_files() if f not in EXCLUDE
+             and not f.startswith(EXCLUDE_DIRS) and not f.endswith(EXCLUDE_SUFFIXES)]
+    refuse_symlinks(files, toolkit.tracked_symlinks())
+    return files
+
+
+def refuse_symlinks(files, links):
+    # read_bytes() follows a link, so a tracked symlink would ship the bytes of its target -- on a build
+    # machine, possibly a file outside the repo, ~/.meridian included. Refused, not skipped: a link
+    # someone committed is a file they meant to ship, and leaving it out quietly is a different bug.
+    found = sorted(set(files) & set(links))
+    if found:
+        raise SystemExit("refusing to package symlinks (git mode 120000): %s" % ", ".join(found))
 
 
 def version_stamp(version):

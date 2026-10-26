@@ -3,6 +3,21 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.31.1 - 2026-10-22
+
+- **Your saved token only goes to its own stack.** Pointing `MERIDIAN_FQDN` at another address no
+  longer sends it there, and `stacks move` accepts only the stack's own new address unless you
+  confirm another, with certificate checks on.
+- **Connector credentials are harder to expose.** Messages and errors hide more secrets, such as
+  quoted passwords, client secrets and AWS key ids, and raw API requests can't reach credentials
+  via a redirect or another spelling of an address.
+- **Safer stacks and updates.** A damaged stacks file stops the skill instead of being saved over,
+  switching stacks keeps machine-wide settings such as a proxy certificate, and self-update never
+  installs an older version, even when forced.
+- **Quicker failures and sturdier reports.** A failed request reports straight away instead of
+  waiting 2 seconds first, PDF reports work in folders with `#` in the name, and Slack alerts no
+  longer expand link previews.
+
 ## 2.31.0 - 2026-10-13
 
 - **Your saved Meridian tokens are encrypted on Windows.** The first time the skill connects, it

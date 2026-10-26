@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,8 @@ def main():
         stamp = json.loads(z.read(PREFIX + "VERSION.json"))
         changelog = z.read(PREFIX + "CHANGELOG.md").decode("utf-8-sig")
         eol = eol_problems({n[len(PREFIX):]: z.read(n) for n in z.namelist()})
-    problems = (member_problems(names) + eol
+        links = symlink_problems(z.infolist(), names, toolkit.tracked_symlinks(args.source))
+    problems = (member_problems(names) + eol + links
                 + stamp_problems(stamp, args.version, args.source)
                 + changelog_problems(changelog, args.version)
                 + rebuild_problems(args.package, stamp, args.source)
@@ -76,6 +78,17 @@ def eol_problems(members):
     return problems
 
 
+def symlink_problems(infos, names, source_links):
+    """No member may be a symlink, in the zip or in the tree it was built from. An unzip tool that
+    honours a member's S_IFLNK mode writes a link wherever its body points; a tracked link packaged by
+    make-package would have shipped its target's bytes instead. make-package refuses the second; this
+    is the check that the package in hand was not built some other way."""
+    problems = ["%s is a symlink entry in the zip" % i.filename for i in infos
+                if stat.S_ISLNK(i.external_attr >> 16)]
+    return problems + ["%s is a symlink in the source tree (git mode 120000)" % n
+                       for n in sorted(set(names) & set(source_links))]
+
+
 def stamp_problems(stamp, version, source):
     problems = []
     if version and stamp.get("version") != version:
@@ -98,8 +111,9 @@ def rebuild_problems(package, stamp, source):
     name = ["--version", stamp["version"]] if stamp.get("version") else ["--label", "rebuild"]
     with tempfile.TemporaryDirectory() as tmp:
         script = os.path.join(source, "scripts", "tools", "make-package.py")
-        subprocess.run([sys.executable, script, *name, "--out-dir", tmp], cwd=source, check=True,
-                       stdout=subprocess.DEVNULL)
+        if subprocess.run([sys.executable, script, *name, "--out-dir", tmp], cwd=source,
+                          stdout=subprocess.DEVNULL).returncode:
+            return ["make-package refused to rebuild from %s (its reason is printed above)" % source]
         rebuilt = os.path.join(tmp, os.listdir(tmp)[0])
         if toolkit.sha256(rebuilt) != toolkit.sha256(package):
             return ["a rebuild from %s is not byte-identical" % source]

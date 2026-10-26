@@ -139,3 +139,48 @@ def test_verify_package_refuses_crlf():
     assert vp.eol_problems(dict(good, **{"README.md": b"a\r\n"})) == [
         "README.md has CR line endings; packages ship text with LF"]
     assert any("front matter" in p for p in vp.eol_problems({"SKILL.md": b"---\nname: x\n# t\n"}))
+
+
+def test_symlinks_never_ship():
+    """A tracked symlink is a real link on a Linux checkout, and read_bytes() follows it, so the
+    package would carry its target's bytes. make-package refuses one; verify-package refuses a zip
+    with a symlink member or a source tree whose packaged file is one. Both directions each time."""
+    import zipfile
+    import toolkit
+    # \x00, not \0: "\0120000" is the octal escape \012 (a newline) followed by "0000".
+    listing = ("100644 aaa 0\tSKILL.md\x00120000 bbb 0\treferences/evil.md\x00"
+               "100755 ccc 0\tscripts/meridian.py\x00120000 ddd 0\tdir with space/l\x00")
+    assert toolkit.symlink_entries(listing) == ["references/evil.md", "dir with space/l"]
+    assert toolkit.symlink_entries("") == []
+    # This repo has none today; a new one should be a deliberate, reviewed decision.
+    assert toolkit.tracked_symlinks() == set()
+
+    mp = _tool("make-package")
+    mp.refuse_symlinks(["SKILL.md"], {"elsewhere"})
+    with pytest.raises(SystemExit, match="references/evil.md"):
+        mp.refuse_symlinks(["SKILL.md", "references/evil.md"], {"references/evil.md"})
+
+    vp = _tool("verify-package")
+    plain = zipfile.ZipInfo("meridiancs/SKILL.md")
+    plain.external_attr = 0o100644 << 16
+    link = zipfile.ZipInfo("meridiancs/references/evil.md")
+    link.external_attr = 0o120777 << 16
+    assert vp.symlink_problems([plain], ["SKILL.md"], set()) == []
+    assert vp.symlink_problems([plain, link], ["SKILL.md"], set()) == [
+        "meridiancs/references/evil.md is a symlink entry in the zip"]
+    assert vp.symlink_problems([plain], ["SKILL.md"], {"SKILL.md"}) == [
+        "SKILL.md is a symlink in the source tree (git mode 120000)"]
+
+
+def test_candidate_tags_stay_outside_the_release_tag_namespace():
+    """The internal repo's v* tag ruleset lets only admins create release tags, and Vault's prod
+    role is bound to refs/tags/v*. Candidates are tagged by CI's bot on every merge, so a candidate
+    named v... is refused by the ruleset (no candidate ships) and sits inside the prod glob."""
+    import fnmatch
+    rm = _tool("release-meta")
+    tag = rm.candidate_tag("2.31.1", "41", "d2d3468")
+    assert tag == "rc-2.31.1-41-d2d3468"
+    assert not fnmatch.fnmatchcase("refs/tags/" + tag, "refs/tags/v*")
+    # The release job's trigger is the other half: a vX.Y.Z tag still triggers it.
+    with open(os.path.join(TOOLS, "..", "..", ".github", "workflows", "release.yml"), encoding="utf-8") as f:
+        assert 'tags: ["v[0-9]+.[0-9]+.[0-9]+"]' in f.read()

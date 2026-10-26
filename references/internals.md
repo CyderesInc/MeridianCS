@@ -58,7 +58,8 @@ not from `git ls-files`), and `selfupdate` compares it against the latest public
 - `selfupdate [--check] [--apply] [--force]` — **run once per session, alongside `connect`.** With no
   flags it reports one `state`; `--apply` installs a newer release over this one. `--force` ignores
   the day-long check cache and, with `--apply`, reinstalls the latest release even if this install
-  already matches. Presentation rules are SKILL.md §0.5. **Exit code is always 0**, every state
+  already matches. It never installs an older release: `ahead` refuses with or without `--force`,
+  since an older release is still validly signed. Presentation rules are SKILL.md §0.5. **Exit code is always 0**, every state
   included — this runs at launch, and a non-zero exit from a housekeeping check reads as a broken
   skill.
 

@@ -45,7 +45,14 @@ def print_title(args):
 
 
 def print_candidate_tag(args):
-    print("v%s-rc.%s-%s" % (next_version(), args.run, toolkit.git("rev-parse", "--short=7", "HEAD")))
+    print(candidate_tag(next_version(), args.run, toolkit.git("rev-parse", "--short=7", "HEAD")))
+
+
+def candidate_tag(version, run, sha):
+    # Never a leading "v": the v* tag ruleset lets only admins create release tags, and the bot
+    # that publishes candidates is not one. Vault's prod role is bound to refs/tags/v* as well, so a
+    # candidate named v... would also sit inside the prod-signing glob.
+    return "rc-%s-%s-%s" % (version, run, sha)
 
 
 def next_version():

@@ -9,18 +9,35 @@ API queries, and returns written answers — including PDF reports.
 
 ## What it does
 
-Ask plain questions ("who are the 10 riskiest users?", "which assets are missing MFA?",
-"investigate <person>", "break assets down by risk level") and the skill picks the right
-endpoint, builds the query, paginates within the rate limit, and answers in prose with severity
-cues. It can also produce a PDF report of any result.
+Ask in plain language. The skill picks the endpoint, builds the query, pages through the results
+within the API's 60-requests-a-minute limit, and answers in prose with severity cues.
+
+| | Ask things like | Verbs behind it |
+|---|---|---|
+| **Answer** | "how many servers are in AWS?", "what's missing CrowdStrike?", "break assets down by risk level", "certificates expiring in the next 30 days" | `list`, `summary`, `top` |
+| **Investigate** | "investigate &lt;person&gt;", "compare these two laptops" | `profile`, `compare` |
+| **Use your own terms** | "what's in PCI scope?", "do we have HR data?" | `labels`, `hr` |
+| **Track over time** | "start tracking KEV exposure", "what got worse since Friday?" | `metrics`, `snapshot`, `trend`, `schedule` |
+| **Alert** | "tell me when a connector breaks" | `alerts` |
+| **Report and export** | "make this a PDF", "send me this every week", "export every match to a spreadsheet" | `report`, `digest`, `--format csv` |
 
 An investigation answers in one step: asking about a person or asset returns the profile *plus* the
-findings and recommended actions, ordered most severe first, in about three seconds — the PDF is for
-when you want a file to send on, not a prerequisite for seeing what to do.
+findings and recommended actions, ordered most severe first, in about three seconds. The PDF is
+for when you want a file to send on, not a prerequisite for seeing what to do.
 
-At the start of a session it also reports **data coverage** — which connectors are enabled, which are
-failing authentication, and how many records each last ingested — so you know what's behind an answer
-before you act on it. Ask "connector status?" at any point to see it again.
+**It says what it doesn't know.** For a security inventory, a confident wrong answer is the expensive
+failure, so the skill is built to show the limits of each answer:
+
+- **Data coverage first.** A session opens with which connectors are enabled, which are failing, and
+  how many records each last ingested. Ask "connector status?" to see it again.
+- **Every answer is dated and sourced.** It names the stack it came from and how current the data is
+  (the latest Meridian rebuild), so production is never mistaken for staging and yesterday's figure
+  is never presented as today's.
+- **Gaps are stated, not hidden.** A breakdown that couldn't place every record says how many it
+  missed. Something that wasn't measured is reported as unknown, never as zero or "no change". A trend
+  across a change in connector health says so.
+- **Read-only by default.** State-changing endpoints (an ingestion trigger, connector profile changes)
+  need explicit confirmation.
 
 ## Install
 
@@ -28,13 +45,17 @@ before you act on it. Ask "connector status?" at any point to see it again.
 
 | | |
 |---|---|
-| **Claude Code** | CLI, desktop app, web, or an IDE extension |
+| **Claude Code** | CLI, desktop app, web, or an IDE extension. Claude Cowork is not supported: it has no copy of the skill's scripts to run. |
 | **Python 3.9 or newer** | the only hard requirement — standard library only, nothing to `pip install` |
 | **Chrome or Edge** | only for turning reports into PDF; without it you still get HTML |
 
+Gemini CLI, GitHub Copilot and OpenAI Codex can run the skill too. The steps below are for Claude
+Code; [Other agents](#other-agents-gemini-copilot-codex) covers where those put it and what they need.
+
 > **The command differs by platform.** On **macOS and Linux** it is `python3`. On **Windows** it is
 > `python`. macOS has shipped no `python` at all since 12.3, so a bare `python` there fails with
-> "command not found" — that is a missing alias, not missing Python.
+> "command not found" — that is a missing alias, not missing Python. Commands below are written for
+> each platform; elsewhere in the docs they are written `python` for brevity.
 
 ### How you get the files
 
@@ -52,7 +73,7 @@ every release.
 python3 --version
 ```
 
-If that prints a version (3.8 or newer), skip to step 2. Otherwise install it with
+If that prints a version (3.9 or newer), skip to step 2. Otherwise install it with
 [the python.org installer](https://www.python.org/downloads/macos/) or, if you use Homebrew:
 
 ```bash
@@ -67,6 +88,8 @@ mkdir -p ~/.claude/skills
 gh release download --repo CyderesInc/MeridianCS --pattern '*.skill.zip' --dir ~/Downloads
 unzip ~/Downloads/meridiancs.v*.skill.zip -d ~/.claude/skills/
 ```
+
+Or double-click the zip in Finder and drag the resulting `meridiancs` folder into `~/.claude/skills/`.
 
 Or clone it, if you would rather update with `git pull` yourself. A clone never updates itself:
 
@@ -104,7 +127,7 @@ A healthy stack returns `"state": "connected"` with your asset and user counts.
 python --version
 ```
 
-If that prints a version (3.8 or newer), skip to step 2. If it opens the Microsoft Store instead, that
+If that prints a version (3.9 or newer), skip to step 2. If it opens the Microsoft Store instead, that
 is Windows' placeholder stub and Python is *not* installed. Install it with:
 
 ```powershell
@@ -159,6 +182,116 @@ cd "$env:USERPROFILE\.claude\skills\meridiancs"; python scripts\meridian.py conn
 A healthy stack returns `"state": "connected"` with your asset and user counts. Edge ships with
 Windows, so PDF reports work without installing anything else.
 
+### Other agents: Gemini, Copilot, Codex
+
+`SKILL.md` follows the open [Agent Skills](https://agentskills.io) format, so the same package also
+runs under agents other than Claude Code. On 2026-10-15, Gemini CLI, GitHub Copilot CLI and OpenAI
+Codex CLI each found the skill with its full description. That check proves the skill is found, not
+that a session works: what each agent needs before the skill can reach your stack is below.
+
+**Where it goes.** Extract the same package into `~/.agents/skills/`
+(`%USERPROFILE%\.agents\skills\` on Windows), the user-level folder all three read. The zip holds a
+`meridiancs` folder, so the skill lands at `~/.agents/skills/meridiancs`. On macOS or Linux:
+
+```bash
+mkdir -p ~/.agents/skills
+unzip ~/Downloads/meridiancs.v*.skill.zip -d ~/.agents/skills/
+```
+
+On Windows, in PowerShell (unblock the zip first, as in step 2 above):
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.agents\skills"
+Get-ChildItem "$env:USERPROFILE\Downloads\meridiancs.*.skill.zip" |
+  Expand-Archive -DestinationPath "$env:USERPROFILE\.agents\skills" -Force
+```
+
+| Agent | Reads the skill from | Before the first session |
+|---|---|---|
+| **Gemini CLI** | `~/.agents/skills` or `~/.gemini/skills` | Nothing. `gemini skills list` should show `meridiancs`. |
+| **GitHub Copilot CLI** | `~/.agents/skills`, `~/.copilot/skills`, and `~/.claude/skills` as an "Inherited" skill | Nothing. If Claude Code already has the skill, Copilot CLI uses that copy and needs no second install. `copilot skill list` should show it. |
+| **GitHub Copilot in VS Code** (agent mode) | `~/.copilot/skills`, per VS Code's documentation (not tested here) | Type `/skills` in the chat panel to see what loaded. |
+| **OpenAI Codex**: CLI, IDE extension, ChatGPT desktop app | `~/.agents/skills` | Open the sandbox, below. Without it, Codex can't reach your stack or save your credentials. |
+| **ChatGPT on the web** | — | Not supported. ChatGPT's web chat runs no standalone skills. |
+
+**Codex: open the sandbox.** Codex's default `workspace-write` sandbox allows no network access and
+no writes outside the project you opened. The skill needs both: it calls your stack, and it keeps
+credentials, caches and history in `~/.meridian`. Add this to `~/.codex/config.toml`, which the CLI,
+the IDE extension and the ChatGPT desktop app share:
+
+```toml
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["~/.meridian"]
+
+# Windows only: without a Windows sandbox mode, Codex runs every command read-only.
+[windows]
+sandbox = "unelevated"
+```
+
+Tested on Windows with Codex CLI 0.163.0 on 2026-10-15; not yet on macOS or Linux.
+
+- **Create `~/.meridian` before the first session** (`mkdir ~/.meridian`). A writable root that
+  doesn't exist yet stays read-only, so the skill can't create the folder to save your credentials.
+  Without the root, `connect` reports your stack as unreachable, but the real cause is that it
+  can't write to `~/.meridian`.
+- **`~` works.** Codex expands it to your account's home folder.
+- **On Windows, the `[windows]` table is required.** Without it, Codex falls back to read-only with
+  no network, whatever `sandbox_mode` says. `"elevated"` is the other value, and it needs a one-time
+  setup as an administrator.
+- **`network_access` is not per skill.** It opens outbound network to every command Codex runs in
+  that sandbox.
+- **Permission profiles replace these settings.** If your `config.toml` sets `default_permissions`,
+  don't add the block above, because the two systems don't combine. Add `"~/.meridian" = "write"`
+  under your profile's `[permissions.<name>.filesystem]` table and `enabled = true` under
+  `[permissions.<name>.network]`.
+- **Self-update doesn't work under Codex on Windows.** An update is staged in the folder that holds
+  the skill. Making `~/.agents/skills` writable gets the staging folder created, but Python makes
+  that folder private to your account, so the sandbox can't write the download into it. The
+  update fails without a word, and the skill stays on its version. Upgrade by hand (see
+  [Staying up to date](#staying-up-to-date)). On macOS and Linux, adding `~/.agents/skills` as a
+  writable root should be enough, but that's untested. The root makes every skill in that folder
+  writable to Codex, which is the trade.
+
+**Your credential files have less protection under these agents.** In Claude Code, a
+`permissions.deny` rule keeps the agent's file tools out of `~/.meridian` (see
+[Recommended hardening](#recommended-hardening)). This README documents no equivalent for the agents
+above, so there only `SKILL.md`'s instruction never to read those files keeps the agent out of them.
+They hold the token for every saved stack: encrypted to your Windows account on Windows, plain text
+on macOS and Linux. What each vendor offers, as of 2026-10-15:
+
+- **Gemini CLI** has a policy engine whose `deny` rules can match a tool call's arguments. Save the
+  rule below as `~/.gemini/policies/meridian.toml`; Gemini loads it at startup without a flag.
+  Tested with Gemini CLI 0.64.0 on Windows on 2026-10-15, it refused `read_file` on either file and
+  any shell command naming one (`cat ~/.meridian/config.json`, a `Get-Content` of the full path),
+  while the skill's own `meridian.py` commands still ran. It does not catch a command that reaches
+  the files some other way: `cat ~/.meridian/*.json` printed both.
+
+  ```toml
+  [[rule]]
+  toolName = "*"
+  argsPattern = '\.meridian[/\\]+(config|stacks)\.json'
+  decision = "deny"
+  priority = 900
+  ```
+
+- **GitHub Copilot** documents no way to deny a path, in the CLI or in VS Code. Copilot CLI starts
+  with access to the directory you launched it in and asks before going further, so decline any
+  request to read `~/.meridian`.
+- **Codex** applies its filesystem rules to every command in its sandbox, the skill's own script
+  included. A rule denying `~/.meridian` would stop the skill from reading its own credentials, so
+  Codex has no way to keep the agent out while letting the skill in.
+
+**Two smaller differences.**
+
+- **Environment variables** set in Claude Code's `settings.json` don't reach other agents. Set any
+  `MERIDIAN_*` variable in your shell profile, bearing in mind that a desktop app started from the
+  Dock or the Start menu doesn't read one.
+- **The welcome message says "Meridian for Claude"** whichever agent shows it. The greeting is part
+  of the skill's instructions, so it is left as it is.
+
 ### Getting an API token
 
 In Meridian, as a user with admin rights over the account you want to use:
@@ -171,10 +304,203 @@ Two things catch people out. Meridian shows the token **once** — copy it befor
 **SSO accounts cannot use the API at all**; the token must come from a local Meridian account holding
 the `Api_Users` role.
 
-You will also be asked for your **FQDN** — e.g. `company.meridian-cyderes.com`, with no `https://` and no
-trailing path.
+You will also be asked for your **FQDN** — e.g. `company.meridian-cyderes.com`, with no `https://` and
+no trailing path.
 
-### Staying up to date
+## Connect
+
+On first use the skill asks for your **Meridian FQDN** and a **User Generated API token** — see
+[Getting an API token](#getting-an-api-token) — validates them, and then offers to save them. Saved
+credentials live **outside the skill folder**, in `~/.meridian/` (`%USERPROFILE%\.meridian\` on
+Windows), and are never committed. Let the skill save them, or use `stacks add` below, rather than
+writing the files by hand: the script creates them owner-only and keeps the per-stack `entity_salt`
+that entity snapshots depend on.
+
+- **On Windows, saved tokens are encrypted** to your Windows account, so a copy of the files is useless
+  on another machine or account. Existing installs are converted the first time they connect. On macOS
+  and Linux they are plain text that only your user can read.
+- **Environment variables win over saved settings.** `MERIDIAN_FQDN`, `MERIDIAN_API_TOKEN` and
+  `MERIDIAN_ACTION_TOKEN` are never written to disk, which makes them the safer choice for a
+  production token. A saved token is only ever sent to the address it was saved with: if
+  `MERIDIAN_FQDN` names a different stack, set `MERIDIAN_API_TOKEN` for it as well.
+- **The action token is optional.** It is only needed for the LDG endpoint, and the standard one
+  answers the same questions.
+
+### Multiple stacks
+
+Keep several stacks and switch between them — switching rewrites only `config.json`, so the other
+stacks' credentials are never overwritten. All named stacks live in `~/.meridian/stacks.json`; an
+existing single-stack `config.json` is migrated in automatically on first use.
+
+```bash
+printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.meridian-cyderes.com --token -
+python scripts/meridian.py stacks switch prod        # activate + validate
+python scripts/meridian.py stacks list               # tokens redacted to last 4
+```
+
+`--token -` reads the token from stdin, which keeps it out of shell history and process listings;
+omitting `--token` uses `MERIDIAN_API_TOKEN` instead. `--action-token -` does the same for the
+action token, read as the next line. A stack with a self-signed certificate takes `--insecure-tls`,
+stored per stack and carried across switches. Each stack needs a token generated **on that stack** —
+tokens are not portable between stacks.
+
+`python scripts/meridian.py stacks rm <name>` removes one, with its caches. Its snapshot history,
+metrics and alert rules stay on disk unless you add `--purge`, which deletes them for good. If it was
+the active stack, another saved stack becomes active and the output says which; if none remain, its
+credentials are removed from `config.json`.
+
+### Moving to meridian-cyderes.com
+
+Meridian is retiring `lucidum.cloud` addresses on **2026-12-05** in favour of `meridian-cyderes.com`;
+each stack keeps its name, so `company.lucidum.cloud` becomes `company.meridian-cyderes.com`. When a
+saved stack is still on an old address, `connect` says so and offers the move:
+
+```bash
+python scripts/meridian.py stacks move prod --fqdn acme.meridian-cyderes.com
+```
+
+The move keeps the stack's token, history, metrics and alert rules, and checks that the new address
+answers for that token before it changes anything. If the new address isn't live yet, it reports
+`moved: false` and leaves the stack as it was, so it is safe to try. Moving with `stacks rm` and
+`stacks add` instead would leave the history under the old address, where nothing reads it.
+
+The move accepts only the stack's own `meridian-cyderes.com` address, because it sends the saved
+token there. A stack that genuinely moved somewhere else takes `--any-fqdn`. The new address is
+always checked with certificate verification on, and an `insecure_tls` setting stays behind.
+
+### TLS
+
+Connections to your stack are made with **certificate verification enabled**. If your stack presents
+a self-signed or internally-issued certificate, opt out with `MERIDIAN_INSECURE_TLS=1` or by adding
+`"insecure_tls": true` to `config.json` — but only where you trust the network path, because the API
+token travels over that connection. `connect` and `check` both report `tlsVerified`, so an opt-out
+saved once stays visible instead of becoming an invisible default.
+
+**Behind a TLS-inspecting proxy** (Zscaler and the like), don't turn verification off: give Python
+the proxy's root certificate instead. Python uses its own list of trusted certificates, not your
+operating system's, which is why `gh` and `curl` can work while the skill reports
+`CERTIFICATE_VERIFY_FAILED`.
+
+- **On macOS this is automatic.** The skill also trusts the certificates in the system keychains,
+  where a managed Mac's proxy root is normally installed. It reads them with `/usr/bin/security` and
+  never reads your login keychain. `MERIDIAN_NO_KEYCHAIN=1` turns this off.
+- **Anywhere else, or a root that isn't in the System keychain:** save the root as a PEM file and set
+  `MERIDIAN_CA_BUNDLE` to its path, or add `"ca_bundle": "<path>"` to `config.json`. For Claude
+  Code, the `env` block of `~/.claude/settings.json` is the place for the variable. The file adds to
+  Python's trusted certificates rather than replacing them.
+
+Both apply to every verified connection: your stack, update checks, and alert webhooks and email.
+`connect` shows what was added as `tlsTrust`. A certificate that still isn't trusted is reported as
+`tls_untrusted`, with these instructions.
+
+### Recommended hardening
+
+`config.json` and `stacks.json` hold the tokens for *every* saved stack. Encrypted or not, anything
+running as you can still use them. The scripts read these files in-process and never need an agent
+to open them, so denying agent read access costs no functionality. Add to `~/.claude/settings.json`
+(macOS) or `%USERPROFILE%\.claude\settings.json` (Windows):
+
+```json
+{
+  "permissions": {
+    "deny": ["Read(~/.meridian/**)", "Grep(~/.meridian/**)", "Glob(~/.meridian/**)"]
+  }
+}
+```
+
+Use `connect` or `stacks list` to inspect configuration — both redact tokens to the last 4. This
+blocks the agent's file tools, not a shell command reading the file directly;
+`sandbox.credentials.files` covers that path if you run sandboxed. Under Gemini, Copilot or Codex
+this rule doesn't apply; see [Other agents](#other-agents-gemini-copilot-codex) for what does.
+
+## Using it
+
+Most of the time you just ask, and the skill runs the right command. The commands are shown here so
+you know what exists; `python scripts/meridian.py <verb> --help` documents every flag.
+
+### Tracking over time
+
+Meridian keeps no history, so the skill records its own: a **snapshot** is a dated copy of the
+stack's totals, risk breakdown, top lists and your **metrics** (named counts you choose to track),
+appended to a local file per stack. `trend` compares snapshots.
+
+```bash
+python scripts/meridian.py metrics add --name kev-exposed --where "Count_KEV >= Integer 1"
+python scripts/meridian.py snapshot
+python scripts/meridian.py trend --since 2026-10-01
+```
+
+History only grows when something takes a snapshot, so say "keep tracking this" and the skill sets
+up a daily or weekly job for Windows, macOS or Linux. It shows you the definition and registers
+nothing without a yes.
+
+```bash
+python scripts/meridian.py schedule show      # the job definition, and the commands to register it
+python scripts/meridian.py schedule status    # did each job run, did it work, has it stopped
+python scripts/meridian.py schedule rm        # retire a job; prints the command that removes the task
+```
+
+A job collects for one stack and writes nothing while another is active. Every run is recorded, and
+the next session tells you when a job has stopped or keeps failing. Details:
+[references/trend-verbs.md](references/trend-verbs.md) and
+[references/scheduling.md](references/scheduling.md).
+
+### Alerts
+
+Rules are evaluated against the recorded history: a connector entering the failing set, or a
+tracked metric crossing a threshold. Each rule is `firing`, `clear` or `unevaluable`, and an
+untestable rule is never reported as passing.
+
+```bash
+python scripts/meridian.py alerts add --name connectors --if coverage-regressed
+python scripts/meridian.py alerts add --name kev-ceiling --if above --metric kev-exposed --value 500
+python scripts/meridian.py alerts eval
+python scripts/meridian.py alerts notify      # Slack, Teams or email, only when a verdict changes
+```
+
+Delivery targets come from environment variables only (see
+[Configuration reference](#configuration-reference)), and the Meridian token is never sent to them.
+A scheduled job needs those variables in its own environment; see
+[references/scheduling.md](references/scheduling.md).
+
+### Reports and exports
+
+`meridian.py report` renders a PDF from any verb's JSON output, including trend charts and a
+blast-radius graph for a profile. Several profiles render as one document. It needs a Chromium
+browser (Chrome or Edge) for the PDF, and falls back to HTML with `--html`. This distribution carries
+no Cyderes brand assets, so reports render in neutral styling and name no brand (see
+[Licensing](#licensing)).
+
+```bash
+python scripts/meridian.py profile --name "<person>" > p.json
+python scripts/meridian.py report --input p.json --out profile.pdf
+python scripts/meridian.py digest > d.json && python scripts/meridian.py report --input d.json --out digest.pdf
+python scripts/meridian.py list --where "Count_KEV >= Integer 1" --all --format csv --out kev.csv
+```
+
+`digest` is the periodic posture review in one call. `--format csv` (on `list`, `top` and `trend`)
+writes rows to a spreadsheet-ready file and prints only a summary, which keeps large results out of
+the conversation. Details: [references/reports.md](references/reports.md).
+
+## Configuration reference
+
+Environment variables override `config.json`. Set them for Claude Code in the `env` block of
+`~/.claude/settings.json`.
+
+| Setting | What it does |
+|---|---|
+| `MERIDIAN_FQDN`, `MERIDIAN_API_TOKEN`, `MERIDIAN_ACTION_TOKEN` | The stack and its tokens, for this session only, never written to disk |
+| `MERIDIAN_INSECURE_TLS=1`, or `"insecure_tls": true` | Skip certificate verification for a self-signed stack ([TLS](#tls)) |
+| `MERIDIAN_CA_BUNDLE`, or `"ca_bundle": "<path>"` | Extra root certificates, for a TLS-inspecting proxy ([TLS](#tls)) |
+| `MERIDIAN_NO_KEYCHAIN=1` | macOS: don't read the system keychains for root certificates |
+| `MERIDIAN_NO_AUTOUPDATE=1`, or `"autoupdate": false` | Turn off self-update ([Staying up to date](#staying-up-to-date)) |
+| `MERIDIAN_ALERT_SLACK_WEBHOOK` | Slack incoming-webhook URL for `alerts notify` |
+| `MERIDIAN_ALERT_TEAMS_WEBHOOK` | Teams Workflows webhook URL for `alerts notify` |
+| `MERIDIAN_ALERT_EMAIL_SMTP_HOST` and `MERIDIAN_ALERT_EMAIL_TO` | Email delivery for `alerts notify`; optionally `_SMTP_PORT`, `_FROM`, `_SMTP_USER`, `_SMTP_PASS` and `_STARTTLS` with the same `MERIDIAN_ALERT_EMAIL` prefix |
+| `MERIDIAN_NO_CACHE=1` | Turn off the aggregate cache, so every figure is measured fresh |
+| `MERIDIAN_PRETTY_JSON=1` | Indent the JSON output, for reading it by hand |
+
+## Staying up to date
 
 **Installs from v2.24.0 onward update themselves** from this repository's release feed — checked
 once per session, cached for a day, no GitHub account needed.
@@ -196,8 +522,7 @@ python scripts/meridian.py selfupdate            # what's available, or why noth
 python scripts/meridian.py selfupdate --apply     # install it
 ```
 
-What the feature does, since the guarantees are the
-reason it can be left on:
+What the feature does, since the guarantees are the reason it can be left on:
 
 | | |
 |---|---|
@@ -241,11 +566,12 @@ meridiancs-release namespaces="meridiancs-release" ssh-ed25519 AAAAC3NzaC1lZDI1N
 ```
 <!-- allowed-signers:end -->
 
-Then, in the folder holding the package, its `.sig` and that file:
+Then, in the folder holding the package, its `.sig` and that file (put the release's version in place
+of `X.Y.Z`):
 
 ```bash
-gh release download v2.28.0 --repo CyderesInc/MeridianCS --pattern 'meridiancs.v*'
-ssh-keygen -Y verify -f allowed_signers -I meridiancs-release -n meridiancs-release -s meridiancs.v2.28.0.skill.zip.sig < meridiancs.v2.28.0.skill.zip
+gh release download vX.Y.Z --repo CyderesInc/MeridianCS --pattern 'meridiancs.v*'
+ssh-keygen -Y verify -f allowed_signers -I meridiancs-release -n meridiancs-release -s meridiancs.vX.Y.Z.skill.zip.sig < meridiancs.vX.Y.Z.skill.zip
 ```
 
 `Good "meridiancs-release" signature` means the package is exactly what a release key signed.
@@ -254,151 +580,51 @@ PowerShell has no `<` redirect, so on Windows run the second line in Git Bash or
 
 ### Releases
 
-Tagged [releases](https://github.com/CyderesInc/MeridianCS/releases) carry the packaged skill; each
-asset is built from that tag's tree and is never re-uploaded afterwards, so a given version always
-means the same bytes. Copies from v2.23.0 or earlier do not upgrade themselves (see
-[Staying up to date](#staying-up-to-date)): replace the folder contents — there are
-no configuration changes, and your saved credentials in `~/.meridian/` are untouched. Patch versions carry fixes and refreshed documentation; new capability comes with a
-minor bump. [CHANGELOG.md](CHANGELOG.md) says which is which.
-
-Rebuild the package with `python scripts/tools/make-package.py --version <X.Y.Z>` after any behaviour
-change — it's a build artifact, gitignored, and nothing in the repo will flag it as stale.
-
-## Connect
-
-On first use the skill prompts for your **Meridian FQDN** and a **User Generated API token** — see
-[Getting an API token](#getting-an-api-token). Credentials are stored **outside this repo** at
-`~/.meridian/config.json` on macOS or `%USERPROFILE%\.meridian\config.json` on Windows (or the
-`MERIDIAN_FQDN` / `MERIDIAN_API_TOKEN` / `MERIDIAN_ACTION_TOKEN` environment variables) — never commit
-them. Save them with `stacks add` (below) rather than writing the file by hand: the script creates
-it owner-only and keeps the per-stack `entity_salt` that entity snapshots depend on.
-
-```json
-{ "fqdn": "company.meridian-cyderes.com", "api_token": "…", "action_token": "…(optional, LDG only)" }
-```
-
-### Multiple stacks
-
-Keep several stacks and switch between them — switching rewrites only `config.json`, so the other
-stacks' credentials are never overwritten. All named stacks live in `~/.meridian/stacks.json`; an
-existing single-stack `config.json` is migrated in automatically on first use.
-
-```bash
-printf '%s\n' '<token>' | python scripts/meridian.py stacks add --name prod --fqdn acme.meridian-cyderes.com --token -
-python scripts/meridian.py stacks switch prod        # activate + validate
-python scripts/meridian.py stacks list               # tokens redacted to last 4
-```
-
-`--token -` reads the token from stdin, which keeps it out of shell history and process listings;
-omitting `--token` uses `MERIDIAN_API_TOKEN` instead. `--action-token -` does the same for the
-action token, read as the next line. A stack with a
-self-signed certificate takes `--insecure-tls`, stored per stack and carried across switches.
-
-`python scripts/meridian.py stacks move <name> --fqdn <new address>` changes a saved stack's
-address and keeps its token, history and alert rules. Meridian is retiring `lucidum.cloud` addresses
-on 2026-12-05 in favour of `meridian-cyderes.com` (`company.lucidum.cloud` becomes
-`company.meridian-cyderes.com`); the skill says so when it connects to an old address, and the move
-checks that the new one answers before it changes anything.
-
-`python scripts/meridian.py stacks rm <name>` removes one, with its caches. Its snapshot history,
-metrics and alert rules stay on disk unless you add `--purge`, which deletes them for good. If it was
-the active stack, another saved stack becomes active and the output says which; if none remain, its
-credentials are removed from `config.json`. Each stack needs a token generated **on
-that stack** — tokens are not portable between stacks.
-
-### TLS
-
-Connections to your stack are made with **certificate verification enabled**. If your stack presents
-a self-signed or internally-issued certificate, opt out with `MERIDIAN_INSECURE_TLS=1` or by adding
-`"insecure_tls": true` to `config.json` — but only where you trust the network path, because the API
-token travels over that connection. `connect` and `check` both report `tlsVerified`, so an opt-out
-saved once stays visible instead of becoming an invisible default.
-
-**Behind a TLS-inspecting proxy** (Zscaler and the like), don't turn verification off: give Python
-the proxy's root certificate instead. Python uses its own list of trusted certificates, not your
-operating system's, which is why `gh` and `curl` can work while the skill reports
-`CERTIFICATE_VERIFY_FAILED`.
-
-- **On macOS this is automatic.** The skill also trusts the certificates in the system keychains,
-  where a managed Mac's proxy root is normally installed. It reads them with `/usr/bin/security` and
-  never reads your login keychain. `MERIDIAN_NO_KEYCHAIN=1` turns this off.
-- **Anywhere else, or a root that isn't in the System keychain:** save the root as a PEM file and set
-  `MERIDIAN_CA_BUNDLE` to its path, or add `"ca_bundle": "<path>"` to `config.json`. For Claude
-  Code, the `env` block of `~/.claude/settings.json` is the place for the variable. The file adds to
-  Python's trusted certificates rather than replacing them.
-
-Both apply to every verified connection: your stack, update checks, and alert webhooks and email.
-`connect` shows what was added as `tlsTrust`. A certificate that still isn't trusted is reported as
-`tls_untrusted`, with these instructions.
-
-### Recommended hardening
-
-`config.json` and `stacks.json` hold the tokens for *every* saved stack. On Windows they are encrypted
-to your Windows account, so a copy of the files is useless anywhere else. On macOS and Linux they are
-plain text that only your user can read, so a single leaked copy exposes each one. Either way,
-anything running as you can still use them. The scripts read these files in-process and never need
-an agent to open them, so denying agent read access costs no functionality. Add to `~/.claude/settings.json` (macOS) or
-`%USERPROFILE%\.claude\settings.json` (Windows):
-
-```json
-{
-  "permissions": {
-    "deny": ["Read(~/.meridian/**)", "Grep(~/.meridian/**)", "Glob(~/.meridian/**)"]
-  }
-}
-```
-
-Use `connect` or `stacks list` to inspect configuration — both redact tokens to the last 4. For
-production tokens, prefer the `MERIDIAN_*` environment variables (session-scoped, never written to
-disk) over saving them in the registry. Note this blocks the agent's file tools, not a shell command
-reading the file directly; `sandbox.credentials.files` covers that path if you run sandboxed.
+Tagged [releases](https://github.com/CyderesInc/MeridianCS/releases) carry the packaged
+skill; each asset is built from that tag's tree and is never re-uploaded afterwards, so a given
+version always means the same bytes. Patch versions carry fixes and refreshed documentation; new
+capability comes with a minor bump. [CHANGELOG.md](CHANGELOG.md) says which is which. Copies from
+v2.23.0 or earlier do not upgrade themselves (see [Staying up to date](#staying-up-to-date)): replace
+the folder contents — there are no configuration changes, and your saved credentials in
+`~/.meridian/` are untouched.
 
 ## Layout
 
 ```text
-SKILL.md                     workflow + connection + query translation + presentation + safety
-CHANGELOG.md                 what changed in each release; the skill reads it after an update
-references/                  authentication, query-syntax, api-reference, field-map, recipes
+SKILL.md              the skill's runtime instructions: connection, query translation, presentation, safety
+CHANGELOG.md          what changed in each release; the skill reads it after an update
+CONTRIBUTING.md       how to propose a change
+SECURITY.md           how to report a vulnerability
+LICENSE, NOTICE       Apache-2.0, attribution and trademark notice
+sbom.cdx.json         CycloneDX bill of materials
+references/           what the skill reads on demand
+  authentication.md   tokens, roles and the SSO restriction
+  query-syntax.md     the query DSL, operators and nesting
+  api-reference.md    endpoints and response shapes
+  field-map.md        field names and the risk model (varies per stack)
+  recipes.md          worked queries for common questions
+  scripts.md          why each verb behaves as it does
+  trend-verbs.md      snapshots, metrics, trends and alerts
+  scheduling.md       scheduled collection on Windows, macOS and Linux
+  reports.md          PDF reports: layout, blast-radius graph and trend charts
+  internals.md        transport, rate limiting, TLS, caching and self-update
+  welcome.md          the launch greeting
 scripts/
-  meridian.py                the CLI — every verb, plus the PDF report generator
-                               connect          onboarding preflight (run first every session)
-                               connectors       data coverage: enabled / succeeding / ingesting
-                               top              top-N by a numeric field
-                               profile          full risk + blast-radius profile of a user/asset
-                               list             filtered list / count
-                               summary          group-by / posture (exact counts) + stack metrics
-                               compare          two entities side by side
-                               stacks           manage + switch between saved stacks
-                               check            token capability preflight
-                               refresh-fields   cache this stack's real field names
-                               report           PDF/HTML from any verb's JSON
-                               api              raw API caller (self-paces under 60/min)
-  make-package.py            rebuilds meridiancs.v<version>.skill.zip from tracked files only
-  make-sbom.py               regenerates sbom.cdx.json
-assets/
-  fonts/                     Space Grotesk + Space Mono (SIL OFL, see the licence texts alongside)
-evals/                       smoke-test prompts
+  meridian.py         the CLI, standard library only; every verb is listed below
+  tools/              packaging, signing, SBOM and docs-check tooling (never shipped in the package)
+assets/fonts/         Space Grotesk and Space Mono (SIL OFL, licence texts alongside)
+evals/                the automated test suite, plus prompt-level checks in evals.json
 ```
 
-## Reports
+`scripts/meridian.py` verbs (`--help` on any of them lists its flags):
 
-`meridian.py report` renders a PDF from any verb's JSON output. Needs Python 3 + a Chromium browser
-(Chrome/Edge) for HTML→PDF; falls back to HTML with `--html`.
-
-This distribution carries no Cyderes brand assets, so reports render in neutral styling — the report
-path falls back on its own when the artwork and stylesheet are absent, and names no brand in the
-footer or masthead. See [Licensing](#licensing).
-
-## Requirements
-
-See [Prerequisites](#prerequisites) above — Claude Code, Python 3 (`python3` on macOS/Linux, `python`
-on Windows), and a Chromium browser only for PDF reports.
-
-> Versions through v2.1 also shipped PowerShell helpers (`scripts/meridian-*.ps1`) as a fallback for
-> Windows without Python. They were removed in v2.2: they covered every verb except `report`, ran
-> about 2× slower (one process per API call), and their failure modes were silent — the PowerShell
-> array-unwrap bug returns an empty result rather than an error, which in an inventory tool reads as
-> "nothing matches". Saved credentials in `~/.meridian/` are unaffected by the upgrade.
+| Area | Verbs |
+|---|---|
+| Connection | `connect` (run first every session), `asof` (how current the data is), `check` (what the token can do), `stacks` |
+| Questions | `list`, `summary`, `top`, `profile`, `compare`, `labels`, `hr`, `connectors`, `refresh-fields`, `api` (raw calls, paced under the rate limit) |
+| History | `snapshot`, `snapshots`, `trend`, `metrics`, `alerts`, `schedule`, `digest` |
+| Output | `report` |
+| Maintenance | `selfupdate` |
 
 ## Licensing
 
@@ -423,7 +649,15 @@ Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) an
   authentic-looking Cyderes-branded risk report. The report path falls back to neutral, unbranded
   styling on its own, and asserts no brand in text either.
 
-## Notes
+## Contributing
 
-- Read-only by default. State-changing endpoints (ingestion trigger, connector profile
-  create/delete/service toggle) require explicit confirmation.
+[CONTRIBUTING.md](CONTRIBUTING.md) describes how to propose a change, and
+[SECURITY.md](SECURITY.md) how to report a vulnerability privately. Run the offline test suite before
+opening a pull request:
+
+```bash
+uv run --locked --project scripts/tools --group release pytest evals
+```
+
+`python scripts/tools/make-package.py --version <X.Y.Z>` builds the package zip from tracked files;
+releases themselves are built, signed and published by the maintainers' release workflow.
