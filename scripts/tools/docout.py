@@ -26,10 +26,25 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>{tit
 </body></html>"""
 
 
+def brand_palette():
+    """The Brand Style Guide colour names the generators' prose CSS uses, read from the Cyderes theme.
+
+    Report themes (v2.32.0) renamed the report stylesheet's variables to theme slots, and these
+    generators kept the old names: every documentation PDF lost its colours until this mapped them
+    back. The two guide colours no report uses have no slot, so they are named here."""
+    t = meridian._active_theme()
+    if t.get("name") != "cyderes":
+        sys.exit("The documentation PDFs are Cyderes-branded and need the bundled Cyderes theme; the "
+                 "active theme is %r (%s)." % (t.get("name"), t.get("fallbackReason") or t.get("source")))
+    return (":root { --brand-black: %(mastheadBg)s; --cybervolt: %(accent)s; --cybervolt-dark: %(accentStrong)s;"
+            " --brand-lime: %(accent)s; --light-gray: %(pageBg)s; --ink-2: %(ink2)s; --ink-3: %(ink3)s;"
+            " --dark-gray: %(mastheadSub)s; --cybervolt-light: #E1FD95; --warm-gray: #E2DDDA; }" % t)
+
+
 def render(name, *, title, subtitle, prose_css, body, footer, confidentiality, badge=""):
     html = PAGE.format(
         title=meridian._esc(title), subtitle=subtitle, fonts=meridian._font_face_css(),
-        brand=meridian._load_css(), prose=prose_css, wordmark=meridian._logo_svg(),
+        brand=meridian._load_css() + "\n" + brand_palette(), prose=prose_css, wordmark=meridian._logo_svg(),
         product=meridian._meridian_svg(), badge=badge, body=body, footer=footer,
         confidentiality=confidentiality)
     out = os.path.join(SKILL, name)

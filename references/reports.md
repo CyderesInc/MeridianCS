@@ -19,15 +19,15 @@ for print-to-PDF and falls back to writing branded HTML when none is found.
   instability callout. No emoji in the PDF, because the word carries the meaning.
 
 - **Branded PDF reports** (`meridian.py report`) — the deliverable format for anything shareable.
-  Pipe any verb's JSON in and get a **Cyderes-branded PDF** built to the official Brand Style Guide
-  (v01-26): a black masthead pairing the **official Cyderes wordmark** (`assets/cyderes-logo.svg`,
-  Cybervolt lime) with the **official Meridian wordmark** (`assets/meridian-logo.svg`, white) —
-  both authentic vectors, on black per the brand rule — over a Light Gray `#F9F2ED` ground with
-  black body text and the
-  **Space Grotesk / Space Mono** brand-alternate fonts — bundled in `assets/fonts/` (OFL-licensed)
-  and embedded as data URIs so reports look right on any machine. Severity dots + score bars use
-  semantic colors kept separate from the brand green (green is accent-only per the guide). Design in
-  `assets/cyderes-report.css`. Usage:
+  Pipe any verb's JSON in and get a PDF styled by the **report theme**. The layout is
+  `assets/report-base.css`; a theme fills only its colour slots, picks fonts from a fixed list, and
+  names two logos and two short texts, so no theme can change what a report says. Internal builds
+  bundle the **Cyderes theme** (`assets/themes/cyderes/`): the official Cyderes and Meridian
+  wordmarks on a black masthead, a Light Gray `#F9F2ED` ground, and the **Space Grotesk / Space
+  Mono** brand-alternate fonts (bundled in `assets/fonts/`, OFL-licensed, embedded as data URIs so
+  reports look right on any machine). The public build has no bundled theme and renders the neutral
+  default. Severity colours are fixed, never themeable. The `report` result's `theme` object names
+  the theme used and, when a bundled theme was passed over, why (`fallbackReason`). Usage:
 
   ```bash
   python meridian.py top --table asset --field Risk_Score --top 10 --select "Asset_Name,Risk_Score,Risk_Level,IP_Address,OS,Count_KEV" > <scratch>/top.json

@@ -7306,7 +7306,7 @@ def _encrypted_cell(v):
     instead of the cell would silently drop that finding.
     """
     if str(v) in ("0", "0.0"):
-        return "<b style='color:#C0392B'>No</b>"
+        return "<b class='enc-no'>No</b>"
     if v in (None, "", "null"):
         return "&mdash;"
     if str(v) in ("1", "1.0"):
@@ -7391,38 +7391,250 @@ def _assets_dir():
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
 
 
-def _load_css():
-    css_path = os.path.join(_assets_dir(), "cyderes-report.css")
-    if os.path.exists(css_path):
-        with open(css_path, encoding="utf-8-sig") as f:
+# ---- Report themes (design/report-themes.md) -------------------------------------------------
+# A theme supplies values for fixed slots, never CSS. assets/report-base.css owns every selector
+# and the layout; a theme can only fill its colour slots, pick from a fixed list of fonts, name two
+# SVG logos and set two short texts. Free CSS would let a theme hide content (`.crit{display:none}`)
+# with nothing on the page saying so, and would break the first time a class name changed.
+#
+# Phase 1 loads the theme bundled in assets/themes/ (internal builds carry the Cyderes one; the
+# public build has none) and otherwise the default below. The `theme` verb, installed themes in
+# ~/.meridian/themes and the logo rebuild are phase 2; a bundled theme ships inside a signed
+# package, so its logos are inlined as they are until then.
+THEME_API = 1
+THEME_COLOR_SLOTS = ("pageBg", "panel", "zebra", "ink", "ink2", "ink3", "line", "rule", "barTrack",
+                     "mastheadBg", "mastheadInk", "mastheadMeta", "mastheadAccentInk", "mastheadSub",
+                     "accent", "accentStrong", "calloutBg", "calloutBorder")
+# Fonts are a choice from this list, never a file a theme carries: font parsing is a long-standing
+# browser attack surface, and the report's CSP allows data: fonts.
+THEME_FONT_STACKS = {
+    "Space Grotesk": '"Space Grotesk", "PX Grotesk", "Helvetica Neue", Arial, sans-serif',
+    "Space Mono": '"Space Mono", "PX Grotesk Mono", ui-monospace, Consolas, monospace',
+    "system-sans": 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+    "system-serif": 'Georgia, Cambria, "Times New Roman", Times, serif',
+    "system-mono": 'ui-monospace, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace',
+}
+THEME_FONT_FILES = (    # bundled OFL faces, embedded only when the theme uses the family
+    ("Space Grotesk", "SpaceGrotesk-Regular.ttf", 400),
+    ("Space Grotesk", "SpaceGrotesk-Medium.ttf", 500),
+    ("Space Grotesk", "SpaceGrotesk-Bold.ttf", 700),
+    ("Space Mono", "SpaceMono-Regular.ttf", 400),
+)
+THEME_TEXT_LIMITS = {"producer": 40, "classification": 24}
+THEME_LOGO_SLOTS = ("logo", "productLogo")
+THEME_LOGO_MAX_BYTES = 64 * 1024
+# Severity colours are fixed and were chosen for a light page, but the backgrounds they print on
+# are themeable, so those backgrounds must stay light (decision 4). The darkest Cyderes one, the
+# page, is about 0.90.
+THEME_LIGHT_FLOOR = 0.85
+THEME_LIGHT_SLOTS = ("pageBg", "panel", "zebra", "calloutBg")
+THEME_TEXT_RATIO = {"ink3": 3.0, "mastheadSub": 3.0}    # every other text slot needs 4.5:1
+_THEME_HEX = re.compile(r"#[0-9A-Fa-f]{6}")     # fullmatch: `$` would pass a trailing newline
+_THEME_LOGO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,59}\.svg")
+# Neutral, and plainly its own look rather than the Cyderes one with the logo removed.
+DEFAULT_THEME = {
+    "name": "default", "themeApi": THEME_API,
+    "pageBg": "#F7F8FA", "panel": "#FFFFFF", "zebra": "#FAFBFC",
+    "ink": "#1E242C", "ink2": "#454C55", "ink3": "#68707C",
+    "line": "#E1E4E8", "rule": "#1E242C", "barTrack": "#E5E7EB",
+    "mastheadBg": "#25303E", "mastheadInk": "#FFFFFF", "mastheadMeta": "#C9D1D9",
+    "mastheadAccentInk": "#9CC3F5", "mastheadSub": "#A8B1BB",
+    "accent": "#3D6FB6", "accentStrong": "#2F5C9E", "calloutBg": "#F0F5FC", "calloutBorder": "#C9DAF2",
+    "sans": "system-sans", "mono": "system-mono",
+    "producer": "meridiancs", "classification": "Confidential",
+}
+_THEME_KEYS = set(THEME_COLOR_SLOTS) | {"sans", "mono", "themeApi"} | set(THEME_TEXT_LIMITS) | set(THEME_LOGO_SLOTS)
+_THEME_CACHE: dict = {}     # assets dir -> resolved theme; tests point _assets_dir elsewhere
+
+
+def relative_luminance(hexcolor):
+    """WCAG relative luminance of a #RRGGBB colour."""
+    c = [int(hexcolor[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+    c = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def contrast_ratio(a, b):
+    """WCAG contrast ratio between two #RRGGBB colours, 1.0 to 21.0."""
+    hi, lo = sorted((relative_luminance(a), relative_luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+_ON_ANNOTATION = re.compile(r"(?<![-\w])(?:color|fill)\s*:\s*([^;{}]+?)\s*;\s*/\*\s*on:\s*([^*]*?)\s*\*/")
+
+
+def theme_contrast_pairs(css):
+    """The (text slot, background slot) pairs a theme must keep readable, read from report-base.css.
+
+    Each rule that sets a text colour from a slot carries `/* on: <bg>[, <bg>] */`. Deriving the
+    pairs from the stylesheet, rather than listing them here, is what keeps a new text rule from
+    escaping the check: the first draft of the design listed four pairs by hand and missed the one
+    carrying the data-currency line. Fixed (non-slot) colours and `on: -` are skipped."""
+    pairs = []
+    for value, on in _ON_ANNOTATION.findall(css or ""):
+        m = re.match(r"var\(--(\w+)\)$", value)
+        if not m or m.group(1) not in THEME_COLOR_SLOTS:
+            continue
+        for bg in (b.strip() for b in on.split(",")):
+            if bg in THEME_COLOR_SLOTS and (m.group(1), bg) not in pairs:
+                pairs.append((m.group(1), bg))
+    return pairs
+
+
+def theme_problems(theme, pairs, theme_dir=None):
+    """Every reason `theme` (already merged over the default) may not render, or []. One bad value
+    rejects the whole theme: a half-applied one looks like a rendering bug."""
+    problems = []
+    for slot in THEME_COLOR_SLOTS:
+        v = theme.get(slot)
+        # The check the design rests on: only a value matching this ever enters the <style> block,
+        # so `red} .crit{display:none` can never bring free CSS back.
+        if not (isinstance(v, str) and _THEME_HEX.fullmatch(v)):
+            problems.append("%s: %r is not a #RRGGBB colour" % (slot, v))
+    for slot in ("sans", "mono"):
+        if theme.get(slot) not in THEME_FONT_STACKS:
+            problems.append("%s: %r is not one of %s" % (slot, theme.get(slot), ", ".join(sorted(THEME_FONT_STACKS))))
+    for slot, limit in THEME_TEXT_LIMITS.items():
+        v = theme.get(slot)
+        if not (isinstance(v, str) and v.strip() and len(v) <= limit
+                and not any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in v)):
+            problems.append("%s: must be plain text of 1-%d characters" % (slot, limit))
+    for slot in THEME_LOGO_SLOTS:
+        v = theme.get(slot)
+        if v is None:
+            continue
+        if not (isinstance(v, str) and _THEME_LOGO_NAME.fullmatch(v)) or theme_dir is None:
+            problems.append("%s: %r is not an .svg file name in the theme folder" % (slot, v))
+            continue
+        path = os.path.join(theme_dir, v)
+        try:
+            if os.path.getsize(path) > THEME_LOGO_MAX_BYTES:
+                problems.append("%s: %s is larger than %dKB" % (slot, v, THEME_LOGO_MAX_BYTES // 1024))
+                continue
+            with open(path, "rb") as f:
+                head = f.read()
+        except OSError:
+            problems.append("%s: %s is missing" % (slot, v))
+            continue
+        if b"<!DOCTYPE" in head.upper() or b"<!ENTITY" in head.upper():
+            problems.append("%s: %s declares a DOCTYPE or ENTITY" % (slot, v))
+    if problems:
+        return problems     # contrast means nothing over malformed colours
+    for slot in THEME_LIGHT_SLOTS:
+        lum = relative_luminance(theme[slot])
+        if lum < THEME_LIGHT_FLOOR:
+            problems.append("%s %s is too dark (luminance %.2f, the floor is %.2f), which would hide the "
+                            "severity words" % (slot, theme[slot], lum, THEME_LIGHT_FLOOR))
+    for text, bg in pairs:
+        need = THEME_TEXT_RATIO.get(text, 4.5)
+        ratio = contrast_ratio(theme[text], theme[bg])
+        if ratio < need:
+            problems.append("%s on %s is %.2f:1, below %.1f:1" % (text, bg, ratio, need))
+    return problems
+
+
+def _base_css(assets):
+    try:
+        with open(os.path.join(assets, "report-base.css"), encoding="utf-8-sig") as f:
             return f.read()
-    return "body{font-family:Arial,sans-serif}"
+    except OSError:
+        return None
+
+
+def _bundled_theme_dir(assets):
+    root = os.path.join(assets, "themes")
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in names:
+        if os.path.isfile(os.path.join(root, name, "theme.json")):
+            return os.path.join(root, name)
+    return None
+
+
+def _active_theme():
+    """The theme a report renders with: the bundled one when it validates, else the default.
+
+    The result says which, and why a bundled theme was passed over (`fallbackReason`), because a
+    report that quietly went unbranded looks deliberate."""
+    assets = _assets_dir()
+    if assets in _THEME_CACHE:
+        return _THEME_CACHE[assets]
+    theme = dict(DEFAULT_THEME, source="default")
+    bdir = _bundled_theme_dir(assets)
+    if bdir:
+        try:
+            with open(os.path.join(bdir, "theme.json"), encoding="utf-8-sig") as f:
+                raw = json.load(f)
+        except (OSError, ValueError) as e:
+            raw, reason = None, "rejected: theme.json is unreadable (%s)" % e
+        else:
+            reason = None if isinstance(raw, dict) else "rejected: theme.json is not an object"
+        if reason is None:
+            api = raw.get("themeApi")
+            if isinstance(api, int) and not isinstance(api, bool) and api > THEME_API:
+                reason = "needs-newer-skill (themeApi %d)" % api
+            elif api != THEME_API:
+                reason = "rejected: themeApi must be %d" % THEME_API
+        if reason is None:
+            merged = dict(DEFAULT_THEME)
+            # Logos are the theme's own or nothing; the default has none to inherit.
+            # A theme that sets only an accent gets it on the masthead text too, checked as text. An
+            # invalid accent is not inherited, so the rejection names the slot the author wrote.
+            if ("mastheadAccentInk" not in raw and isinstance(raw.get("accent"), str)
+                    and _THEME_HEX.fullmatch(raw["accent"])):
+                merged["mastheadAccentInk"] = raw["accent"]
+            merged.update((k, v) for k, v in raw.items() if k in _THEME_KEYS)
+            probs = theme_problems(merged, theme_contrast_pairs(_base_css(assets)), bdir)
+            if probs:
+                reason = "rejected: " + probs[0]
+            else:
+                theme = dict(merged, name=os.path.basename(bdir), source="bundled", dir=bdir)
+        if reason:
+            theme["fallbackReason"] = reason
+    _THEME_CACHE[assets] = theme
+    return theme
+
+
+def _theme_summary():
+    t = _active_theme()
+    out = {"name": t["name"], "source": t["source"]}
+    if t.get("fallbackReason"):
+        out["fallbackReason"] = t["fallbackReason"]
+    return out
+
+
+def _theme_file(slot):
+    t = _active_theme()
+    if not t.get(slot) or not t.get("dir"):
+        return None
+    with open(os.path.join(t["dir"], t[slot]), encoding="utf-8") as f:
+        return f.read()
+
+
+def _load_css():
+    """The report stylesheet: the active theme's slot values as custom properties, then the layout."""
+    t = _active_theme()
+    decl = ["--%s: %s;" % (s, t[s]) for s in THEME_COLOR_SLOTS]
+    decl += ["--sans: %s;" % THEME_FONT_STACKS[t["sans"]], "--mono: %s;" % THEME_FONT_STACKS[t["mono"]]]
+    base = _base_css(_assets_dir())
+    return ":root { %s }\n%s" % (" ".join(decl), base if base is not None else "body{font-family:var(--sans)}")
 
 
 def _branded():
-    """True when this install carries the Cyderes brand assets.
+    """True when a theme other than the default styles reports.
 
-    Public builds ship without them (see scripts/tools/make-public.py). A build that cannot render the
-    wordmark must not assert it in text either: "cyderes" spelled out in the masthead, or a footer
-    naming Cyderes, is the same trademark use as the artwork with the artwork taken away. So this
-    gates the words too, not only the SVG -- which is the whole reason it exists rather than each
-    call site testing for its own file.
-    """
-    return os.path.exists(os.path.join(_assets_dir(), "cyderes-logo.svg"))
+    Brand words reach a report only through a theme (`producer`, the logos), never from code. That
+    is what keeps an unbranded build from branding by text: removing the artwork while keeping the
+    words is the same trademark use, minus the artwork. The default theme names no organisation."""
+    return _active_theme()["source"] != "default"
 
 
 def _logo_svg():
-    """Inline the official Cyderes wordmark SVG (Cybervolt fill, for the black masthead).
-
-    Falls back to nothing at all, not to a typographic wordmark -- see _branded(). The masthead's
-    product slot still names Meridian, which is what the report is about, and naming the system a
-    tool queries is nominative use rather than branding.
-    """
-    p = os.path.join(_assets_dir(), "cyderes-logo.svg")
-    if os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return f.read()
-    return ""
+    """The theme's wordmark SVG for the masthead, or nothing at all -- never a typographic stand-in
+    (see _branded()). The product slot still names Meridian, which is nominative use."""
+    return _theme_file("logo") or ""
 
 
 def _currency_line(data):
@@ -7451,33 +7663,28 @@ def _currency_line(data):
 
 
 def _producer_note():
-    """The report footer's attribution line, neutral when the brand assets are absent."""
-    who = "Cyderes Meridian" if _branded() else "meridiancs"
-    return "Generated by the %s skill. Verify against the live stack before acting." % who
+    """The report footer's attribution line. The producer is the theme's; the instruction to verify
+    is not themeable."""
+    return "Generated by the %s skill. Verify against the live stack before acting." % _active_theme()["producer"]
 
 
 def _meridian_svg():
-    """Inline the official Meridian wordmark (white, for the black masthead). Falls back to text."""
-    p = os.path.join(_assets_dir(), "meridian-logo.svg")
-    if os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return f.read()
-    return "Meridian"
+    """The theme's product logo for the masthead, or the word Meridian."""
+    return _theme_file("productLogo") or "Meridian"
 
 
 def _font_face_css():
-    """Embed the bundled Cyderes brand-alternate fonts (Space Grotesk / Space Mono, both OFL) as
-    data URIs so the PDF is on-brand on any machine, not just ones with the fonts installed."""
+    """Embed the bundled OFL faces the theme uses (Space Grotesk / Space Mono) as data URIs, so the
+    PDF looks the same on any machine. A theme on system fonts embeds nothing: the public build
+    used to embed all four faces into every report for a stylesheet that never named them."""
     import base64
     fdir = os.path.join(_assets_dir(), "fonts")
-    faces = [
-        ("Space Grotesk", "SpaceGrotesk-Regular.ttf", 400),
-        ("Space Grotesk", "SpaceGrotesk-Medium.ttf", 500),
-        ("Space Grotesk", "SpaceGrotesk-Bold.ttf", 700),
-        ("Space Mono", "SpaceMono-Regular.ttf", 400),
-    ]
+    t = _active_theme()
+    used = {t["sans"], t["mono"]}
     out = []
-    for fam, fn, wt in faces:
+    for fam, fn, wt in THEME_FONT_FILES:
+        if fam not in used:
+            continue
         p = os.path.join(fdir, fn)
         if os.path.exists(p):
             with open(p, "rb") as f:
@@ -7551,7 +7758,7 @@ def _sev_span(level):
 
 def _simple_table(headers, rows):
     if not rows:
-        return "<p style='color:#8a847f;font-size:11px'>None.</p>"
+        return "<p class='report-note' style='font-size:11px'>None.</p>"
     th = "".join("<th>%s</th>" % _esc(h) for h in headers)
     body = "".join("<tr>%s</tr>" % "".join("<td>%s</td>" % c for c in r) for r in rows)
     return "<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>" % (th, body)
@@ -7838,7 +8045,9 @@ def _blast_radius_svg(data):
             or [i.get("source") for i in (data.get("identities") or []) if isinstance(i, dict)]) if s]
 
     import math
-    CRIT, HIGH, LOW, GRAY, EDGE = "#C0392B", "#E07B39", "#2E8B57", "#8a847f", "#c9bfb2"
+    # The severity values match cyderes-report.css's --crit/--high/--low, so a node and its table
+    # row agree on colour.
+    CRIT, HIGH, LOW, GRAY, EDGE = "#C0392B", "#AD5212", "#237A4B", "#8a847f", "#c9bfb2"
     TINT = {CRIT: "#fbeceb", HIGH: "#fcf1e8", LOW: "#e9f4ee", GRAY: "#f1eeeb"}
 
     def sev_color(level):
@@ -8007,10 +8216,10 @@ def _blast_radius_svg(data):
     lx, legend = 60, []
     for col, lab in leg_items:
         legend.append('<circle cx="%g" cy="530" r="6" fill="%s" stroke="%s" stroke-width="1.4"/>'
-                      '<text x="%g" y="534" font-size="11" fill="#4c4a48">%s</text>'
+                      '<text x="%g" y="534" font-size="11" class="legend-label">%s</text>'
                       % (lx, TINT.get(col, "#eee"), col, lx + 12, _esc(lab)))
         lx += 24 + len(lab) * 6.4 + 24
-    legend.append('<text x="60" y="552" font-size="10" fill="#8a847f">Node size scales with risk '
+    legend.append('<text x="60" y="552" font-size="10" class="axis">Node size scales with risk '
                   'score (user &amp; assets); identity, threat and posture nodes are shown at baseline size.</text>')
 
     svg = ('<svg viewBox="0 0 780 566" role="img" style="width:100%%;max-width:770px;height:auto;display:block;margin:2px auto 0" '
@@ -8192,7 +8401,7 @@ def _profile_html(data):
     callout = ""
     if stab.get("oscillating"):
         flds = ", ".join("%s (×%s)" % (f.get("field"), f.get("changeCount")) for f in (stab.get("fields") or []))
-        callout = ("<div class='callout' style='border-left-color:#C0392B;background:#fbeceb;border-color:#f3c9c5'>"
+        callout = ("<div class='callout unstable'>"
                    "<strong>⚠ Record unstable — identity-resolution conflict.</strong> "
                    "<em>Historical: from the user's change log.</em> This identity's defining fields "
                    "change repeatedly in the change log (%s), meaning two source personas are being merged into one record. "
@@ -8217,7 +8426,7 @@ def _profile_html(data):
     return subtitle, statcards, body
 
 
-_EMPTY_TABLE = "<p style='color:#8a847f;font-size:11px'>None.</p>"
+_EMPTY_TABLE = "<p class='report-note' style='font-size:11px'>None.</p>"
 
 
 def _profile_subject(data):
@@ -8346,7 +8555,7 @@ def _line_chart_svg(dates, series, height=210, flagged=None):
         gv = lo + (hi - lo) * f
         gy = y(gv)
         parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#e8e1da" stroke-width="1"/>' % (ML, gy, W - MR, gy))
-        parts.append('<text x="%d" y="%.1f" text-anchor="end" font-size="10" fill="#8a847f">%s</text>'
+        parts.append('<text x="%d" y="%.1f" text-anchor="end" font-size="10" class="axis">%s</text>'
                      % (ML - 6, gy + 3, "{:,.0f}".format(gv)))
     for i, d in enumerate(dates):
         if d in (flagged or ()):
@@ -8382,7 +8591,7 @@ def _line_chart_svg(dates, series, height=210, flagged=None):
     for i in label_idx:
         # Edge labels anchor inward so the first and last dates don't clip at the chart borders.
         anchor = "start" if i == 0 else ("end" if i == len(dates) - 1 else "middle")
-        parts.append('<text x="%.1f" y="%d" text-anchor="%s" font-size="10" fill="#8a847f">%s</text>'
+        parts.append('<text x="%.1f" y="%d" text-anchor="%s" font-size="10" class="axis">%s</text>'
                      % (x(i), H - 8, anchor, _esc(dates[i])))
     for _, vs, color in series:
         seg = []
@@ -8407,7 +8616,7 @@ def _line_chart_svg(dates, series, height=210, flagged=None):
 def _series_gap_note(series):
     """The one-line honesty footnote, present only when a plotted series actually has a gap."""
     if any(v is None for _, vs, _ in series for v in vs):
-        return ("<p style='color:#8a847f;font-size:10px;margin:2px 0 0'>A break in a line is a date "
+        return ("<p class='report-note' style='font-size:10px;margin:2px 0 0'>A break in a line is a date "
                 "this value was not captured — a gap is unknown, never zero.</p>")
     return ""
 
@@ -8421,7 +8630,7 @@ def _chart_block(title, dates, named_values, note="", coverage_flags=None):
     if coverage_flags:
         # Named on the chart itself, not just in a caveats section at the end: a dip on a date when
         # connectors were failing reads as an environment change unless the picture says otherwise.
-        note += ("<p style='color:#8a847f;font-size:10px;margin:2px 0 0'>Marked dates had reduced "
+        note += ("<p class='report-note' style='font-size:10px;margin:2px 0 0'>Marked dates had reduced "
                  "connector coverage (%s) — a movement there may be the data sources, not the "
                  "environment.</p>"
                  % _esc("; ".join("%s: %s" % (f.get("date"), f.get("reason")) for f in coverage_flags[:4])))
@@ -8491,11 +8700,11 @@ def _trend_html(data):
         ranked = sorted(groups.items(), key=lambda kv: -last_val(kv[1]))
         note = ""
         if len(ranked) > 8:
-            note = ("<p style='color:#8a847f;font-size:10px;margin:2px 0 0'>Showing the 8 largest of "
+            note = ("<p class='report-note' style='font-size:10px;margin:2px 0 0'>Showing the 8 largest of "
                     "%d groups (by latest value).</p>" % len(ranked))
             ranked = ranked[:8]
         if bd.get("incompleteDates"):
-            note += ("<p style='color:#8a847f;font-size:10px;margin:2px 0 0'>On %s this breakdown did "
+            note += ("<p class='report-note' style='font-size:10px;margin:2px 0 0'>On %s this breakdown did "
                      "not account for every record; those counts are exact but not exhaustive.</p>"
                      % _esc(", ".join(bd["incompleteDates"])))
         sec.append(_chart_block("%s by %s" % (bd.get("table") or "asset", bd.get("by") or "?"),
@@ -8538,7 +8747,7 @@ def _trend_html(data):
                            % (_esc(ents.get("identities") or ""),
                               _simple_table(["Entity", "From", "To", "Change"], movers)))
             if ents.get("note"):
-                sec.append("<p style='color:#8a847f;font-size:10px'>%s</p>" % _esc(ents["note"]))
+                sec.append("<p class='report-note' style='font-size:10px'>%s</p>" % _esc(ents["note"]))
 
     notes = []
     if coverage.get("note"):
@@ -8679,7 +8888,7 @@ def _write_report(a, default_title, subtitle, statcards, body, section_label="",
 %s
 %s
 %s
-<div class="report-footer"><span>%s</span><span class="conf">Confidential</span></div>
+<div class="report-footer"><span>%s</span><span class="conf">%s</span></div>
 </body></html>""" % (
         _esc(title), _font_face_css(), _load_css(), _logo_svg(), _meridian_svg(), _esc(title), _esc(subtitle), _esc(fqdn or "n/a"),
         (" &middot; " + _esc(gen)) if gen else "",
@@ -8687,13 +8896,13 @@ def _write_report(a, default_title, subtitle, statcards, body, section_label="",
         ("<div class='stats'>%s</div>" % statcards) if statcards else "",
         section_label,
         body,
-        _esc(_producer_note()))
+        _esc(_producer_note()), _esc(_active_theme()["classification"]))
 
     out = a.out
     if a.html or out.lower().endswith(".html"):
         with open(out, "w", encoding="utf-8") as f:
             f.write(html)
-        jout({"written": os.path.abspath(out), "format": "html"}); return
+        jout({"written": os.path.abspath(out), "format": "html", "theme": _theme_summary()}); return
 
     # Render to PDF via headless Chrome/Edge.
     browser = _find_browser()
@@ -8703,7 +8912,8 @@ def _write_report(a, default_title, subtitle, statcards, body, section_label="",
     if not browser:
         os.replace(tmp_html, out + ".html")
         jout({"written": os.path.abspath(out + ".html"), "format": "html",
-                          "note": "No Chrome/Edge found for PDF conversion; wrote HTML instead."}); return
+                          "note": "No Chrome/Edge found for PDF conversion; wrote HTML instead.",
+              "theme": _theme_summary()}); return
     try:
         try:
             _print_to_pdf(browser, tmp_html, out)
@@ -8719,11 +8929,13 @@ def _write_report(a, default_title, subtitle, statcards, body, section_label="",
         except OSError:
             pass
     if ok:
-        jout({"written": os.path.abspath(out), "format": "pdf", "renderer": os.path.basename(browser)})
+        jout({"written": os.path.abspath(out), "format": "pdf", "renderer": os.path.basename(browser),
+              "theme": _theme_summary()})
     else:
         with open(out + ".html", "w", encoding="utf-8") as f:
             f.write(html)
-        jout({"written": os.path.abspath(out + ".html"), "format": "html", "note": "PDF conversion failed; wrote HTML."})
+        jout({"written": os.path.abspath(out + ".html"), "format": "html", "note": "PDF conversion failed; wrote HTML.",
+              "theme": _theme_summary()})
 
 
 # ---- connector / data-coverage summary --------------------------------------------------------

@@ -7274,6 +7274,28 @@ def test_brand_fallback(m, monkeypatch, tmp_path):
     check("restored to the branded install", m._branded(), True)
 
 
+def test_severity_words_are_readable(m):
+    """Severity words print in their severity colour (`.s-high { color: var(--high) }`), so each
+    colour is body text and needs WCAG's 4.5:1. Until v2.32.0 high and med measured 2.68:1 and
+    2.64:1 on the page background, below even the 3:1 large-text floor, in every report. Measured
+    against every background a severity word sits on in every theme that ships: the default always,
+    and the bundled one where the tree has it. The colours live in report-base.css, which both trees
+    ship, so this runs in the public tree too."""
+    import re as _re
+    with open(os.path.join(m._assets_dir(), "report-base.css"), encoding="utf-8") as f:
+        css = f.read()
+    var = dict(_re.findall(r"--([\w-]+):\s*(#[0-9A-Fa-f]{6})", css))
+    themes = [("default", m.DEFAULT_THEME)]
+    if m._active_theme()["source"] == "bundled":
+        themes.append((m._active_theme()["name"], m._active_theme()))
+    for sev in ("crit", "high", "med", "low"):
+        for name, theme in themes:
+            for bg in ("pageBg", "panel", "zebra"):
+                check("%s readable on %s's %s" % (sev, name, bg),
+                      m.contrast_ratio(var[sev], theme[bg]) >= 4.5, True)
+    check("the guard can fail: the old high colour", m.contrast_ratio("#E07B39", "#F9F2ED") >= 4.5, False)
+
+
 def test_trademark_notice():
     """NOTICE asserts Cyderes ownership of Meridian, and no longer hedges it.
 

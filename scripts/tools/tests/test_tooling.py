@@ -181,6 +181,10 @@ def test_candidate_tags_stay_outside_the_release_tag_namespace():
     tag = rm.candidate_tag("2.31.1", "41", "d2d3468")
     assert tag == "rc-2.31.1-41-d2d3468"
     assert not fnmatch.fnmatchcase("refs/tags/" + tag, "refs/tags/v*")
-    # The release job's trigger is the other half: a vX.Y.Z tag still triggers it.
-    with open(os.path.join(TOOLS, "..", "..", ".github", "workflows", "release.yml"), encoding="utf-8") as f:
-        assert 'tags: ["v[0-9]+.[0-9]+.[0-9]+"]' in f.read()
+
+
+@pytest.mark.skipif(not os.path.exists(RELEASE_WORKFLOW), reason="make-public.py drops release.yml")
+def test_release_tags_still_trigger_the_release_job():
+    """The other half of the tag split: a vX.Y.Z tag still triggers the release job. A separate
+    test so the public tree, which has no release.yml, still runs the candidate-name half."""
+    assert 'tags: ["v[0-9]+.[0-9]+.[0-9]+"]' in _release_workflow_code()

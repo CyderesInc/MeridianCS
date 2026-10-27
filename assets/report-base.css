@@ -1,0 +1,191 @@
+/* Meridian report layout (print / PDF optimized). Brand-neutral: every colour here is a theme
+   slot (design/report-themes.md, decision 2), filled in by meridian.py's theme loader, which
+   writes the slot values into a :root block ahead of this file.
+
+   Every rule that sets a text colour from a slot names the background it sits on, as
+   `on: <slot>[, <slot>...]` in a comment. The loader reads those annotations to decide which
+   pairs to contrast-check (decision 4), and test_report_base_annotations fails when a text colour
+   has none. `on: -` marks the few that carry no information (markers, a separator glyph) or that
+   sit on a fixed severity surface; the test holds that list to a named few. */
+
+:root {
+  /* Severity: meaning, not brand, so never themeable. Each holds 4.5:1 on the page background
+     (test_severity_words_are_readable); the light-background floor keeps that true under any theme. */
+  --crit: #C0392B;
+  --high: #AD5212;
+  --med: #876A0A;
+  --low: #237A4B;
+}
+
+/* Landscape gives wide asset/user tables room. Use the bare `landscape` keyword — Chrome's
+   --print-to-pdf honors this but ignores the "Letter landscape" / explicit-dimension forms. */
+@page { size: landscape; margin: 12mm 12mm 14mm; }
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: var(--sans); color: var(--ink); /* on: pageBg */ background: var(--pageBg);
+  font-size: 12px; line-height: 1.5;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+
+/* ---- Masthead ---- */
+.masthead { background: var(--mastheadBg); color: var(--mastheadInk); /* on: mastheadBg */ padding: 18px 22px 16px; border-radius: 8px; position: relative; overflow: hidden; }
+.masthead::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: var(--accent); }
+.brandrow { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+/* Wordmark slot: the theme's `logo` SVG, or nothing. */
+.wordmark { display: inline-flex; align-items: center; color: var(--mastheadAccentInk); /* on: mastheadBg */ font-weight: 700; letter-spacing: -.02em; font-size: 19px; line-height: 1; }
+.wordmark svg { height: 20px; width: auto; display: block; }
+/* Product slot: the theme's `productLogo` SVG, or the word Meridian. */
+.masthead .product { display: inline-flex; align-items: center; }
+.masthead .product svg { height: 18px; width: auto; display: block; }
+.masthead h1 { font-size: 23px; font-weight: 700; letter-spacing: -.01em; margin: 14px 0 4px; color: var(--mastheadInk); /* on: mastheadBg */ text-wrap: balance; }
+/* Carries the data-currency line, which no theme may hide (decision 4). */
+.masthead .meta { font-size: 11px; color: var(--mastheadMeta); /* on: mastheadBg */ }
+.masthead .meta code { font-family: var(--mono); color: var(--mastheadAccentInk); /* on: mastheadBg */ }
+
+/* ---- Summary stat row ---- */
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 16px 0 4px; }
+.stat { background: var(--panel); color: var(--ink); /* on: panel */ border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; position: relative; }
+.stat::before { content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; background: var(--accent); border-radius: 2px; }
+.stat.crit::before { background: var(--crit); }
+.stat .n { font-family: var(--mono); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.02em; padding-left: 8px; }
+.stat.crit .n { color: var(--crit); /* on: panel */ }
+.stat .l { font-size: 10px; color: var(--ink3); /* on: panel */ text-transform: uppercase; letter-spacing: .07em; margin-top: 1px; padding-left: 8px; }
+
+/* ---- Section label ---- */
+.section-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--ink2); /* on: pageBg */
+  margin: 22px 0 8px; display: flex; align-items: center; gap: 9px; }
+.section-label::before { content: ""; width: 18px; height: 3px; background: var(--accent); }
+
+/* ---- Table ---- */
+table { border-collapse: collapse; width: 100%; }
+.name { word-break: break-word; }
+thead th:first-child, tbody td:first-child { width: 26px; }
+thead th { text-align: left; font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink3); /* on: pageBg */
+  font-weight: 700; padding: 8px 10px; border-bottom: 1.5px solid var(--rule); white-space: nowrap; }
+tbody td { padding: 9px 10px; border-bottom: 1px solid var(--line); font-size: 11.5px; vertical-align: middle; }
+tbody tr:nth-child(even) { background: var(--zebra); color: var(--ink); /* on: zebra */ }
+.rank { font-family: var(--mono); color: var(--ink3); /* on: pageBg, zebra */ font-variant-numeric: tabular-nums; }
+.name { font-family: var(--mono); font-size: 11px; }
+.name .id { color: var(--ink3); /* on: pageBg, zebra */ font-size: 10px; }
+.ip { font-family: var(--mono); font-size: 10.5px; color: var(--ink2); /* on: pageBg, zebra */ }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+
+.sev { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.s-crit { color: var(--crit); /* on: pageBg, zebra */ } .s-crit .dot { background: var(--crit); }
+.s-high { color: var(--high); /* on: pageBg, zebra */ } .s-high .dot { background: var(--high); }
+.s-med  { color: var(--med); /* on: pageBg, zebra */ }  .s-med  .dot { background: var(--med); }
+.s-low  { color: var(--low); /* on: pageBg, zebra */ }  .s-low  .dot { background: var(--low); }
+/* The encryption cell's "No" -- a severity word, so a severity colour. */
+.enc-no { color: var(--crit); /* on: pageBg, zebra */ }
+
+.score { display: flex; align-items: center; gap: 8px; }
+.score .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 700; min-width: 44px; text-align: right; }
+.bar { flex: 1; height: 5px; background: var(--barTrack); border-radius: 3px; overflow: hidden; min-width: 44px; }
+.bar > span { display: block; height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--high), var(--crit)); }
+
+.kev { display: inline-block; font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 700;
+  padding: 1px 8px; border-radius: 20px; font-size: 11px; }
+/* A severity surface: fixed background and fixed text, so no theme value reaches it. */
+.kev.hot { background: var(--crit); color: #fff; /* on: - */ }
+.kev.none { color: var(--ink3); /* on: pageBg, zebra */ }
+
+/* ---- Findings / recommendations lists ---- */
+ul.insights, ol.recs { margin: 6px 0 2px; padding-left: 20px; }
+ul.insights li, ol.recs li { margin-bottom: 6px; font-size: 12px; line-height: 1.45; }
+ul.insights li::marker { color: var(--accentStrong); /* on: - */ }
+ol.recs li::marker { font-family: var(--mono); font-weight: 700; color: var(--ink2); /* on: pageBg */ }
+
+/* ---- Callout + footer ---- */
+.callout { margin-top: 16px; background: var(--calloutBg); border: 1px solid var(--calloutBorder); border-left: 3px solid var(--accent);
+  border-radius: 6px; padding: 12px 15px; font-size: 11.5px; color: var(--ink2); /* on: calloutBg */ }
+.callout strong { color: var(--ink); /* on: calloutBg */ }
+/* The unstable-record warning is a severity surface: every colour fixed, text included. The
+   declarations keep the order the inline style had, so border-color still wins over the left edge. */
+.callout.unstable { border-left-color: #C0392B; background: #fbeceb; border-color: #f3c9c5; color: #4c4a48; /* on: - */ }
+.callout.unstable strong { color: #000000; /* on: - */ }
+/* Notes under charts and tables (coverage, gaps, "None."). They carry the caveats a trend depends on.
+   Not `.note`: the documentation generators reuse this stylesheet and have a `.note` of their own. */
+.report-note { color: var(--ink3); /* on: pageBg */ }
+.report-footer { margin-top: 18px; padding-top: 10px; border-top: 1px solid var(--line);
+  font-size: 9.5px; color: var(--ink3); /* on: pageBg */ display: flex; justify-content: space-between; gap: 12px; }
+.report-footer .conf { font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--ink2); /* on: pageBg */ }
+
+/* ---- Charts and the blast-radius graph (inline SVG) ---- */
+svg .axis { fill: var(--ink3); /* on: pageBg */ }
+svg .legend-label { fill: var(--ink2); /* on: pageBg */ }
+
+/* ---- Multi-subject reports (`report --input a.json b.json ...`) --------------------------------
+   Every rule here is scoped to .subj / .toc / .graphbox / .assetbox, which only a multi-subject
+   document emits, so a single-profile report renders exactly as before. The rest of this stylesheet
+   is tuned for one subject on its own page; stacked several deep that vertical rhythm becomes
+   whitespace, and narrow content wastes the landscape width. Measured on a user plus three linked
+   assets: 10 pages down to 5, with no content removed.                                          */
+
+/* Contents line. One row, not a block list -- there are no page numbers to align. */
+.toc { font-size: 10.5px; color: var(--ink2); /* on: pageBg */ margin: 9px 0 0; }
+.toc .lead { font-size: 9px; color: var(--ink3); /* on: pageBg */ text-transform: uppercase;
+  letter-spacing: .07em; margin-right: 7px; }
+.toc b { color: var(--ink); /* on: pageBg */ }
+.toc .k { color: var(--ink3); /* on: pageBg */ }
+.toc .sep { color: var(--mastheadSub); /* on: - */ margin: 0 6px; }
+
+/* Subject banner. */
+.subject { margin: 13px 0 0; padding: 6px 12px; background: var(--mastheadBg);
+  border-radius: 7px; display: flex; align-items: baseline; gap: 11px;
+  break-after: avoid; page-break-after: avoid; }
+.subject .k { font-family: var(--mono); font-size: 9px; text-transform: uppercase;
+  letter-spacing: .12em; color: var(--mastheadAccentInk); /* on: mastheadBg */ white-space: nowrap; }
+.subject .v { font-size: 14px; font-weight: 700; color: var(--mastheadInk); /* on: mastheadBg */ word-break: break-all; }
+.subject .sub { font-size: 9.5px; line-height: 1.35; color: var(--mastheadSub); /* on: mastheadBg */
+  margin-left: auto; text-align: right; white-space: nowrap; }
+
+/* Keep a whole asset profile on one page rather than forcing a break before each subject --
+   forced breaks left three pages roughly 60% empty. An identity section is taller than a page, so
+   Chrome ignores `avoid` there and breaks it naturally, which is what we want. */
+.subj { break-inside: avoid; page-break-inside: avoid; }
+.subj.identity { break-inside: auto; page-break-inside: auto; }
+
+/* Density. */
+.subj .stats { gap: 8px; margin: 9px 0 1px; }
+.subj .stat { padding: 7px 11px; border-radius: 7px; }
+.subj .stat::before { top: 7px; bottom: 7px; }
+.subj .stat .n { font-size: 16px; }
+.subj .stat .l { font-size: 9px; margin-top: 0; }
+.subj .section-label { margin: 11px 0 4px; font-size: 10px;
+  break-after: avoid; page-break-after: avoid; }
+.subj .section-label::before { width: 14px; height: 2px; }
+.subj thead th { padding: 4px 8px; font-size: 9px; }
+.subj tbody td { padding: 5px 8px; font-size: 11px; }
+.subj p { margin: 3px 0; }
+.subj ul.insights, .subj ol.recs { margin: 3px 0 0; padding-left: 18px; }
+.subj ul.insights li, .subj ol.recs li { margin-bottom: 3px; font-size: 11.5px; line-height: 1.4; }
+.subj .callout { margin-top: 9px; padding: 8px 12px; font-size: 11px; }
+
+/* The blast-radius graph is 780x566. At full width it eats three-quarters of a page's height, and
+   scaled down on its own it left the right half of the page empty -- so it floats, with its label,
+   and the three short sections that follow (risk factors, threats, governance) fill the space
+   beside it. Width is set inline on the <svg>, hence !important. */
+.subj .graphbox { float: right; width: 440px; margin: 0 0 8px 20px; }
+.subj .graphbox .section-label { margin-top: 0; }
+.subj .graphbox svg { max-width: 440px !important; margin: 0 !important; }
+/* The 7-column linked-assets table needs the full width back. The identity table sits above the
+   float, so clearing it costs nothing. */
+.subj.identity .pbody > table { clear: both; }
+.subj.identity .pbody table tbody td:nth-child(-n+4) { white-space: nowrap; }
+
+/* Asset bodies are narrow (5-column tables, short lists) on a ~966px-wide landscape page, so flow
+   them in two columns. An identity body stays single-column: its linked-assets table is 7 columns
+   wide and would be cramped. */
+.pbody.cols { column-count: 2; column-gap: 22px; }
+.pbody.cols > * { break-inside: avoid; page-break-inside: avoid; }
+/* ...except the lists. Held whole, a long findings list filled one column and left the other
+   empty; letting it flow balances the pair. Individual items still stay intact. */
+.pbody.cols > ul, .pbody.cols > ol { break-inside: auto; page-break-inside: auto; }
+.pbody.cols li { break-inside: avoid; page-break-inside: avoid; }
+/* The asset table's host id is a 60-character key, far too wide for a ~470px column -- it
+   overflowed into the neighbouring one. Span both columns instead of wrapping the id. */
+.pbody.cols > .assetbox { column-span: all; margin: 2px 0 0; }
+.pbody.cols > .assetbox .section-label { margin-top: 4px; }

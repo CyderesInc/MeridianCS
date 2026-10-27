@@ -3,6 +3,18 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.32.0 - 2026-10-26
+
+- **Severity is easier to read in reports.** High, medium and low severity words and graph markers
+  are darker, so each meets the standard contrast for small text. High and medium used to fall
+  below even the large-text minimum.
+- **Every install gets a designed report.** Unbranded reports used to be near-unstyled text. They
+  now use the full layout in a neutral theme, and each file is about 96% smaller. Branded reports
+  are unchanged.
+- **A report's styling can't hide what it says.** It now comes from a theme the skill checks first,
+  so all text stays readable, including how current the data is. A theme that fails is set aside,
+  and the report says why.
+
 ## 2.31.1 - 2026-10-22
 
 - **Your saved token only goes to its own stack.** Pointing `MERIDIAN_FQDN` at another address no

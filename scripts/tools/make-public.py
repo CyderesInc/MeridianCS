@@ -16,12 +16,12 @@ have trailed the tree by a commit. A hand-maintained public fork is that bug wit
 
 ## What it removes, and why
 
-**Brand assets** (`assets/cyderes-*.svg`, `assets/meridian-logo.svg`, `assets/cyderes-report.css`).
-Apache-2.0 section 6 grants no trademark rights, but the practical risk is not licensing: with the
-wordmarks in a public repo, anyone can generate an authentic-looking Cyderes-branded risk report.
-No code change is needed to drop them -- `_load_css`, `_logo_svg`, `_meridian_svg` and
-`_font_face_css` in `meridian.py` each check `os.path.exists` and fall back to neutral styling, so
-the report path degrades to unbranded output on its own. `evals/test_connect.py` asserts that
+**The bundled Cyderes theme** (`assets/themes/cyderes/`: both wordmarks, the palette and the
+producer text, `design/report-themes.md` decision 11). Apache-2.0 section 6 grants no trademark
+rights, but the practical risk is not licensing: with the wordmarks in a public repo, anyone can
+generate an authentic-looking Cyderes-branded risk report. No code change is needed to drop it --
+with no bundled theme, `meridian.py`'s theme loader uses its neutral default, and the layout
+(`assets/report-base.css`, brand-neutral) ships either way. `evals/test_connect.py` asserts that
 fallback, so the derived tree's report path is covered by the same suite as everything else.
 
 The four **fonts stay**: they are SIL OFL 1.1, explicitly redistributable, and are not Cyderes
@@ -92,7 +92,12 @@ PUBLISH_INTERNAL_DOCS = False
 # Markdown inline links, for the dangling-link audit below.
 MD_LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
 
-# Cyderes trademarks and Brand Style Guide styling. Not licensed for redistribution; see NOTICE.
+# Cyderes trademarks and Brand Style Guide styling, as a bundled report theme. Every file under
+# the folder is dropped, so a theme file added later cannot ride along by being unlisted. Not
+# licensed for redistribution; see its NOTICE.
+BRAND_DIRS = ("assets/themes/",)
+# Brand files that predate the themes layout. Never tracked any more; the audit still fails if one
+# reappears in the output.
 BRAND_ASSETS = {
     "assets/cyderes-logo.svg",
     "assets/meridian-logo.svg",
@@ -236,7 +241,7 @@ def plan(files):
     keep, subs, dropped, missing = [], {}, [], []
     available = set(files)
     for f in files:
-        if f in drop or (not PUBLISH_INTERNAL_DOCS and f.startswith(INTERNAL_DIRS)):
+        if f in drop or f.startswith(BRAND_DIRS) or (not PUBLISH_INTERNAL_DOCS and f.startswith(INTERNAL_DIRS)):
             dropped.append(f)
             continue
         if f.endswith(".public.md"):
@@ -277,7 +282,7 @@ def audit(target):
         if not os.path.exists(os.path.join(target, rel)):
             problems.append("missing required file: %s" % rel)
 
-    for rel in sorted(BRAND_ASSETS):
+    for rel in sorted(BRAND_ASSETS) + list(BRAND_DIRS):
         if os.path.exists(os.path.join(target, rel)):
             problems.append("brand asset survived into the output: %s" % rel)
 

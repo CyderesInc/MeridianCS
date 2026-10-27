@@ -468,7 +468,7 @@ A scheduled job needs those variables in its own environment; see
 `meridian.py report` renders a PDF from any verb's JSON output, including trend charts and a
 blast-radius graph for a profile. Several profiles render as one document. It needs a Chromium
 browser (Chrome or Edge) for the PDF, and falls back to HTML with `--html`. This distribution carries
-no Cyderes brand assets, so reports render in neutral styling and name no brand (see
+no Cyderes brand assets, so reports render in the neutral default theme and name no brand (see
 [Licensing](#licensing)).
 
 ```bash
@@ -612,6 +612,7 @@ references/           what the skill reads on demand
 scripts/
   meridian.py         the CLI, standard library only; every verb is listed below
   tools/              packaging, signing, SBOM and docs-check tooling (never shipped in the package)
+assets/report-base.css  the report layout; a theme supplies only its colours, fonts and logos
 assets/fonts/         Space Grotesk and Space Mono (SIL OFL, licence texts alongside)
 evals/                the automated test suite, plus prompt-level checks in evals.json
 ```
