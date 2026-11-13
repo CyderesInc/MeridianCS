@@ -1711,7 +1711,7 @@ def test_tls_routing(m, monkeypatch, tmp_path):
     failure must not be answered with "what's the correct address?", and the update notice must stay
     the only `unknown` that speaks. Plus the general form: every connect state the code can return
     has a row, since a state with no row gets whatever the model improvises."""
-    body = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+    body = skill_with("launch.md")
     for rule in ("| `tls_untrusted` |",
                  "**Don't** re-prompt for the FQDN (it worked)",
                  "don't lead with `insecure_tls`",
@@ -4464,6 +4464,20 @@ def test_entities(m, monkeypatch, tmp_path):
 
 
 SKILL_MD = os.path.join(os.path.dirname(HERE), "SKILL.md")
+
+
+def skill_with(*refs):
+    """SKILL.md plus the references it sends the model to for one job, whitespace-normalised.
+
+    Prose that only matters in a minority of sessions (a failed connection, an applied update, a
+    stack being switched) lives in references/ behind an imperative pointer, so the always-loaded
+    body doesn't carry it. A rule pinned by a guard is still pinned: the guard reads what the model
+    has in front of it once it has followed the pointer. test_launch_references holds the other
+    half, that SKILL.md still sends it there."""
+    refs_dir = os.path.join(os.path.dirname(SKILL_MD), "references")
+    parts = [open(SKILL_MD, encoding="utf-8").read()]
+    parts += [open(os.path.join(refs_dir, r), encoding="utf-8").read() for r in refs]
+    return " ".join(" ".join(parts).split())
 # Agent Skills cap `description` at 1024 characters. Over it, the skill does not merely route worse --
 # it FAILS TO IMPORT, so the whole skill is silently absent from the user's Claude. Nothing in the repo
 # caught that: it is frontmatter, not code, and a merge to main is a live deploy. This grew past the cap
@@ -5307,6 +5321,27 @@ def test_skill_frontmatter():
           any(t in fm["description"].lower() for t in ("trend", "changed over time")), True)
 
 
+# SKILL.md is loaded whole into every session, so its size is a cost every user pays before asking
+# anything. It was compressed to 58,062 bytes in v2.23.0 and called settled; by v2.32.0 it was 76,881,
+# a third larger, grown one rule at a time with nothing counting. Moving the conditionally-needed
+# prose to references/ and rendering the coverage summary in the script brought it to 61,495.
+SKILL_BODY_MAX = 64000
+
+
+def test_skill_body_budget():
+    """SKILL.md stays under a byte budget, so growing it is a decision instead of an accident.
+
+    Not a style check, and not a reason to cut a rule. When this fails, the question is whether the
+    new text is needed in EVERY session. If it only matters when something specific happens (a state,
+    a verb, a flag in the output), it belongs in a reference behind an imperative pointer, the way
+    launch.md, stacks.md and connectors.md are, with its guard reading it through skill_with(). If it
+    really is needed every time, raise the number here and say why in the commit: the budget exists
+    to make that visible, not to forbid it. Measured on LF-normalised bytes, the form that ships
+    (make-package.py writes LF whatever the checkout holds)."""
+    n = len(open(SKILL_MD, "rb").read().replace(b"\r\n", b"\n"))
+    check("SKILL.md is within its %d-byte budget (is %d)" % (SKILL_BODY_MAX, n), n <= SKILL_BODY_MAX, True)
+
+
 def test_hr_routing():
     """SKILL.md routes HR / Human Resources questions to `hr`, with the "no HR data" rule attached.
 
@@ -5538,6 +5573,57 @@ def test_skill_rule_survival():
     for target in sorted(set(_re.findall(r"\(references/([a-z-]+\.md)[^)]*\)", raw))):
         check("SKILL.md's link to references/%s resolves" % target,
               os.path.isfile(os.path.join(refs, target)), True)
+
+
+def test_launch_references():
+    """Conditional launch prose lives in references/, and SKILL.md must still send the model there.
+
+    A failed connection's message, an applied update's line and the rules for changing stacks are
+    needed in a minority of sessions, so the always-loaded body carries a pointer instead of the
+    text. That trade has one way to go wrong, and it is silent: a pointer that is missing, vague or
+    conditional on the wrong thing leaves the model to improvise in exactly the sessions where the
+    wording matters, and an improvised error message still looks like an error message. The guards
+    that pin the wording read it through skill_with(); this one pins the route."""
+    skill = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+    refs = os.path.join(os.path.dirname(SKILL_MD), "references")
+    launch = " ".join(open(os.path.join(refs, "launch.md"), encoding="utf-8").read().split())
+    stacks = " ".join(open(os.path.join(refs, "stacks.md"), encoding="utf-8").read().split())
+
+    # The version check: every result that speaks is named as a reason to read, and the two rules
+    # that apply to the results that DON'T speak stay in the body, since nothing sends the model
+    # anywhere on those.
+    sec = skill.split("## 0.5 Version check")[1].split("## 1. Connection setup")[0]
+    for frag in ("`state` is `outdated`", "`whatsNew`", "`notice: true`",
+                 "read [references/launch.md](references/launch.md) before you act or reply",
+                 "say nothing at all", 'Never say "up to date"', "Don't re-run the check"):
+        check("section 0.5 still says: %s" % frag[:44], frag in sec, True)
+    for frag in ("selfupdate --apply", "Updated to meridiancs", "Keep that last clause",
+                 "What's new in meridiancs", "can't check for updates", "MERIDIAN_NO_AUTOUPDATE",
+                 '"applied": false'):
+        check("launch.md carries the update wording: %s" % frag[:36], frag in launch, True)
+
+    # The connection: the state table stays (it is what picks a template), template A stays (every
+    # connected session uses it), and B-H are behind one pointer that covers every other state.
+    sec = skill.split("## 1. Connection setup")[1].split("## 1.5 Data coverage")[0]
+    check("section 1 keeps the state table", "| `state` | Meaning | Your response |" in sec, True)
+    check("...and template A", "**A — connected**" in sec, True)
+    check("...and sends every other state to the file",
+          "every other state: read [references/launch.md](references/launch.md) before you reply" in sec, True)
+    check("...with the one rule that can't wait for a read", "never write `config.json` yourself" in sec, True)
+    for letter, state in zip("BCDEFGH", ("not_configured", "auth_error", "forbidden", "unreachable",
+                                         "tls_untrusted", "token_unreadable", "stack_moved")):
+        check("the state table still names template %s" % letter, "template %s" % letter in sec, True)
+        check("launch.md has template %s" % letter, "**%s — %s" % (letter, state) in launch, True)
+        check("...and SKILL.md no longer carries a second copy", "**%s — %s" % (letter, state) in skill, False)
+    check("launch.md carries the save step", "stacks add --name" in launch and "--token -" in launch, True)
+
+    # Stacks: `list` is the only one safe to run unread.
+    check("section 1 sends stack changes to the file",
+          "Before `stacks add`, `switch`, `rm` or `move`, read [references/stacks.md](references/stacks.md)" in sec, True)
+    for frag in ("stacks switch prod", "stacks rm prod", "stacks move prod", "Never move a stack with `rm` + `add`",
+                 "re-state the coverage"):
+        check("stacks.md carries: %s" % frag[:36], frag in stacks, True)
+    check("...and SKILL.md no longer carries a second copy", "Never move a stack with `rm` + `add`" in skill, False)
 
 
 def test_launch_greeting():
@@ -7449,8 +7535,7 @@ def test_security_hardening(m, monkeypatch, tmp_path):
 
     # SKILL.md must route saving through the script. A model writing config.json itself skips the
     # 0600 write and drops entity_salt, and `--token '<token>'` puts the token in argv.
-    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
-        skill = re.sub(r"\s+", " ", f.read())
+    skill = skill_with("launch.md")
     check("SKILL.md no longer tells the model to write config.json by hand",
           "On yes, write the file" in skill, False)
     check("...and saves through stacks add with the token on stdin",
@@ -7839,8 +7924,7 @@ def test_whats_new(m, monkeypatch, tmp_path):
           "whatsNew" in announce(local="2.26.0", prior=m._read_updatecheck()), False)
 
     # --- SKILL.md carries the rules, not just the code ---------------------------------------------
-    with open(os.path.join(root, "SKILL.md"), encoding="utf-8") as f:
-        skill = re.sub(r"\s+", " ", f.read())
+    skill = skill_with("launch.md")
     for rule in ('`whatsNew` on a check result is one of two exceptions to "say nothing".',
                  "Show it **once**",
                  'never "nothing new"',
@@ -8151,6 +8235,10 @@ def test_documented_commands(m):
                 if not cut or cut[0] not in verbs or any(
                         "<" in t or "[" in t or "..." in t or "\u2026" in t or t in ("-h", "--help") for t in cut):
                     continue
+                # main() expands `--args-file PATH` before argparse runs, and a documented PATH is a
+                # placeholder, so drop the pair here as the parser itself never sees it.
+                cut = [t for i, t in enumerate(cut)
+                       if t != "--args-file" and not (i and cut[i - 1] == "--args-file")]
                 checked += 1
                 err = io.StringIO()
                 try:
@@ -9101,8 +9189,7 @@ def test_stacks_rm(m, monkeypatch, capsys, tmp_path):
           (out["config"], config().get("api_token")), ("switched", "tok-gamma-3333"))
 
     # SKILL.md is what makes the model relay this; no behaviour test notices a dropped rule.
-    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
-        skill = " ".join(f.read().split())
+    skill = skill_with("stacks.md")
     for rule in ("`rm` of the active stack makes another saved stack active: **say which** (`active`)",
                  "add `--purge` only when the user asks to delete them, after saying it can't be undone",
                  "Relay a `scheduleWarning` with its `unregister` command"):
@@ -9377,8 +9464,7 @@ def test_domain_move_routing():
     """The move is persistent configuration, and stack_moved must not send the user through
     onboarding for a token they already have. SKILL.md carries both; nothing else would notice
     either rule being dropped."""
-    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
-        skill = " ".join(f.read().split())
+    skill = skill_with("launch.md", "stacks.md")
     for rule in ("| `stack_moved` |",
                  "**H — stack_moved:**",
                  "If the result carries `domainNotice`",
@@ -9703,8 +9789,7 @@ def test_token_dpapi_real(m, monkeypatch, capsys, tmp_path):
 def test_token_routing(m):
     """SKILL.md is what makes the model handle token_unreadable and say where a token is saved; no
     behaviour test notices one of these rules being dropped."""
-    with open(os.path.join(os.path.dirname(HERE), "SKILL.md"), encoding="utf-8") as f:
-        skill = " ".join(f.read().split())
+    skill = skill_with("launch.md")
     for rule in ("| `token_unreadable` |",
                  "**G — token_unreadable:**",
                  "it was never sent",

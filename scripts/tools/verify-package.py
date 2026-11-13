@@ -16,6 +16,10 @@ REQUIRED = (
     "NOTICE",
     "sbom.cdx.json",
     "references/welcome.md",
+    # SKILL.md sends the model to these for a failed connection, an update and a stack change. A
+    # package without them leaves it to improvise exactly where a wrong message costs the most.
+    "references/launch.md",
+    "references/stacks.md",
     "scripts/meridian.py",
     "assets/fonts/SpaceGrotesk-OFL.txt",
     "assets/fonts/SpaceMono-OFL.txt",

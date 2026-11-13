@@ -186,6 +186,15 @@ download no record (`count_records`, below). These refinements keep the call cou
   `TOP_REFINE_MIN` it's skipped entirely, since refining can only save `pages - 1` fetches and on small
   tails that *loses* calls. Measured: `--top 250` went 8.9s/12 calls → 4.4–5.1s/9 calls, with the
   slightly looser threshold showing up as a 4-page tail instead of 3 (fetched concurrently anyway).
+- **On a slow stack the threshold tightens further.** The rules above count pages. Where a record
+  costs a tenth of a second or more (see [Slow stacks](#slow-stacks-split-pages-and-overlapping-ones)),
+  a tail of 50 for a top 10 is under every gate above and took 14s. So while the records past `--top`
+  would cost more than `TOP_REFINE_SECONDS` to read, the same three-point probe runs inside the
+  bracket, for at most `TOP_REFINE_ROUNDS` (2) rounds, and a tight warm hit probes the rung above to
+  get a bracket. The threshold only moves to a point a probe saw fill, so the ranking is the one the
+  loose threshold gave. Measured: `--top 10` 15.9s/3 calls → 5.4s/10 calls, and `--top 25` on the
+  user table 13.6s/4 calls → 3.8s/15 calls, both with the identical ranking. The extra calls are the
+  price: four such queries inside a minute reach the 60/min pacer, and one then waited 30s.
 
 Beyond `TOP_MAX_PAGES` (20 pages / 2000 records) the result sets `truncated: true` and says so —
 that is the one case where the answer may not be the true top-N.
@@ -371,6 +380,43 @@ a previous answer should not wait for one:
 
 A 100-record page is ~1.1MB of 312-field records and costs ~2.3s against a remote stack, so serial
 paging dominated everything.
+
+### Slow stacks: split pages, and overlapping ones
+
+On one stack a 100-record page takes about twelve seconds, and the cost is per **record**, not per
+byte: 100 asset records (5.5MB) took 11.6s, 100 user records (1.7MB) 11.2s. The same reads as one
+`parallel()` wave of small pages took 2–4s. So `read_records()`, which `top` and `list` both read
+through, times what a record costs and plans from it:
+
+- **The figure is `recordSeconds:<table>` in the `topcache` file.** A page fetched alone sets it,
+  given at least `PAGE_WEIGH_MIN` (25) records; fewer and the round trip is the time, not the
+  records. Pages fetched together slow each other down, so they are an upper bound and may only
+  lower it, which is also how a stack that got faster stops being split. A table with no figure
+  borrows the slowest other table's. An unmeasured stack is never assumed slow: its first read pays
+  the old cost.
+- **A stack is slow when a full page would take over `PAGE_SLOW_SECONDS` (5).** Then a read that
+  fits in one wave is split into up to `PAGE_SPLIT_MAX` (8) pages of about `PAGE_TARGET_SECONDS`
+  each. A stack with ordinary timings reads `top` with exactly the requests it always sent, and a
+  read already eight pages long is left alone, because the 60/min budget is the limit there.
+- **`list` asks for `--limit` records, not a full page.** The default list downloaded 100 records to
+  show 50. On the slow stack that was 12.5s against 6.8s, and it is fewer bytes everywhere.
+
+**The API can return the same record on two pages, and then another record is on none.** Measured
+on that stack: four pages of 100 from the unfiltered asset list held 272 distinct records, the same
+ones on every run, so `list --limit 300` returned 300 rows of which 212 were distinct and said
+nothing. `read_records()` checks every multi-page read by `_id`:
+
+- **A split is kept only when its pages are provably disjoint**: every page the length the total
+  says, every record with an `_id`, none repeated. Otherwise the read is repeated unsplit. A single
+  page cannot overlap itself, so splitting can waste a wave but cannot cost correctness.
+- **Only a whole result is split, never a leading slice of a larger one.** Every split of a slice
+  came back overlapping (2 of 2, filtered and not) and every split of a whole result came back clean
+  (3 of 3), so `list` splits only when `--all` or `--limit` covers every match. `top` always reads
+  the whole tail.
+- **An unsplit read that overlaps has nothing to fall back to.** The repeats are dropped and counted:
+  `list` returns `duplicateRows` and `top` adds `tailIncomplete`, each with a `note` saying that many
+  matching records are missing. `totalRecords` is a count and stays exact. Records without an `_id`
+  cannot be checked and read as before.
 
 > **Page size is a per-stack fact, not a constant — don't treat the ~1.1MB above as a ceiling.** The
 > figures in this file were measured on a stack of ~34k assets / ~10k users. Measured

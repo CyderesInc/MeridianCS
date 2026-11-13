@@ -124,7 +124,7 @@ it — see [field-map.md](field-map.md) response quirks for the measured oversta
 - "Users with MFA disabled" → `meridian.py list --table user --where "Count_No_MFA >= Integer 1"`
 - "Users with leaked credentials" → `meridian.py list --table user --where "Threat_List match List Leaked Password"`
 - "Non-compliant users (SailPoint)" → `meridian.py list --table user --where "Count_Non_Compliance >= Integer 1"`
-- "Investigate <person>" / "their risks and recommendations" → `meridian.py profile --name "<name>"` (accepts partial/display names). The response carries `findings` and `recommendations` already — present those; don't re-derive them and don't render a report just to read them.
+- "Investigate <person>" / "their risks and recommendations" → `meridian.py profile --name "<name>"` (accepts partial/display names). A name taken from earlier Meridian output, such as the top row of `top`, goes through `--args-file` and is never typed into the command (SKILL.md §5). The response carries `findings` and `recommendations` already — present those; don't re-derive them and don't render a report just to read them.
 
 ## Certificates & time-based
 

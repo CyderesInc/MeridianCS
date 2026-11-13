@@ -3,6 +3,20 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.33.0 - 2026-11-12
+
+- **Faster answers on large stacks.** Rankings and lists now read fewer records, in smaller pages
+  fetched together. On one large stack a top-10 ranking went from about 16 seconds to about 5, with
+  the same result.
+- **A list tells you when records are missing.** Some stacks return the same record on two pages,
+  so another is left out. Lists and rankings now drop the repeats and say how many are missing.
+- **Sessions start lighter.** The connector summary you see on connecting is now written by the
+  skill itself, so it reads the same every time, and each session loads about a fifth less
+  instruction text.
+- **Secrets stay put, and data stays data.** Your token and alert settings are no longer passed to
+  the browser that makes reports. Names from your stack are never run or shown as links, and any that
+  look like a command or an instruction are pointed out.
+
 ## 2.32.0 - 2026-10-26
 
 - **Severity is easier to read in reports.** High, medium and low severity words and graph markers
