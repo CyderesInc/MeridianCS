@@ -167,6 +167,9 @@ currency-unknown unless paired with `asof`.
   `truncated: true` when the qualifying tail exceeds 2000 records —
   past that the ranking is **not** a guaranteed global top-N (no server-side sort means an unread
   page could hold a higher value), so narrow with `--where`. Threshold mechanics: [internals.md](internals.md#how-top-picks-its-threshold).
+  `tailIncomplete: true` with `duplicateRows` is the other way a ranking can be short: the tail's
+  pages overlapped (see `list`, below), so a record above the threshold was never read and may
+  belong in the ranking. The `note` says "may not be the true top N", and the remedy is the same.
 - `profile` — **full risk/blast-radius profile for one named
   user or asset** in a single call. Use this for any "tell me about / investigate / what's the risk
   of \<name\>" question. For a user it returns identity linkage (every source account/email/status/MFA),
@@ -238,6 +241,14 @@ currency-unknown unless paired with `asof`.
     50 pages is most of the hard 60/min budget. Past it the response reports the ceiling and asks you
     to narrow, rather than stalling behind the pacer for minutes and looking like a hang. Output
     carries `apiCalls` so the cost is visible.
+  - **`duplicateRows` means the pages overlapped.** The API can return one record on two pages, which
+    leaves another record on none ([internals.md](internals.md#slow-stacks-split-pages-and-overlapping-ones)
+    has the measurement). Every read of more than one page is checked by `_id`. Repeats are dropped,
+    so `shown` counts distinct rows, `duplicateRows` is how many were dropped and therefore how many
+    matching records are missing, and `truncated` is true. `totalRecords` comes from a count, not
+    from the rows, so it is unaffected. Re-running does not help: the overlap was the same on every
+    run. A result that fits one page cannot overlap, which is why the `note` says to narrow. Until
+    this was checked, such a list read as complete, and nothing in it looked wrong.
   - **It is also a context fact, and that is the larger one.** The rows land in the answer, so the
     shape of the call decides whether it costs hundreds of characters or hundreds of thousands.
     Measured on the demo stack over the same 1,198 KEV-carrying assets:

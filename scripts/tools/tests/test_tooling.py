@@ -26,6 +26,30 @@ def test_internal_only_exemption_stays_out_of_the_publication_audit(pii_gate):
     assert pii_gate.REPO_SWEEP_SKIP == pii_gate.SKIP_FILES | pii_gate.INTERNAL_ONLY_FILES
 
 
+def test_a_stack_nickname_may_sit_in_internal_notes_but_not_in_anything_that_ships(pii_gate):
+    """Internal notes say which stack a measurement came from; shipped files must not. Three comments
+    in scripts/meridian.py carried a nickname into public releases before this existed.
+
+    Both directions, as everywhere in this gate: the files that never ship stay exempt, or CLAUDE.md
+    could no longer record where a figure was measured, and nothing else is exempt, or the next
+    comment gets through the same way."""
+    if not pii_gate.KNOWN_AVAILABLE:
+        pytest.skip("design/known-identifiers.json is not part of a public checkout")
+    assert pii_gate.STACK_NAMES, "design/known-identifiers.json lists no stack names"
+    name = pii_gate.STACK_NAMES[0]
+    assert pii_gate.stack_names("up to ~115MB on %s; projecting" % name) == [name]
+    assert pii_gate.stack_names("measured on %s" % name.upper()) == [name]
+    assert pii_gate.stack_names("up to ~115MB on a larger one") == []
+    assert pii_gate.never_ships("CLAUDE.md") and pii_gate.never_ships("design/trends.md")
+    for shipped in ("scripts/meridian.py", "SKILL.md", "references/internals.md", "evals/test_paging.py",
+                    "scripts/tools/make-impact.py", "README.md", "CHANGELOG.md"):
+        assert not pii_gate.never_ships(shipped), shipped
+    # The tree itself: nothing that ships names one today.
+    offenders = [rel for rel in pii_gate.tracked_text_files()
+                 if not pii_gate.never_ships(rel) and pii_gate.stack_names(pii_gate.read(rel))]
+    assert offenders == []
+
+
 @pytest.mark.parametrize("ref", ["pre-commit/action@v3.0.1", "actions/checkout@v4", "ruff-pre-commit@v0.16.4"])
 def test_version_ref_is_not_an_email_address(pii_gate, ref):
     assert re.findall(pii_gate.PATTERNS["email address"], ref) == []

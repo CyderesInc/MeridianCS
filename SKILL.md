@@ -424,7 +424,8 @@ Structure every findings response like this:
    · ▬ flat, colored 🔴/🟢 by whether the direction is bad or good in context. The 30-day average
    is **historical**, so label it (§4.1).
 5. **Caveats** last, in one line (pagination cap, null fields, "sorted client-side — no
-   server-side sort", an incomplete `summary` breakdown, a `truncated` top-N). Mention the query you
+   server-side sort", an incomplete `summary` breakdown, a `truncated` or `tailIncomplete` top-N,
+   `duplicateRows`). Mention the query you
    ran only briefly, or on request — the user wants the answer, not the JSON.
 6. **Always name the stack the answer came from** — the FQDN in the caveat line is enough
    (`_from company.meridian-cyderes.com_`). The active stack is **sticky**: a `stacks switch` persists in
@@ -724,6 +725,14 @@ rule.** Read it when the user asks why, or when you need exact arguments — tho
   group's `percent` is of `total`, not `whereTotal`: label it "of those with a value", or recompute.
   → [scripts.md](references/scripts.md)
 
+- **`duplicateRows` means the stack sent some records twice, so the same number are missing — say
+  so, with the count.** `list` then returns fewer rows than were asked for (`shown`). `totalRecords`
+  is still exact, because it is a count. On `top` it arrives with `tailIncomplete: true`: the ranking
+  **may not be the true top N**, so present it as provisional, never as "the top N". **Don't re-run
+  to fix it**: the same records repeat every time. Offer to narrow with `--where` until the result
+  fits one page (100 records), which cannot overlap. A `--format csv` file has the same gap, so say
+  it there too. → [scripts.md](references/scripts.md)
+
 - **One `profile` call is the whole investigation answer — don't rebuild it.** It returns `findings`
   and `recommendations` — analyst reasoning ordered most-severe first — alongside the data. Present
   those, adding only what the user asked for: don't re-derive them from raw fields, don't issue
@@ -744,7 +753,7 @@ rule.** Read it when the user asks why, or when you need exact arguments — tho
   four. **Nothing is totalled across subjects** (a KEV count spanning an identity and its own assets
   would double-count), so read each subject's own numbers. For a spreadsheet, `--format csv` on
   `top`/`list`/`summary` writes the rows out while the JSON envelope still prints — hand on its
-  caveats (`truncated`, `complete`, `unaccountedRecords`) rather than letting the file imply the set
+  caveats (`truncated`, `complete`, `unaccountedRecords`, `duplicateRows`) rather than letting the file imply the set
   is whole. → [reports.md](references/reports.md)
 
 - **`digest` is the whole periodic review in one command** — use it when the user wants a recurring or

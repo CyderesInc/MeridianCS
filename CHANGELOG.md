@@ -3,6 +3,14 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.33.1 - 2026-11-13
+
+- **You're told when a list is missing records.** Some stacks return the same record on two pages,
+  which leaves another out. The skill now says how many are missing, for a spreadsheet export too,
+  instead of presenting the list as complete.
+- **A ranking that may be incomplete is labelled.** It is shown as provisional, never as "the top
+  10", and the skill offers to narrow the question so the ranking can be read in full.
+
 ## 2.33.0 - 2026-11-12
 
 - **Faster answers on large stacks.** Rankings and lists now read fewer records, in smaller pages
@@ -13,9 +21,9 @@ at any time for the full list. To get started, see [Install](README.md#install) 
 - **Sessions start lighter.** The connector summary you see on connecting is now written by the
   skill itself, so it reads the same every time, and each session loads about a fifth less
   instruction text.
-- **Secrets stay put, and data stays data.** Your token and alert settings are no longer passed to
-  the browser that makes reports. Names from your stack are never run or shown as links, and any that
-  look like a command or an instruction are pointed out.
+- **Secrets stay put, and data stays data.** Your token and alert settings no longer reach the
+  browser that makes reports. Names from your stack are never run or shown as links, and any shaped
+  like a command or an instruction are flagged.
 
 ## 2.32.0 - 2026-10-26
 

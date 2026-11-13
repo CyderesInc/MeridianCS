@@ -653,7 +653,8 @@ TOP_REFINE_MIN = 500  # only tighten the threshold past this many records; see c
 #
 # A split is only kept when the records' `_id`s prove the pages were disjoint (read_records). That is
 # not paranoia: measured on the same stack, the unfiltered asset list returns OVERLAPPING pages --
-# 4 pages of 100 held 272 distinct records, repeatably -- so more pages is more ways to be wrong.
+# about a third of the rows in four pages of 100 were repeats, the same ones on every run -- so more
+# pages is more ways to be wrong.
 PAGE_SLOW_SECONDS = 5.0
 PAGE_TARGET_SECONDS = 0.75    # what one page of a split read should cost, alone
 PAGE_SPLIT_MAX = 8            # one parallel() wave; never more calls than that for a split read
@@ -3235,7 +3236,7 @@ def top_n(table, field, n, where=None, select=None):
         else ["Asset_Name", a.field, "Risk_Level", "IP_Address", "OS"])
     # Projected inside each task, as its page lands -- to the selected fields plus the ranked one, which
     # the sort below needs even when a --select omits it. Raw pages are ~1.1MB of 312-field records on
-    # the demo stack and up to ~115MB on cyderes-one; projecting only after parallel() returned meant
+    # the demo stack and up to ~115MB on a larger one; projecting only after parallel() returned meant
     # every raw page of the tail was alive at once just to keep 5 fields each.
     keep = list(dict.fromkeys(fields + [a.field]))
 
@@ -3306,7 +3307,7 @@ def list_records(a):
     # narrow rather than quietly stalling behind the rate limiter for minutes.
     #
     # Every read projects inside the task that fetched the page: a raw page is ~1.1MB of 312-field
-    # records on the demo stack (up to ~115MB on cyderes-one), so `list --all` used to hold every raw
+    # records on the demo stack (up to ~115MB on a larger one), so `list --all` used to hold every raw
     # page at once before throwing away every unselected field anyway.
     if a.all or limit > 100:
         total = count_records(a.table, q)
@@ -3477,7 +3478,7 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
         if isinstance(first, Exception):
             raise first
     # Each sampled page is reduced to its records' --by values inside the task that fetched it. A raw
-    # page is ~1.1MB on the demo stack and up to ~115MB on cyderes-one, and reducing only after
+    # page is ~1.1MB on the demo stack and up to ~115MB on a larger one, and reducing only after
     # parallel() returned held all SUMMARY_SAMPLE_PAGES of them at once to keep one field each.
     def record_values(rec):
         if nested:

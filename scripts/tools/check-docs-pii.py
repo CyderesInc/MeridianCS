@@ -141,6 +141,35 @@ def load_known():
 KNOWN_REAL_IDENTIFIERS, KNOWN_FIGURES, KNOWN_AVAILABLE = load_known()
 
 
+def load_stack_names():
+    """Nicknames for a real stack, from the same file. Empty when the file is absent."""
+    try:
+        with open(IDENTIFIER_DATA, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return ()
+    return tuple(data.get("stack_names") or ()) if data.get("schema") == 1 else ()
+
+
+# A stack's nickname is not an identifier in the sense above: internal notes are supposed to say
+# which stack a measurement came from, so CLAUDE.md and design/ use it freely. What it must not do
+# is ship. Three comments in scripts/meridian.py carried one into public releases, and nothing
+# noticed, because the sweep had no category between "allowed anywhere" and "allowed nowhere".
+STACK_NAMES = load_stack_names()
+
+
+def never_ships(rel):
+    """Files no package and no public tree contains (make-package.py EXCLUDE / EXCLUDE_DIRS,
+    make-public.py INTERNAL_DIRS). Everything else reaches somebody."""
+    rel = rel.replace("\\", "/")
+    return rel == "CLAUDE.md" or rel.startswith("design/")
+
+
+def stack_names(text):
+    low = text.lower()
+    return [k for k in STACK_NAMES if k.lower() in low]
+
+
 def figure_pattern(figure):
     """Word-boundary matcher for a measured count, bare or comma-grouped.
 
@@ -303,7 +332,9 @@ def main():
     repo_failed = False
     for rel in files:
         text = read(os.path.join(SKILL, rel))
-        if report("   " + rel, scan_text(text, REPO_WIDE), known_identifiers(text)):
+        named = [] if never_ships(rel) else ["%s (a stack's nickname, in a file that ships)" % k
+                                             for k in stack_names(text)]
+        if report("   " + rel, scan_text(text, REPO_WIDE), known_identifiers(text) + named):
             repo_failed = True
     if not repo_failed:
         print("   clean")

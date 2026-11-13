@@ -7,7 +7,7 @@ showed a tighter `top` threshold left 12 records to read instead of 50. So the s
 are measured, a slow page is split, and `top` tightens while the surplus outweighs the probes.
 
 The same measurements found that the API can return one record on two pages, and then another on
-none: 4 pages of 100 from the unfiltered asset list held 272 distinct records, repeatably. More pages
+none: about a third of the rows in 4 pages of 100 from the unfiltered asset list were repeats. More pages
 is more ways to be wrong, so a split is kept only when `_id`s prove its pages disjoint, and an
 ordinary multi-page read that overlaps now says so instead of passing for complete.
 
@@ -29,7 +29,7 @@ import os
 import pytest
 import pytest_check
 
-from test_connect import load_meridian
+from test_connect import SKILL_MD, load_meridian
 
 SLOW = 0.28    # seconds per record: 50 records in 14s, as measured on the stack that prompted this
 FAST = 0.023   # 100 records in 2.3s
@@ -335,3 +335,58 @@ def test_overlapping_pages_are_reported_not_passed_off(m, monkeypatch):
     stack(m, monkeypatch, [3000.0 + i for i in range(300)] + [1.0] * 50, overlap=lambda size: 20, ids=False)
     out = m.top_n("asset", "Risk_Score", 10)
     check("no _id to check with: unchanged, as before this existed", out.get("tailIncomplete"), None)
+
+
+def test_overlap_routing(m, monkeypatch, capsys, tmp_path):
+    """SKILL.md tells the model what `duplicateRows` and `tailIncomplete` mean, and the script emits
+    what SKILL.md names.
+
+    The flags shipped in v2.33.0 with only a `note` to carry them, and a note is advice. The failure
+    this exists for is one sentence: "here are your 300 assets" over a list that holds 212 of them, or
+    "the top 10" over a ranking that never read every candidate. SKILL.md is prose the model follows,
+    so no behaviour test notices that rule being dropped; and a rule naming a key the script does not
+    emit would be a rule that never fires. Both directions, as with test_alert_routing."""
+    skill = " ".join(open(SKILL_MD, encoding="utf-8").read().split())
+    for why, frag in [
+        ("the flag is named and means records are missing",
+         "`duplicateRows` means the stack sent some records twice, so the same number are missing"),
+        ("...and has to be said, with the count", "say so, with the count"),
+        ("a list's count is still right", "`totalRecords` is still exact, because it is a count"),
+        ("a short ranking is named too", "`tailIncomplete: true`"),
+        ("...and is never presented as the top N", 'may not be the true top N'),
+        ("...provisional, not final", 'never as "the top N"'),
+        ("re-running is not the fix", "Don't re-run to fix it"),
+        ("the fix that works is offered", "fits one page (100 records), which cannot overlap"),
+        ("a CSV carries the same gap", "A `--format csv` file has the same gap"),
+        ("the answer's caveat line lists both", "a `truncated` or `tailIncomplete` top-N, `duplicateRows`"),
+        ("a report hands the caveat on", "(`truncated`, `complete`, `unaccountedRecords`, `duplicateRows`)"),
+    ]:
+        check("SKILL.md says: %s" % why, frag in skill, True)
+
+    ref = " ".join(open(os.path.join(os.path.dirname(SKILL_MD), "references", "scripts.md"),
+                        encoding="utf-8").read().split())
+    for frag in ("`duplicateRows` means the pages overlapped", "checked by `_id`", "Re-running does not help",
+                 "`tailIncomplete: true` with `duplicateRows`"):
+        check("scripts.md carries the reasoning: %s" % frag[:40], frag in ref, True)
+
+    # The other direction: every key and phrase the rule relies on is what the script produces.
+    stack(m, monkeypatch, [float(i) for i in range(300)], overlap=lambda size: 20)
+    _, out = _list(m, all=True)
+    check("list emits the keys SKILL.md names", (out["duplicateRows"], out["shown"], out["totalRecords"], out["truncated"]),
+          (40, 260, 300, True))
+    check("...and its note gives the remedy SKILL.md offers", "fits one page (100 records)" in out["note"], True)
+    csv_path = str(tmp_path / "rows.csv")
+    m.emit(dict(out), "rows", "csv", csv_path)
+    envelope = json.loads(capsys.readouterr().out)
+    check("a CSV export keeps the flag in the envelope it prints", (envelope.get("duplicateRows"), "rows" in envelope),
+          (40, False))
+
+    stack(m, monkeypatch, [3000.0 + i for i in range(300)] + [1.0] * 50, overlap=lambda size: 20)
+    out = m.top_n("asset", "Risk_Score", 10)
+    check("top emits both keys together", (out["tailIncomplete"], out["duplicateRows"]), (True, 40))
+    check("...and says it in the words SKILL.md uses", "may not be the true top" in out["note"], True)
+
+    stack(m, monkeypatch, [float(i) for i in range(300)])
+    _, out = _list(m, all=True)
+    check("a clean read carries neither key, so their absence means something",
+          [k for k in out if k in ("duplicateRows", "tailIncomplete")], [])

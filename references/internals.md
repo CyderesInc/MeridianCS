@@ -402,9 +402,9 @@ through, times what a record costs and plans from it:
   show 50. On the slow stack that was 12.5s against 6.8s, and it is fewer bytes everywhere.
 
 **The API can return the same record on two pages, and then another record is on none.** Measured
-on that stack: four pages of 100 from the unfiltered asset list held 272 distinct records, the same
-ones on every run, so `list --limit 300` returned 300 rows of which 212 were distinct and said
-nothing. `read_records()` checks every multi-page read by `_id`:
+on that stack: about a third of the rows in four pages of 100 from the unfiltered asset list were
+repeats, the same ones on every run, so `list --limit 300` returned 300 rows with duplicates among
+them and said nothing. `read_records()` checks every multi-page read by `_id`:
 
 - **A split is kept only when its pages are provably disjoint**: every page the length the total
   says, every record with an `_id`, none repeated. Otherwise the read is repeated unsplit. A single

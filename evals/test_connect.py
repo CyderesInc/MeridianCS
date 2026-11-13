@@ -7839,6 +7839,16 @@ def test_whats_new(m, monkeypatch, tmp_path):
     check("... newest first, no duplicates", versions == sorted(set(versions), reverse=True), True)
     check("... every entry says something", all(items for _, items in real), True)
 
+    # What an updating install is SHOWN, not what the file holds. parse_changelog() returns items
+    # already cut to WHATS_NEW_ITEM_CHARS, so their lengths can never exceed it. Measuring those is
+    # how v2.33.0 shipped a fourth item that installs saw end mid-sentence while the release notes
+    # said all four were whole. The newest entries are the ones announced, so they are held to it.
+    shown = m.whats_new(real[m.WHATS_NEW_MAX_VERSIONS][0], real[0][0], path=os.path.join(root, "CHANGELOG.md"))
+    check("the newest entries are announced whole: no item is cut mid-sentence",
+          [(r["version"], i[-40:]) for r in shown for i in r["items"] if i.endswith("…")], [])
+    check("... and none is hidden behind 'N more'", [r["version"] for r in shown if r.get("moreItems")], [])
+    check("... across every entry one update can announce", len(shown), m.WHATS_NEW_MAX_VERSIONS)
+
     # --- parsing and range selection ---------------------------------------------------------------
     parsed = m.parse_changelog(WN_CHANGELOG)
     check("entries and items parse, prose ignored", [(v, len(i)) for v, i in parsed],

@@ -304,6 +304,8 @@ def audit(target):
                     problems.append("%s: %s -> %s" % (rel, label, hit))
             for hit in PII.known_identifiers(text):
                 problems.append("%s: removed identifier is back -> %s" % (rel, hit))
+            for hit in PII.stack_names(text):
+                problems.append("%s: names a real stack -> %s" % (rel, hit))
             # Measured demo-tenant aggregates. Individually not PII; together they describe one
             # customer's estate, and the .public.md reference docs deliberately replaced them with
             # illustrative round numbers. Checked here because the first sanitisation pass covered
