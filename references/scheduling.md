@@ -97,8 +97,10 @@ lines (illustrative figures):
 Monday, because a job that runs only while you are logged on legitimately misses a weekend. **`lastRunOk`**
 means the job ran and failed. The two fail differently and need different fixes, so neither is folded
 into the other. No heartbeat at all is `scheduled: false`, which never means "ok". "Written" is judged
-from the history file itself, never from a return value, so a failure after the append can't hide a
-snapshot that landed.
+from the history file itself, never from a return value, and never from the clock: a scheduled
+snapshot carries the `run` id of the run that wrote it, and the run looks for that id. It used to
+compare the snapshot's `takenAt` with the run's start, so a clock corrected mid-run could report a
+written snapshot as missing. A failure after the append still can't hide a snapshot that landed.
 
 Cross-check against the scheduler's own view:
 

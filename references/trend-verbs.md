@@ -46,14 +46,15 @@ forward-incompatible file into a silent zero.
 |---|---|
 | Totals + coverage (from a `digest` already computed) | **0** |
 | One named metric | **1** |
-| Breakdown by `Risk_Level` (3 groups) | ~12 |
-| Breakdown by a 40-group field like `OS` | **~49** |
+| Breakdown by `Risk_Level` (3 groups) | 13 to 22 |
+| Breakdown by a 40-group field like `OS` | **~51** |
 | `--entities top500` | ~5 (5 pages, ~12s) |
 
-A breakdown costs one page-0 call, up to 8 stratified sample pages, and **one call per discovered
-group**, out of a hard 60/min. So **anything you want to trend belongs in the metric list, not in a
-second breakdown** — twenty metrics cost twenty calls; one high-cardinality breakdown costs forty-nine
-and leaves no budget for the rest of the snapshot. A snapshot warns with the measured cost when a
+A breakdown costs two counts, up to 8 small pages for each round of discovery, and **one call per
+discovered group**, capped at 51 in all, out of a hard 60/min. So **anything you want to trend
+belongs in the metric list, not in a second breakdown** — twenty metrics cost twenty calls; one
+high-cardinality breakdown costs fifty-one and leaves no budget for the rest of the snapshot. A
+snapshot warns with the cost the breakdown counted itself spending (`apiCalls`) when a
 breakdown's `distinctValuesSeen` is large, both after the fact and (from the previous snapshot's
 measurement) before spending the calls. It warns rather than refuses: the operator asked for the field.
 

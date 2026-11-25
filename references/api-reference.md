@@ -63,8 +63,12 @@ Response entries:
 | `/CMDB/v2/system/metrics/action` | GET | Scheduled Actions (Spring page object): `{actions:[{actionId, actionName, actionType, actionGroup, scheduleType, scheduleCronExpression, lastRunAt, nextRunAt, status, createdBy}], totalPages, ...}` |
 | `/CMDB/v2/system/metrics/action-jobs/<action_id>` | GET | Runs of one Action: `[{id, action_run_date, action_status, action_status_msg, action_result_number, action_result_log_id}]` |
 
-On `/system/metrics/connector`, prefer `?size=2000` to fetch every run in one call rather than
-paging. Do **not** narrow it with a descending `_time` sort and a small page: the returned window
+On `/system/metrics/connector`, ask for `?size=2000` and still read `totalPages`. That is a page
+size, not the depth of the history: a busy stack passed 2,000 runs within three days. The endpoint
+returns runs unsorted, so page 0 alone is an arbitrary slice, not the newest one, and a connector's
+last ingest can then read days stale. Fetch the remaining pages.
+
+Do **not** narrow it with a descending `_time` sort and a small page: the returned window
 then spans only a few days, so a source that last ran a month ago drops out of the response
 entirely and reports as idle — which claims "hasn't ingested" when the truth is "couldn't tell".
 

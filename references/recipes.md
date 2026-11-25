@@ -193,7 +193,7 @@ stores. **There is no backfill** — a trend can only answer what was already be
   Ids are salted hashes on disk; `--name-entities` resolves them live. `disappeared` means dropped
   below the top-500 cutoff, **not** removed from the inventory — say which.
 - "What are we tracking?" / "start tracking X" → `meridian.py metrics list` / `metrics add`
-  (cap 20, one call each). Prefer a metric over a breakdown: `Risk_Level` costs ~12 calls, `OS` ~49.
+  (cap 20, one call each). Prefer a metric over a breakdown: `Risk_Level` costs 13 to 22 calls, `OS` ~51.
 - "How much history do we have?" → `meridian.py snapshots list` (count, oldest, newest, bytes).
   Trim with `snapshots prune --keep N`; it reports exactly what it dropped.
 - "Asset & user counts for a past date" → `meridian.py api 'CMDB/v2/system/metrics/data?date=2026-06-01'`

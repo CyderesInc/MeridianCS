@@ -372,7 +372,7 @@ a previous answer should not wait for one:
 | `profile` | linked-asset query + change log; exact-key + fuzzy name lookup |
 | `connectors` | the two connector endpoints |
 | `connect --with-connectors` | validation + both connector endpoints |
-| `summary --by` | discovery pages 1..N; then every per-value count |
+| `summary --by` | the total and the no-value count; then, each round, its pages and after them its counts |
 | `summary --metrics` | the metrics and license GETs |
 | `top` | every page of the qualifying tail |
 | `list` | every page needed to fill `--limit` |

@@ -69,9 +69,9 @@ currency-unknown unless paired with `asof`.
   data each last brought in.** Merges
   `/CMDB/v2/connector/profile` (configured + enabled + connection-test status) with
   `/CMDB/v2/system/metrics/connector?size=2000` (actual ingestion runs and record counts) into
-  `summary` / `connectors[]` / `warningGroups[]` / `failures[]` / `otherSources[]`. Two GETs, both
-  paced and issued concurrently. Field-by-field reading guide and the presentation rules are in
-  SKILL.md §1.5.
+  `summary` / `connectors[]` / `warningGroups[]` / `failures[]` / `otherSources[]`. Two GETs on most
+  stacks (the run history is paged; see below), paced and issued concurrently. Field-by-field
+  reading guide and the presentation rules are in SKILL.md §1.5.
   - **The default shape is `brief` (`"shape": "brief"`), and it is the default because this is the one
     call SKILL.md makes mandatory on every session.** Measured on a live stack, the old
     shape was 75,288 chars (~20,900 tokens) against 21,862 (~6,100) now — a 71% cut on the payload
@@ -122,8 +122,13 @@ currency-unknown unless paired with `asof`.
     whole block verbatim rather than lose that membership. This one did need a §1.5 table row
     (`warningIds`). The digest is why it lives here and not in brief: its renderer reads
     `failures[].message`.
-  - The runs endpoint is paginated at 20/page (~31 pages); `size=2000` returns the lot in **one**
-    call — don't loop pages. It also accepts `sort=_time%2Cdesc`, and a smaller sorted window is
+  - The runs endpoint is paginated at 20/page (~31 pages); `size=2000` makes that **one** call on
+    most stacks. It is a page size, not a history depth: a busy stack passed 2,000 runs within 3
+    days and needed 4 pages. The endpoint is unsorted, so page 0 alone is an arbitrary slice. On
+    that stack it held only the 3 oldest days, and every connector's last ingest read up to 5 days
+    stale. So `_fetch_connector_runs` reads `totalPages` and fetches the rest concurrently, up to
+    `CONNECTOR_RUNS_MAX_PAGES` (20); past that `summary.runHistoryTruncated` is true.
+  - The runs endpoint also accepts `sort=_time%2Cdesc`, and a smaller sorted window is
     ~0.4s faster — **don't**: the window spans only the last few days on a stack that ingests daily,
     so a source that last ran a month ago would silently drop out of the summary and report as
     `idle`, which is supposed to mean "hasn't ingested", not "couldn't tell".
@@ -266,14 +271,34 @@ currency-unknown unless paired with `asof`.
     row-returning verb, and to `--out` past a few hundred rows.
 - `summary` — **group-by / posture**: `--by <field>`
   returns exact per-value counts; `--metrics` returns stack totals + license (two GETs, concurrent).
-  - **Which values exist is sampled; each count is exact.** There is no aggregation endpoint, so
-    discovery reads `SUMMARY_SAMPLE_PAGES` (8) pages and collects the distinct values it sees. Every
-    breakdown therefore states its own reach, and **no path returns a silently partial answer**.
-  - **The sample is stratified, not the first N pages.** Records come back clustered by source rather
+  - **Which values exist is found in rounds; each count is exact.** There is no aggregation endpoint,
+    so values have to be read off records. The first round reads `SUMMARY_SAMPLE_PAGES` (8) small
+    pages of `SUMMARY_ROUND_RECORDS` (12) records, spread across the result, and counts every value
+    it sees. Each later round asks for the records holding **none** of the values counted so far
+    (`!=` per value, `not match` on a `List`), so it reads only what the last round missed, and the
+    rare value a sample skips is exactly what comes back. Rounds stop when nothing is left, after
+    `SUMMARY_ROUNDS` (4), or when the next one would pass `SUMMARY_CALL_BUDGET` (51 calls, which is
+    what the sample method cost at its worst; inside a `digest`, and so a snapshot, the rounds after
+    the first are held to `SUMMARY_DIGEST_CALL_BUDGET`, 36, because the digest's other sections
+    need the rest of the 60). `discoveryRounds` says how many ran and `apiCalls`
+    what the breakdown spent. Every breakdown still states its own reach, and **no path returns a
+    silently partial answer**.
+  - **A round only proposes values. It never decides what is true.** Each proposed value is counted
+    exactly, and completeness is judged afterwards by the same checks as before (below). So a stack
+    that ignored the negative operators would cost one wasted round: the remainder comes back with
+    nothing new, and the breakdown reads the 8 × 100 sample it always read. A dotted (nested) field
+    has no `exists` gate to take a remainder of, so it reads that sample every time.
+  - **Small pages in many places beat large pages in few.** Measured where a 100-record page takes
+    thirteen seconds: eight pages of 12 came back in 5.4s against 17.1s for eight of 100, and saw
+    four fifths as many distinct values. Four pages of 25 took longer and saw a third as many. Time
+    follows the records read on each page; values follow the number of places read.
+  - **The fallback sample is stratified, not the first N pages.** Records come back clustered by source rather
     than shuffled — measured, page 0 held 3 distinct `sourcetype` values, page 1 held 4 — so
-    consecutive pages keep re-seeing the same values while whole categories sit further in. Page 0 is
-    read first (its `totalRecords` sizes the sample and serves as the denominator), then the remaining
-    pages are spread across the full range. At identical cost this found a 14,000-record source the
+    consecutive pages keep re-seeing the same values while whole categories sit further in. A count
+    gives the total first (it sizes the sample and serves as the denominator), then the pages go out
+    together, spread across the full range with page 0 among them. Page 0 used to be read alone for
+    its `totalRecords`, so on a stack where a page takes over ten seconds every breakdown waited out
+    a whole page before the rest could start. At identical cost this found a 14,000-record source the
     first-8-pages sample missed entirely: `--by sourcetype` went from 21 groups with **12,680 records
     (37%) unplaced and unflagged** to 23 groups with 174 (0.5%) unplaced and stated.
   - **Single-valued fields** are checked by arithmetic, at no extra call: the counts partition the
@@ -287,7 +312,7 @@ currency-unknown unless paired with `asof`.
     is exact. Reported as `coveredRecords` / `unaccountedRecords` / `complete`.
   - **Records with no value for the field are counted separately.** The breakdown's query adds an
     `exists` gate on the field, so `total`, the percentages and `complete` cover only records that
-    *have* a value. One extra count of `--where` alone, run beside page 0, gives `whereTotal` and
+    *have* a value. One extra count of `--where` alone, run beside the total, gives `whereTotal` and
     `recordsWithoutField` (the difference), and the `note` names a non-zero gap. Each group's
     `percent` stays a share of `total`, so quoting it against `whereTotal` overstates it. A cache
     entry written before these keys existed is a miss, not a silent answer. `complete` keeps
@@ -295,9 +320,10 @@ currency-unknown unless paired with `asof`.
     the data rather than a gap in the sample, often by design. `whereTotalUnavailable` means that
     count failed, so the gap is unknown rather than zero, and the result is not cached. A dotted
     (nested) field has no gate, so it reports neither key.
-  - **High cardinality returns partial data rather than nothing.** Past `SUMMARY_MAX_GROUPS` (40) it
-    counts the largest values the sample saw, sets `groupsCapped` and `distinctValuesSeen`, is never
-    `complete`, and the coverage check states how many records the dropped values hold. `--by OS`
+  - **High cardinality returns partial data rather than nothing.** Past `SUMMARY_MAX_GROUPS` (40), or
+    when the call budget runs out with values seen and not yet counted, it counts the most frequent
+    values it saw, sets `groupsCapped` (the number of groups shown) and `distinctValuesSeen`, is
+    never `complete`, and the coverage check states how many records the dropped values hold. `--by OS`
     previously returned zero groups; it now returns 40 with exact counts and "2,532 of 28,480 (8.9%)
     unplaced".
   - Trade-off worth knowing: stratifying is a large win on clustered fields and a small loss on ones

@@ -3,6 +3,18 @@ tell you what's new in the first session after it updates. Ask "what's new in th
 at any time for the full list. To get started, see [Install](README.md#install) and
 [Connect](README.md#connect) in the README.
 
+## 2.34.0 - 2026-11-25
+
+- **Breakdowns find the rare categories.** A breakdown used to sample records, so it could miss a
+  small category and say only how many records it could not place. It now goes back for what it
+  missed, so far more come back complete.
+- **Breakdowns are faster on large stacks.** They read far fewer records to learn which categories
+  exist. On one large stack, users by risk level went from about 28 seconds to about 8, and showed
+  all three levels where it had shown one.
+- **A scheduled collection reports what it saved.** If the computer's clock was corrected while a
+  collection ran, it could report that nothing was collected when the snapshot had been saved. It
+  now checks for the snapshot itself.
+
 ## 2.33.1 - 2026-11-13
 
 - **You're told when a list is missing records.** Some stacks return the same record on two pages,

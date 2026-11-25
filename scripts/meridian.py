@@ -677,6 +677,26 @@ SUMMARY_SAMPLE_PAGES = 8
 # records the rest hold -- it used to return no groups at all, which made "break assets down by OS"
 # (51 values) unanswerable.
 SUMMARY_MAX_GROUPS = 40
+# `summary --by` finds values in rounds (_discover_by_remainder): each one reads a few small pages of
+# the records holding NONE of the values counted so far, so a round only ever sees what the last one
+# missed. Measured on a stack where a 100-record page takes thirteen seconds: eight pages of 12 came
+# back in 5.4s against 17.1s for eight of 100, and saw four fifths as many distinct values, because
+# records are clustered and it is the number of places sampled that finds values, not the records
+# read at each (four pages of 25 took longer and saw a third as many). The rare values a small first
+# round misses are exactly what the next round's query returns.
+SUMMARY_ROUND_RECORDS = 12
+SUMMARY_ROUNDS = 4
+# Calls one breakdown may spend finding and counting values: what the sample method costs at its
+# worst (two counts, the sample pages, SUMMARY_MAX_GROUPS counts, one coverage count). Rounds stop
+# when the next one would not fit, so the new method is never the reason a breakdown waits on the
+# 60/min pacer.
+SUMMARY_CALL_BUDGET = 2 + SUMMARY_SAMPLE_PAGES + SUMMARY_MAX_GROUPS + 1
+# The same, for a breakdown inside a digest, which is how a snapshot takes one. A digest's other four
+# sections spend about twenty calls, so a breakdown allowed all of SUMMARY_CALL_BUDGET would put a
+# digest past 60 a minute for a field of twenty-odd values, where the sample method kept it under:
+# measured, two such fields went from 35 calls to 50 and 51. The first round is not held to this (it
+# costs what the sample method did, value for value). Only the rounds after it are.
+SUMMARY_DIGEST_CALL_BUDGET = 36
 
 # Ceiling on records one `list` call will read. A page is 100 records, ~1.1MB and one API call, so 50
 # pages is most of the hard 60/min budget -- past this, paging on would stall behind the rate limiter
@@ -3394,7 +3414,121 @@ def stack_metrics():
     return {"metrics": m, "license": lic}
 
 
-def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
+def _discover_by_remainder(table, by, by_type, where, total, budget=None):
+    """Find and count the values of `by` in rounds, each reading only what the last one missed.
+
+    The API has no aggregation, so which values exist has to be read off records. A sample finds the
+    common ones and misses the rare ones, and a bigger sample is paid for per record. So after the
+    first small round, each later one asks for the records that hold NONE of the values counted so
+    far (`!=` per value; `not match` on a List), spread across that remainder. Every record it gets
+    back carries a value still missing, and the remainder's size is already known from the counts.
+
+    **Nothing here decides what is true.** A round only proposes values. Each is then counted exactly,
+    and completeness is judged afterwards by the same arithmetic as before (counts against the total,
+    or one OR count for a List). So if a stack ignored the negative operators, the worst outcome is a
+    round that proposes nothing new: `stalled`, and the caller reads the sample it always read.
+    Checked live on String, List, Integer, Float and Binary fields: the negated count equalled the
+    total minus the positive counts every time.
+
+    Returns counts (string form -> exact count, or the exception a count raised), raw (string form ->
+    original value), seen, sampled, rounds, calls, covered (a List's last coverage count, else None)
+    and stalled. Not for a dotted field: those have no `exists` gate to take a remainder of.
+    `budget` is the calls the rounds after the first may bring the breakdown to (default
+    SUMMARY_CALL_BUDGET).
+    """
+    budget = SUMMARY_CALL_BUDGET if budget is None else budget
+    is_list = by_type == "List"
+    op, neg = ("match", "not match") if is_list else ("==", "!=")
+    numeric = by_type in ("Integer", "Float")
+    gate = {"searchFieldName": by, "operator": "exists", "type": "String", "value": None}
+    counts, raw, seen = {}, {}, set()
+    st = {"sampled": 0, "calls": 0, "rounds": 0, "covered": None, "stalled": False}
+    remainder = total
+
+    def clause(operator, v):
+        return {"searchFieldName": by, "operator": operator, "type": by_type,
+                "value": raw.get(v, v) if numeric else v}
+
+    def read(query, page):
+        # Reduced to the field's values inside the task: a raw page is megabytes, and one field of it
+        # is wanted.
+        r = call("POST", "/CMDB/v2/data/cmdb", {"table": table, "query": query, "paging": {
+            "page": page, "recordsPerPage": SUMMARY_ROUND_RECORDS}})
+        out = []
+        for rec in r.get("data") or []:
+            v = rec.get(by) if isinstance(rec, dict) else None
+            out.append((v if isinstance(v, list) else [v]) if v is not None else [])
+        return out
+
+    while remainder > 0 and st["rounds"] < SUMMARY_ROUNDS:
+        last = (remainder - 1) // SUMMARY_ROUND_RECORDS
+        # One call is held back for the coverage count: a List makes it every round, and any other
+        # field makes it once at the end if values were seen and left uncounted.
+        # `budget` holds the rounds after the first; the first may always count up to the cap.
+        avail = (budget if st["rounds"] else SUMMARY_CALL_BUDGET) - 2 - st["calls"] - 1
+        # Never more pages than counts left to spend. Every record of a remainder holds a value not
+        # yet counted, so each page shows at least one, and a page whose value cannot then be counted
+        # was a call wasted: a last round that read eight pages to count two values is how a field
+        # ended up with fewer groups than the sample method gave it.
+        n = min(SUMMARY_SAMPLE_PAGES, last + 1, avail // 2)
+        room = min(SUMMARY_MAX_GROUPS - len(counts), avail - n)
+        if n < 1 or room < 1:
+            break
+        step = last / float(n - 1) if n > 1 else 0.0
+        picks = sorted({int(round(i * step)) for i in range(n)})
+        known = sorted(counts)
+        query = and_query(where, gate) + [[clause(neg, v)] for v in known]
+        got = parallel([(lambda p=p: read(query, p)) for p in picks])
+        st["calls"] += len(picks)
+        pages = [g for g in got if not isinstance(g, Exception)]
+        if not pages:
+            if not st["rounds"]:
+                # No values at all, and nothing to fall back on that would read differently: an
+                # empty breakdown must not stand in for a failed read.
+                raise got[0]
+            st["stalled"] = True
+            break
+        freq = {}
+        for page in pages:
+            st["sampled"] += len(page)
+            for values in page:
+                for x in values:
+                    if x is None:
+                        continue
+                    freq[str(x)] = freq.get(str(x), 0) + 1
+                    raw.setdefault(str(x), x)
+        seen.update(freq)
+        new = sorted((v for v in freq if v not in counts), key=lambda v: (-freq[v], v))
+        if not new:
+            st["stalled"] = True     # the remainder gave back nothing new: negation did not deliver
+            break
+        take = new[:room]
+        tasks = [(lambda v=v: count_records(table, and_query(where, clause(op, v)))) for v in take]
+        if is_list:
+            tasks.append(lambda: count_records(
+                table, and_query(where) + [[clause(op, v) for v in known + take]]))
+        res = parallel(tasks)
+        st["calls"] += len(tasks)
+        counts.update(zip(take, res))
+        st["rounds"] += 1
+        if any(isinstance(r, Exception) for r in res):
+            st["covered"] = None     # a failed count: the remainder is unknown, so stop asking for it
+            break
+        if is_list:
+            st["covered"] = res[-1]
+            left = total - res[-1]
+        else:
+            left = total - sum(counts.values())
+        if left >= remainder:
+            # Counted, and no smaller: values that match nothing (a count of 0), which the next round
+            # would only read again.
+            st["stalled"] = True
+            break
+        remainder = left
+    return dict(st, counts=counts, raw=raw, seen=seen)
+
+
+def summarize_by(table, by, where=None, refresh=False, rebuilt=None, call_budget=None):
     """Group-by with its completeness verdict, returned rather than printed so `digest` reuses it.
 
     `rebuilt` is the table's LDG rebuild stamp (`ldg_rebuild()[table]["rebuiltUtc"]`) and is part of
@@ -3462,21 +3596,25 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     def page_body(p, n=100):
         return {"table": a.table, "query": q, "paging": {"page": p, "recordsPerPage": n}}
 
-    # Page 0 goes first because its totalRecords decides how many pages exist -- and it doubles as
-    # the group-by denominator, so the separate count call this used to make was pure duplication.
+    # The total comes from a count, and the whole sample then goes out as ONE wave. Page 0 used to go
+    # first, alone, because its totalRecords decides which pages exist and is the group-by
+    # denominator -- so every breakdown waited out a full page before the rest of the sample could
+    # start. A count returns the same number without downloading a record (count_records), and on a
+    # stack where a 100-record page takes over ten seconds that wait was 13s of a 32s breakdown, to
+    # learn one integer. Eight pages together took the same 17s that seven had.
     # Beside it, when the `exists` gate applies, one count of `where` alone: the gate is what keeps
     # records with no value out of the denominator, so it is also what hides them. Independent of
-    # page 0, so it costs no round trip. Optional -- a failed count is flagged below, never fatal.
-    # With no --where this is an empty query, which counts every record: checked live, it equals the
-    # `Asset_Name exists` / `Owner_Name exists` count `list` uses, on both tables.
+    # the gated count, so it costs no round trip. Optional -- a failed count is flagged below, never
+    # fatal. With no --where this is an empty query, which counts every record: checked live, it
+    # equals the `Asset_Name exists` / `Owner_Name exists` count `list` uses, on both tables.
     if nested:
-        first, where_total = call("POST", "/CMDB/v2/data/cmdb", page_body(0)), None
+        total, where_total = count_records(a.table, q), None
     else:
-        first, where_total = parallel([
-            lambda: call("POST", "/CMDB/v2/data/cmdb", page_body(0)),
+        total, where_total = parallel([
+            lambda: count_records(a.table, q),
             lambda: count_records(a.table, and_query(where))])
-        if isinstance(first, Exception):
-            raise first
+        if isinstance(total, Exception):
+            raise total
     # Each sampled page is reduced to its records' --by values inside the task that fetched it. A raw
     # page is ~1.1MB on the demo stack and up to ~115MB on a larger one, and reducing only after
     # parallel() returned held all SUMMARY_SAMPLE_PAGES of them at once to keep one field each.
@@ -3499,69 +3637,86 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
     def sample(resp):
         return [record_values(rec) for rec in resp.get("data") or []]
 
-    total = first["totalRecords"]
-    samples = [sample(first)]
-    del first
-    lastpage = max(0, (total + 99) // 100 - 1)
-    nsample = min(SUMMARY_SAMPLE_PAGES, lastpage + 1)
-    # Spread the sample across the WHOLE result set instead of reading the first N pages. Records come
-    # back clustered by source, not shuffled -- measured: page 0 held 3 distinct sourcetypes, page 1
-    # held 4 -- so consecutive pages keep re-seeing the same values while entire categories sit further
-    # in. Stratifying at identical cost found a 14,000-record source that the first-8-pages sample
-    # missed completely.
-    if nsample > 1:
-        step = lastpage / float(nsample - 1)
-        picks = sorted({int(round(i * step)) for i in range(1, nsample)})
-        # Independent pages. Serially these cost ~2.3s each against a remote stack; concurrently the
-        # whole sample costs roughly one page's latency.
-        for r in parallel([(lambda p=p: sample(call("POST", "/CMDB/v2/data/cmdb", page_body(p))))
-                           for p in picks]):
-            if not isinstance(r, Exception):
-                samples.append(r)
-    sampled = sum(len(s) for s in samples)
-
     # Values are grouped by their string form but queried by their original one. A numeric field's
     # value sent as a string is a quoted number, which the API answers with 0 records and no error --
     # so `--by` on an Integer SmartLabel reported every group as 0 (measured: 19 values, all 0, over
     # every user on the stack). Only Integer/Float are re-typed: String already is one, and Binary is
     # sent as before.
-    freq, raw = {}, {}
-    for s in samples:
-        for values in s:
-            for x in values:
-                if x is None:
-                    continue
-                freq[str(x)] = freq.get(str(x), 0) + 1
-                raw.setdefault(str(x), x)
-    seen = set(freq)
+    counts, raw, seen = {}, {}, set()   # string form -> exact count (or the exception); -> original
+    sampled, calls, rounds, covered = 0, (1 if nested else 2), (None if nested else 0), None
 
     def qval(v):
         return raw.get(v, v) if byType in ("Integer", "Float") else v
-    # High cardinality used to return no groups at all -- "break assets down by OS" (51 values) gave
-    # nothing. Counting all of them would be one call each, so instead count the biggest ones the sample
-    # saw and let the coverage check below state exactly how many records the rest hold. Partial and
-    # honest beats empty.
-    capped = len(seen) > SUMMARY_MAX_GROUPS
-    if capped:
-        vals = sorted(sorted(freq, key=lambda k: freq[k], reverse=True)[:SUMMARY_MAX_GROUPS])
-    else:
-        vals = sorted(seen)
-    counts = parallel([(lambda v=v: count_records(
-                            a.table, and_query(where, {"searchFieldName": a.by, "operator": op,
-                                                       "type": byType, "value": qval(v)})))
-                       for v in vals])
-    groups = [{"value": v, "count": c, "percent": round(100.0 * c / total, 1) if total else 0}
-              for v, c in zip(vals, counts) if not isinstance(c, Exception)]
+
+    # Which values exist is found in rounds that each read only what the last one missed
+    # (_discover_by_remainder). A dotted field has no `exists` gate to take a remainder of, so it
+    # reads the sample below, as does a stack where the remainder came back with nothing new.
+    need_sample = bool(total)
+    if total and not nested:
+        d = _discover_by_remainder(a.table, a.by, byType, where, total, budget=call_budget)
+        counts, raw, seen = d["counts"], d["raw"], d["seen"]
+        sampled, rounds, covered = d["sampled"], d["rounds"], d["covered"]
+        calls += d["calls"]
+        need_sample = d["stalled"]
+    if need_sample:
+        lastpage = max(0, (total + 99) // 100 - 1)
+        nsample = min(SUMMARY_SAMPLE_PAGES, lastpage + 1)
+        # Spread the sample across the WHOLE result set instead of reading the first N pages. Records
+        # come back clustered by source, not shuffled -- measured: page 0 held 3 distinct sourcetypes,
+        # page 1 held 4 -- so consecutive pages keep re-seeing the same values while entire categories
+        # sit further in. Stratifying at identical cost found a 14,000-record source that the
+        # first-8-pages sample missed completely. Page 0 is always one of the picks.
+        step = lastpage / float(nsample - 1) if nsample > 1 else 0.0
+        picks = sorted({int(round(i * step)) for i in range(nsample)})
+        # Independent pages. Serially these cost ~2.3s each against a remote stack; concurrently the
+        # whole sample costs roughly one page's latency.
+        got = parallel([(lambda p=p: sample(call("POST", "/CMDB/v2/data/cmdb", page_body(p))))
+                        for p in picks])
+        calls += len(picks)
+        samples = [r for r in got if not isinstance(r, Exception)]
+        # One lost page is a smaller sample, which the completeness check below measures. Every page
+        # lost is no sample at all, and an empty breakdown must not stand in for a failed read.
+        if not samples:
+            raise got[0]
+        freq = {}
+        for s in samples:
+            sampled += len(s)
+            for values in s:
+                for x in values:
+                    if x is None:
+                        continue
+                    freq[str(x)] = freq.get(str(x), 0) + 1
+                    raw.setdefault(str(x), x)
+        seen.update(freq)
+        # High cardinality used to return no groups at all -- "break assets down by OS" (51 values)
+        # gave nothing. Counting all of them would be one call each, so instead count the biggest ones
+        # the sample saw and let the coverage check below state exactly how many records the rest
+        # hold. Partial and honest beats empty.
+        todo = sorted((v for v in freq if v not in counts), key=lambda v: (-freq[v], v))
+        todo = todo[:max(0, SUMMARY_MAX_GROUPS - len(counts))]
+        counts.update(zip(todo, parallel([(lambda v=v: count_records(
+            a.table, and_query(where, {"searchFieldName": a.by, "operator": op,
+                                       "type": byType, "value": qval(v)}))) for v in todo])))
+        calls += len(todo)
+        if todo:
+            covered = None      # a coverage count made before these values were added is out of date
+    # Values seen and left uncounted: past SUMMARY_MAX_GROUPS, or past the call budget.
+    capped = len(seen) > len(counts)
+    vals = sorted(counts)
+    groups = [{"value": v, "count": counts[v], "percent": round(100.0 * counts[v] / total, 1) if total else 0}
+              for v in vals if not isinstance(counts[v], Exception)]
     groups.sort(key=lambda g: g["count"], reverse=True)
     out = {"table": a.table, "by": a.by, "fieldType": byType, "total": total,
            "sampledForValues": sampled, "distinctValuesSeen": len(seen), "groups": groups}
     if nested:
         out["nested"] = True
-    failed = [v for v, c in zip(vals, counts) if isinstance(c, Exception)]
+    if rounds is not None:
+        out["discoveryRounds"] = rounds
+    failed = [v for v in vals if isinstance(counts[v], Exception)]
     if failed:
         out["countsUnavailable"] = failed
     if capped:
-        out["groupsCapped"] = SUMMARY_MAX_GROUPS
+        out["groupsCapped"] = len(vals)
 
     # Which values EXIST is discovered from a sample; each value's count is then exact. So a category
     # the sample never reached used to vanish from the breakdown with nothing said -- a posture answer
@@ -3601,9 +3756,10 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
         # of 34,229 records, with a 14,000-record source missing outright). Instead, count the records
         # matching ANY discovered value in one OR query -- several objects in
         # a single inner array -- and the shortfall against the total is exact. Same guarantee the
-        # single-valued branch gets, for one extra call.
-        covered = None
-        if vals:
+        # single-valued branch gets, for one extra call. A List's rounds made this same count as their
+        # last call, over these same values, so it is not asked twice.
+        if covered is None and vals:
+            calls += 1
             try:
                 or_group = [{"searchFieldName": a.by, "operator": op, "type": byType, "value": qval(v)}
                             for v in vals]
@@ -3672,7 +3828,14 @@ def summarize_by(table, by, where=None, refresh=False, rebuilt=None):
                 "Records matching the query with no value for %r could not be counted on this run, "
                 "so some may be missing from every group below." % a.by
                 + (" " + out["note"] if out.get("note") else ""))
-    summary_cache_put(out, table, by, where, rebuilt)
+    # Counted, not estimated: what this breakdown cost out of the 60 calls a minute, which is what a
+    # snapshot's cost warning quotes.
+    out["apiCalls"] = calls
+    # A complete breakdown is the same whatever it was allowed to spend. One cut short under a
+    # smaller allowance is not what `summary` would return for the same question, so it is not left
+    # in the cache for `summary` to be served.
+    if out.get("complete") or call_budget is None or call_budget >= SUMMARY_CALL_BUDGET:
+        summary_cache_put(out, table, by, where, rebuilt)
     return out
 
 
@@ -3723,7 +3886,7 @@ def build_digest(table="asset", by=None, field="Risk_Score", top=5, refresh=Fals
 
     def breakdown_section():
         stamp["before"] = ldg_rebuild()
-        return summarize_by(table, by, refresh=refresh,
+        return summarize_by(table, by, refresh=refresh, call_budget=SUMMARY_DIGEST_CALL_BUDGET,
                             rebuilt=(stamp["before"].get(_table_kind(table)) or {}).get("rebuiltUtc"))
     parts = parallel([
         lambda: stack_metrics(),
@@ -3787,9 +3950,10 @@ def cmd_digest(a):
 SNAPSHOT_SCHEMA = 1
 
 # distinctValuesSeen above this makes a breakdown expensive enough to say so out loud. Read
-# summarize_by: a breakdown costs one page-0 call, up to SUMMARY_SAMPLE_PAGES stratified sample pages,
-# and then one call per discovered group (capped at SUMMARY_MAX_GROUPS) -- so Risk_Level's 3 groups
-# cost ~11 calls while a 40-group field costs ~48, most of the hard 60/min budget in a single field.
+# summarize_by: a breakdown costs two counts (the total, and the records with no value), up to
+# SUMMARY_SAMPLE_PAGES small pages for each round of discovery, and one call per discovered group,
+# SUMMARY_CALL_BUDGET at most -- so Risk_Level's 3 groups cost 13 to 22 calls while a 40-group
+# field costs ~51, most of the hard 60/min budget in a single field.
 # Snapshots run on a cadence and unattended, and a scheduled job that quietly starts failing sections
 # is the one thing this must not do. Anything else worth trending belongs in the metric list, at one
 # call each.
@@ -4044,7 +4208,8 @@ def _snapshot_breakdown(b):
            "groups": {g["value"]: g.get("count") for g in (b.get("groups") or []) if "value" in g}}
     for k in ("complete", "accountedRecords", "unaccountedRecords", "coveredRecords",
               "overcountedRecords", "groupsCapped", "distinctValuesSeen", "sampledForValues",
-              "countsUnavailable", "whereTotal", "recordsWithoutField", "whereTotalUnavailable"):
+              "countsUnavailable", "whereTotal", "recordsWithoutField", "whereTotalUnavailable",
+              "apiCalls"):
         if k in b:
             out[k] = b[k]
     return out
@@ -4074,11 +4239,15 @@ def _breakdown_cost_warnings(breakdowns):
         if n <= SNAPSHOT_WARN_GROUPS:
             continue
         counted = min(n, SUMMARY_MAX_GROUPS)
-        calls = 1 + SUMMARY_SAMPLE_PAGES + counted + (1 if b.get("fieldType") == "List" else 0)
+        # What the breakdown counted itself spending, when it says. A record written before it did
+        # gets the sample method's arithmetic, which is what that record cost.
+        calls = b.get("apiCalls")
+        if not isinstance(calls, int) or isinstance(calls, bool) or calls < 1:
+            calls = 2 + SUMMARY_SAMPLE_PAGES + counted + (1 if b.get("fieldType") == "List" else 0)
         out.append({"breakdown": b.get("by"), "distinctValuesSeen": n, "estimatedCalls": calls,
                     "warning": "Breakdown by %r saw %d distinct values, so capturing it costs about %d "
                                "of the 60 calls per minute this API allows -- a 3-group field like "
-                               "Risk_Level costs ~11. On a cadence that leaves little budget for the "
+                               "Risk_Level costs 13 to 22. On a cadence that leaves little budget for the "
                                "rest of the snapshot. Track a specific count as a metric (one call "
                                "each) instead of trending a high-cardinality breakdown."
                                % (b.get("by"), n, calls)})
@@ -4162,7 +4331,7 @@ def snapshot_record(d, measured=None, entities=None):
 
 
 def take_snapshot(digest=None, table="asset", by=None, field="Risk_Score", top=5, with_metrics=True,
-                  entities=None, allow_large=False, with_names=False, salt=None):
+                  entities=None, allow_large=False, with_names=False, salt=None, run=None):
     """Append one snapshot to this stack's history and report what was written.
 
     Pass an already-computed `digest` payload and the aggregate half costs **zero** API calls; otherwise
@@ -4226,6 +4395,10 @@ def take_snapshot(digest=None, table="asset", by=None, field="Risk_Score", top=5
         else:
             ents = results["entities"]
     rec = snapshot_record(digest, measured, ents)
+    if run:
+        # Which scheduled run wrote this record. It is how that run later proves its snapshot landed
+        # (schedule_run), and it is additive within schema 1: a reader that predates it ignores it.
+        rec["run"] = run
     path = append_snapshot(rec)
     recs, skipped = load_snapshots(path)
     out = {"written": True, "path": path, "schema": SNAPSHOT_SCHEMA,
@@ -4285,7 +4458,7 @@ def cmd_snapshot(a):
 
 # --- Option B: user-defined metrics -----------------------------------------------------------
 # A metric is a named count the customer cares about, captured on every snapshot so it can be trended.
-# It exists because a breakdown is the wrong tool for this: ~11 API calls for Risk_Level and ~48 for a
+# It exists because a breakdown is the wrong tool for this: 13 to 22 API calls for Risk_Level and ~51 for a
 # 40-group field, against ONE for a metric (query with recordsPerPage: 1 and read totalRecords, the
 # trick top_n's probe() already uses). Twenty metrics therefore cost twenty calls, and the extensible
 # surface of the whole feature is this list rather than the breakdown set.
@@ -6557,10 +6730,19 @@ def load_heartbeat(path):
     return out
 
 
-def _snapshots_since(fqdn, since_iso):
+def _snapshots_of_run(fqdn, run):
+    """Records in the job's history that this run wrote, found by the run id each one carries.
+
+    It used to be every record whose `takenAt` was not before the run's start, two wall-clock
+    strings at one-second resolution. A clock that stepped back between them, by milliseconds if a
+    second boundary lay in between, made a run report the snapshot it had just written as missing:
+    exit 1 and a `finished` line saying nothing was collected, for a history file with the record
+    in it. Stepped back further, the same comparison would have credited a run with an earlier
+    run's snapshot. A scheduler's host has its clock corrected as a matter of course, so the proof
+    is the record itself, not when it says it was taken."""
     # Read from the job's own history file, not _snapshots_path(): that one follows the active stack.
     recs, _ = load_snapshots(os.path.join(CFG_DIR, "snapshots.%s.jsonl" % _fqdn_slug(fqdn)))
-    return len([r for r in recs if (r.get("takenAt") or "") >= since_iso])
+    return len([r for r in recs if run and r.get("run") == run])
 
 
 def _schedule_alerts(problems):
@@ -6634,7 +6816,7 @@ def _schedule_collect(expect, entities, res, problems, state):
                             "--entities %s` once in a session to create it" % entities)
         else:
             salt = cfg["entity_salt"]
-    snap = take_snapshot(digest=digest, entities=entities if salt else None, salt=salt)
+    snap = take_snapshot(digest=digest, entities=entities if salt else None, salt=salt, run=res["run"])
     head = digest.get("headline") or {}
     res.update({"stackDate": snap.get("stackDate"), "historyRecords": snap.get("historyRecords"),
                 "assets": head.get("assets"), "users": head.get("users")})
@@ -6674,7 +6856,7 @@ def schedule_run(expect, cadence="daily", entities=None):
         # Decided from the history file, not from whether take_snapshot returned: a failure after
         # the append (a stderr write, the alert step) must not report a written snapshot as missing.
         try:
-            written = bool(state.get("matched")) and _snapshots_since(expect, started) > 0
+            written = bool(state.get("matched")) and _snapshots_of_run(expect, res["run"]) > 0
         except Exception:
             written = False
         res["snapshotWritten"] = written
@@ -6688,7 +6870,7 @@ def schedule_run(expect, cadence="daily", entities=None):
             res["exit"] = SCHEDULE_EXIT_OK
         res["ok"] = res["exit"] == SCHEDULE_EXIT_OK
         res["ts"] = _utc_iso()
-        res["durationS"] = round(time.time() - t0, 1)
+        res["durationS"] = max(0.0, round(time.time() - t0, 1))   # the clock can step back mid-run
         try:
             _append_heartbeat(expect, res)
         except Exception as e:

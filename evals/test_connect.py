@@ -1745,6 +1745,63 @@ def test_tls_routing(m, monkeypatch, tmp_path):
     check("...whose hint is the trust fix", out["hint"], m.tls_trust_hint())
     check("...and never offers insecure_tls as the fix", "insecure_tls" in out["hint"], False)
 
+def _sample_only(m, monkeypatch):
+    """Send summarize_by down the sample path, with nothing found by the remainder rounds.
+
+    That is the path a dotted field always takes, and the one a stack falls back to when a round's
+    remainder comes back with nothing new. The tests that script their answers page by page pin that
+    path's arithmetic and notes; test_summary_remainder pins the rounds, against _FakeCmdb."""
+    monkeypatch.setattr(m, "_discover_by_remainder", lambda *a, **k: {
+        "counts": {}, "raw": {}, "seen": set(), "sampled": 0, "calls": 0, "rounds": 0,
+        "covered": None, "stalled": True})
+
+
+class _FakeCmdb:
+    """POST /CMDB/v2/data/cmdb over records held in memory, answering the way the real one does.
+
+    It evaluates the query (inner arrays ANDed, objects in one array ORed), pages by recordsPerPage,
+    and returns totalRecords on every page, one past the end included. `==` and `!=` are exact and
+    type-strict, so a number sent as a string matches nothing, with no error; `match` is a
+    case-insensitive substring. `ignore_negation` answers `!=` and `not match` as though the clause
+    were absent, which is how this API fails when it does not honour an operator."""
+
+    def __init__(self, records, ignore_negation=False):
+        self.records, self.ignore_negation, self.calls, self.fail = records, ignore_negation, [], None
+
+    def _clause(self, rec, c):
+        v, op, want = rec.get(c["searchFieldName"]), c["operator"], c.get("value")
+        vals = v if isinstance(v, list) else ([] if v is None else [v])
+        if op == "exists":
+            return bool(vals)
+        if op in ("!=", "not match") and self.ignore_negation:
+            return True
+        if op in ("==", "!="):
+            hit = any(x == want and isinstance(x, str) == isinstance(want, str) for x in vals)
+        elif op in ("match", "not match"):
+            hit = any(str(want).lower() in str(x).lower() for x in vals)
+        else:
+            raise AssertionError("operator not modelled: %r" % op)
+        return hit if op in ("==", "match") else not hit
+
+    def call(self, method, endpoint, body=None, retries=1):
+        body = body or {}
+        self.calls.append(body)
+        if self.fail and self.fail(body):
+            raise RuntimeError("HTTP 500: refused by the test")
+        hits = [r for r in self.records
+                if all(any(self._clause(r, c) for c in group) for group in body.get("query") or [])]
+        page, size = body["paging"]["page"], body["paging"]["recordsPerPage"]
+        return {"totalRecords": len(hits), "data": hits[page * size:(page + 1) * size]}
+
+    def pages(self, size):
+        return [b for b in self.calls if b["paging"]["recordsPerPage"] == size]
+
+    @staticmethod
+    def negated(body, field):
+        return sorted(c["value"] for g in body.get("query") or [] for c in g
+                      if c["searchFieldName"] == field and c["operator"] in ("!=", "not match"))
+
+
 def test_summary_completeness(m, monkeypatch, capsys, tmp_path):
     """`summary --by` discovers which values exist by sampling, then counts each exactly. A category
     too rare to appear in the sample used to vanish from the breakdown with nothing said -- a posture
@@ -1761,6 +1818,12 @@ def test_summary_completeness(m, monkeypatch, capsys, tmp_path):
                 # The `where`-alone count (no clause on `by`) -- every record here has the field, so
                 # it matches the gated total. test_summary_without_field covers the gap.
                 if not any(c.get("searchFieldName") == by for g in groups for c in g):
+                    return {"totalRecords": total, "data": []}
+                # The gated total (`by exists`): it sizes the sample and is the denominator, so it is
+                # counted before any page is read. A nested `by` has no gate; its total is the
+                # where-alone count above.
+                if any(c.get("searchFieldName") == by and c.get("operator") == "exists"
+                       for g in groups for c in g):
                     return {"totalRecords": total, "data": []}
                 # The coverage probe ORs every value into ONE inner array; a per-value count has one.
                 if groups and len(groups[-1]) > 1:
@@ -1780,6 +1843,7 @@ def test_summary_completeness(m, monkeypatch, capsys, tmp_path):
         # and on a machine with no ~/.meridian (CI) that die()s out of the whole suite. Every dev
         # machine had credentials, so the dependency stayed invisible until the first CI run.
         monkeypatch.setattr(m, "call", fake_call)
+        _sample_only(m, monkeypatch)
         monkeypatch.setattr(m, "field_type", lambda t, f: dtype)
         monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
         monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(dir=tmp_path))
@@ -1884,10 +1948,15 @@ def test_summary_without_field(m, monkeypatch, tmp_path):
         by = state["by"]
         if paging.get("recordsPerPage") == 1:
             if not any(c.get("searchFieldName") == by for g in groups for c in g):
+                if "." in by:        # nested: no gate, so this where-shaped count IS the total
+                    return {"totalRecords": state["total"], "data": []}
                 wt = state["where_total"]
                 if isinstance(wt, Exception):
                     raise wt
                 return {"totalRecords": wt, "data": []}
+            if any(c.get("searchFieldName") == by and c.get("operator") == "exists"
+                   for g in groups for c in g):                         # the gated total
+                return {"totalRecords": state["total"], "data": []}
             if groups and len(groups[-1]) > 1:                          # List/nested coverage probe
                 return {"totalRecords": state["total"], "data": []}
             q = json.dumps(groups[-1])
@@ -2004,7 +2073,10 @@ def test_summary_without_field(m, monkeypatch, tmp_path):
     # --- the nested path has no gate, so it is unchanged: no extra call, no new keys -------------
     nrecs = [{"Details": [{"OS": "Linux"}]}] * 60 + [{"Details": [{"OS": "Windows"}]}] * 40
     out = run("Details.OS", nrecs, {"Linux": 600, "Windows": 400}, 1000, 1500, where=where)
-    check("nested: no where-only count is made", len(where_only_calls("Details.OS")), 0)
+    # One where-shaped count is made, and it is the total itself (the nested query has no gate to
+    # count without). A second one would be the gap count this path must not make.
+    check("nested: the only where-shaped count is the total", len(where_only_calls("Details.OS")), 1)
+    check("nested: ...and the total is what it returned", out.get("total"), 1000)
     check("nested: no gap keys", [k for k in ("whereTotal", "recordsWithoutField",
                                               "whereTotalUnavailable") if k in out], [])
     check("nested: completeness unchanged", (out.get("coveredRecords"), out.get("complete")), (1000, True))
@@ -2027,6 +2099,8 @@ def test_summary_numeric_values(m, monkeypatch, tmp_path):
             clauses = [c for g in groups for c in g if c.get("searchFieldName") == "Rank"]
             if not clauses:
                 return {"totalRecords": 100, "data": []}                  # the where-only count
+            if any(c.get("operator") == "exists" for c in clauses):
+                return {"totalRecords": 100, "data": []}                  # the gated total
             sent.extend(c["value"] for c in clauses)
             if len(groups[-1]) > 1:                                        # List coverage probe
                 return {"totalRecords": 100, "data": []}
@@ -2053,6 +2127,375 @@ def test_summary_numeric_values(m, monkeypatch, tmp_path):
     monkeypatch.setattr(m, "field_type", lambda t, f: "String")
     m.summarize_by("user", "Rank")
     check("String: values are still sent as strings", all(isinstance(v, str) for v in sent), True)
+
+
+def test_summary_one_wave(m, monkeypatch, tmp_path):
+    """The sample path of `summary --by` learns its total from a count, then reads its whole sample
+    as one wave. It is the path a dotted field takes and the fallback for the remainder rounds.
+
+    Page 0 used to be read first and alone, because its totalRecords decides which pages exist. Where
+    a page takes over ten seconds, that was a third of the breakdown spent learning one integer before
+    the other seven pages could start. These checks hold the order (count, then pages), the shape (one
+    batch with page 0 inside it), and that the sample itself is the one the old order read."""
+    import tempfile
+    state = {"total": 0, "fail": set(), "events": [], "batches": []}
+    real_parallel = m.parallel
+
+    def fake_call(method, endpoint, body=None, retries=1):
+        body = body or {}
+        paging, groups = body.get("paging", {}), body.get("query") or []
+        if paging.get("recordsPerPage") == 1:
+            clauses = [c for g in groups for c in g if c.get("searchFieldName") == "Tier"]
+            if not clauses or clauses[0].get("operator") == "exists":
+                state["events"].append("total")                 # the gated total, or the where-only count
+                return {"totalRecords": state["total"], "data": []}
+            return {"totalRecords": state["total"] // 2, "data": []}    # one value's exact count
+        page = paging["page"]
+        state["events"].append(("page", page, paging.get("recordsPerPage")))
+        if page in state["fail"]:
+            raise RuntimeError("HTTP 500: page %d" % page)
+        left = max(0, min(100, state["total"] - 100 * page))
+        return {"totalRecords": state["total"], "data": [{"Tier": "t%d" % (page % 2)}] * left}
+
+    def spy_parallel(tasks):
+        state["batches"].append(len(tasks))
+        return real_parallel(tasks)
+
+    def run(total, fail=()):
+        state.update(total=total, fail=set(fail), events=[], batches=[])
+        return m.summarize_by("asset", "Tier")
+
+    def pages():
+        return [e[1] for e in state["events"] if e != "total"]
+
+    monkeypatch.setattr(m, "call", fake_call)
+    _sample_only(m, monkeypatch)
+    monkeypatch.setattr(m, "parallel", spy_parallel)
+    monkeypatch.setattr(m, "check_fields", lambda *a, **k: None)
+    monkeypatch.setattr(m, "field_type", lambda t, f: "String")
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(prefix="wave-", dir=tmp_path))
+
+    # --- a result set far larger than the sample -------------------------------------------------
+    out = run(40000)
+    check("the total is known before any page is read", state["events"][:2], ["total", "total"])
+    check("...and no count is repeated among the pages",
+          [e for e in state["events"][2:] if e == "total"], [])
+    check("the whole sample goes out as one batch, after the two counts", state["batches"][:2],
+          [2, m.SUMMARY_SAMPLE_PAGES])
+    # The pages the old order read: page 0 first, then the rest spread across the result set.
+    last = (40000 + 99) // 100 - 1
+    step = last / float(m.SUMMARY_SAMPLE_PAGES - 1)
+    old_picks = sorted({0} | {int(round(i * step)) for i in range(1, m.SUMMARY_SAMPLE_PAGES)})
+    check("the sample is the same pages as before", sorted(pages()), old_picks)
+    check("...page 0 among them, read once", pages().count(0), 1)
+    check("...each a full page", {e[2] for e in state["events"] if e != "total"}, {100})
+    check("...so the same number of records is sampled", out.get("sampledForValues"),
+          100 * m.SUMMARY_SAMPLE_PAGES)
+    check("the count is the denominator", out.get("total"), 40000)
+    check("both values are found and the breakdown is complete",
+          (sorted(g["value"] for g in out["groups"]), out.get("complete")), (["t0", "t1"], True))
+
+    # --- fewer records than one page: one page, nothing else -------------------------------------
+    out = run(60)
+    check("a small result reads page 0 only", pages(), [0])
+    check("...and samples every record", out.get("sampledForValues"), 60)
+
+    # --- no records: the count already said so, and no page is requested -------------------------
+    out = run(0)
+    check("an empty result reads no page at all", pages(), [])
+    check("...and reports an empty breakdown, not a failure",
+          (out.get("total"), out.get("sampledForValues"), out.get("groups")), (0, 0, []))
+
+    # --- one page lost: a smaller sample, which the breakdown states -----------------------------
+    out = run(40000, fail={old_picks[3]})
+    check("a lost page shrinks the sample rather than failing the breakdown",
+          out.get("sampledForValues"), 100 * (m.SUMMARY_SAMPLE_PAGES - 1))
+    out = run(40000, fail={0})
+    check("...page 0 included: it is a sample page now, not the source of the total",
+          (out.get("sampledForValues"), out.get("total")), (100 * (m.SUMMARY_SAMPLE_PAGES - 1), 40000))
+
+    # --- every page lost: that is a failed read, never an empty breakdown ------------------------
+    try:
+        run(40000, fail=set(old_picks))
+        check("a sample with no pages raises", False, True)
+    except RuntimeError as e:
+        check("a sample with no pages raises the page's own error", "HTTP 500" in str(e), True)
+
+
+def test_summary_remainder(m, monkeypatch, tmp_path):
+    """`summary --by` finds values in rounds: after a small first sample, each round reads only records
+    holding NONE of the values counted so far, so it sees exactly what the last one missed.
+
+    A sample finds the common values and misses the rare ones, and a breakdown that missed one used
+    to say so and stop. Run against _FakeCmdb, which answers queries the way the API does, so these
+    hold the property that matters (a rare value is found, counted and the breakdown is complete)
+    and the two that keep it safe: a round only proposes values, so an API that ignores negation
+    costs a wasted round and never a wrong count; and the rounds never spend more calls than the
+    sample method did at its worst."""
+    import tempfile
+    ROUND, PAGE = m.SUMMARY_ROUND_RECORDS, 100
+    monkeypatch.setattr(m, "check_fields", lambda *a, **k: None)
+    monkeypatch.setattr(m, "load_config", lambda: ("s.example", "tok", None))
+    monkeypatch.setattr(m, "CFG_DIR", tempfile.mkdtemp(prefix="rem-", dir=tmp_path))
+
+    def run(records, by, dtype="String", where=None, **fake_kw):
+        api = _FakeCmdb(records, **fake_kw)
+        monkeypatch.setattr(m, "call", api.call)
+        monkeypatch.setattr(m, "field_type", lambda t, f: dtype)
+        return api, m.summarize_by("asset", by, where)
+
+    def groups(out):
+        return {g["value"]: g["count"] for g in out["groups"]}
+
+    def truth(records, by, where=lambda r: True):
+        """Exact count of every value, straight from the records."""
+        t = {}
+        for r in records:
+            v = r.get(by)
+            for x in (v if isinstance(v, list) else [v]):
+                if x is not None and where(r):
+                    t[str(x)] = t.get(str(x), 0) + 1
+        return t
+
+    # --- a rare value the first round cannot see -------------------------------------------------
+    # 10 "crit" records sit inside the first 2,000, between the places a first round reads.
+    tiers = ([{"Tier": "low"}] * 100 + [{"Tier": "crit"}] * 10 + [{"Tier": "low"}] * 1900
+             + [{"Tier": "med"}] * 990)
+    api, out = run(tiers, "Tier")
+    check("the rare value is found and counted exactly", groups(out), {"low": 2000, "med": 990, "crit": 10})
+    check("...so the breakdown is complete", (out.get("complete"), out.get("accountedRecords")), (True, 3000))
+    check("...with no gap note", "note" in out, False)
+    check("...in two rounds", out.get("discoveryRounds"), 2)
+    first, second = api.pages(ROUND)[:-1], api.pages(ROUND)[-1]
+    check("the first round asks for no negation", [_FakeCmdb.negated(b, "Tier") for b in first],
+          [[]] * m.SUMMARY_SAMPLE_PAGES)
+    check("the second asks for records holding neither value found", _FakeCmdb.negated(second, "Tier"),
+          ["low", "med"])
+    check("...still gated on the field having a value",
+          any(c["operator"] == "exists" for g in second["query"] for c in g), True)
+    check("...and reads one small page, because ten records are left", len(api.pages(ROUND)),
+          m.SUMMARY_SAMPLE_PAGES + 1)
+    check("no 100-record page is read at all", api.pages(PAGE), [])
+    check("the records read are counted", out.get("sampledForValues"), ROUND * m.SUMMARY_SAMPLE_PAGES + 10)
+    check("apiCalls is the number of calls made", out.get("apiCalls"), len(api.calls))
+    # The same records through the sample path: the fixture is one a sample genuinely misses.
+    with monkeypatch.context() as mp:
+        _sample_only(m, mp)
+        _, sampled = run(tiers, "Tier")
+    check("the sample method misses that value on the same records",
+          (sampled.get("complete"), sampled.get("unaccountedRecords"), "crit" in groups(sampled)),
+          (False, 10, False))
+
+    # --- every value in the first round: one round, and nothing is asked twice --------------------
+    api, out = run([{"Tier": "low"}] * 600 + [{"Tier": "med"}] * 400, "Tier")
+    check("a field the first round covers is done in one", (out.get("discoveryRounds"), out.get("complete")),
+          (1, True))
+    check("...for two counts, the pages and one count per value", len(api.calls),
+          2 + m.SUMMARY_SAMPLE_PAGES + 2)
+    check("...with no negated query", [b for b in api.calls if _FakeCmdb.negated(b, "Tier")], [])
+
+    # --- --where travels with every round, and the no-value gap is still reported -----------------
+    scoped = ([dict(r, Site="east") for r in tiers] + [{"Site": "east"}] * 50
+              + [{"Tier": "other", "Site": "west"}] * 500)
+    where = ["Site == String east"]
+    api, out = run(scoped, "Tier", where=where)
+    check("--where scopes the rounds: another site's value is never a group", groups(out),
+          {"low": 2000, "med": 990, "crit": 10})
+    check("...on every call", [b for b in api.calls if not any(
+        c["searchFieldName"] == "Site" and c["value"] == "east" for g in b["query"] for c in g)], [])
+    check("...and records with no value are still counted apart",
+          (out.get("total"), out.get("whereTotal"), out.get("recordsWithoutField"), out.get("complete")),
+          (3000, 3050, 50, True))
+
+    # --- a List field: `not match`, and coverage measured each round, never twice -----------------
+    srcs = ([{"Src": ["aws", "okta"]}] * 100 + [{"Src": ["zebra"]}] * 20 + [{"Src": ["aws", "okta"]}] * 900
+            + [{"Src": ["okta"]}] * 500)
+    api, out = run(srcs, "Src", dtype="List")
+    check("List: the rare value is found", groups(out), {"aws": 1000, "okta": 1500, "zebra": 20})
+    check("List: coverage is complete", (out.get("coveredRecords"), out.get("complete")), (1520, True))
+    check("List: the overlap is still explained",
+          "one record can hold several values" in (out.get("note") or ""), True)
+    check("List: the remainder is asked for with `not match`",
+          sorted({c["operator"] for b in api.calls for g in b["query"] for c in g
+                  if _FakeCmdb.negated(b, "Src")} - {"exists"}), ["not match"])
+    or_counts = [b for b in api.calls if any(len(g) > 1 for g in b["query"])]
+    check("List: one coverage count per round, and no second one at the end",
+          (len(or_counts), out.get("discoveryRounds")), (2, 2))
+    check("List: apiCalls is the number of calls made", out.get("apiCalls"), len(api.calls))
+
+    # --- numbers are sent as numbers in the negation too ------------------------------------------
+    ranks = [{"Rank": 1}] * 100 + [{"Rank": 3}] * 10 + [{"Rank": 1}] * 500 + [{"Rank": 2.5}] * 300
+    for dtype in ("Integer", "Float"):
+        api, out = run(ranks, "Rank", dtype=dtype)
+        sent = [c["value"] for b in api.calls for g in b["query"] for c in g
+                if c["searchFieldName"] == "Rank" and c["operator"] != "exists"]
+        check("%s: no value is sent as a string, in `==` or `!=`" % dtype,
+              [v for v in sent if isinstance(v, str)], [])
+        check("%s: so the rare number is found" % dtype, (groups(out), out.get("complete")),
+              ({"1": 600, "2.5": 300, "3": 10}, True))
+
+    # --- an API that ignores negation costs a round, never a wrong answer -------------------------
+    api, out = run(tiers, "Tier", ignore_negation=True)
+    check("ignored negation: every count shown is still exact", groups(out), {"low": 2000, "med": 990})
+    check("...the gap is stated exactly, not hidden",
+          (out.get("complete"), out.get("unaccountedRecords")), (False, 10))
+    check("...and the sample is read, so the answer is never worse than it was",
+          len(api.pages(PAGE)), m.SUMMARY_SAMPLE_PAGES)
+    check("...with what it cost still counted", out.get("apiCalls"), len(api.calls))
+
+    # --- more values than can be counted: the cap, at the old method's worst-case cost ------------
+    wide = [{"Tag": "t%02d" % (i % 60)} for i in range(3000)]
+    api, out = run(wide, "Tag")
+    real = truth(wide, "Tag")
+    check("high cardinality: the cap is the number of groups", (len(out["groups"]), out.get("groupsCapped")),
+          (m.SUMMARY_MAX_GROUPS, m.SUMMARY_MAX_GROUPS))
+    check("...every count shown is exact", [v for v, c in groups(out).items() if real[v] != c], [])
+    check("...it is never called complete", out.get("complete"), False)
+    check("...what is left out is exact", out.get("unaccountedRecords"),
+          sum(c for v, c in real.items() if v not in groups(out)))
+    check("...more values were seen than counted", out.get("distinctValuesSeen") > m.SUMMARY_MAX_GROUPS, True)
+    check("...for exactly the sample method's worst case", len(api.calls), m.SUMMARY_CALL_BUDGET)
+    # The group cap is its own rule: today the call budget implies it, and a raised budget must not lift it.
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "SUMMARY_CALL_BUDGET", 500)
+        _, roomy = run(wide, "Tag")
+    check("...and a larger call budget still counts no more than the cap", len(roomy["groups"]),
+          m.SUMMARY_MAX_GROUPS)
+
+    # --- a long tail: rounds stop at the call budget, and say exactly what is left ----------------
+    tail = []
+    for i in range(10):
+        tail += [{"Tag": "big%02d" % i}] * 250
+    for i in range(70):
+        tail += [{"Tag": "small%02d" % i}] * 6
+    api, out = run(tail, "Tag")
+    real = truth(tail, "Tag")
+    check("long tail: more than one round ran", out.get("discoveryRounds") > 1, True)
+    check("...within the call budget", len(api.calls) <= m.SUMMARY_CALL_BUDGET, True)
+    # Every record of a remainder holds a value not yet counted, so a page past the counts left to
+    # spend is a wasted call. Per round: the pages read never outnumber the values then counted.
+    spent, shape = [], []
+    for b in api.calls[2:]:
+        kind = "page" if b["paging"]["recordsPerPage"] == ROUND else "count"
+        if kind == "page" and (not spent or spent[-1] == "count"):
+            shape.append([0, 0])
+        if kind == "page" or any(len(g) == 1 and g[0].get("operator") == "==" for g in b["query"]):
+            shape[-1][0 if kind == "page" else 1] += 1
+        spent.append(kind)
+    check("...no round reads more pages than it goes on to count values",
+          [s for s in shape if s[0] > s[1]], [])
+    check("...apiCalls says what was spent", out.get("apiCalls"), len(api.calls))
+    check("...every count shown is exact", [v for v, c in groups(out).items() if real[v] != c], [])
+    check("...every large group is there", [v for v in real if v.startswith("big") and v not in groups(out)], [])
+    check("...and what is left out is exact, never called complete",
+          (out.get("complete"), out.get("unaccountedRecords")),
+          (False, sum(c for v, c in real.items() if v not in groups(out))))
+    check("...with no fallback to the sample: the rounds worked, the budget ran out",
+          api.pages(PAGE), [])
+    # Values the last round saw and could not afford to count are flagged like any other cap, so
+    # the answer reads as partial for the right reason.
+    check("...values seen and left uncounted are flagged as a cap",
+          (out.get("distinctValuesSeen") > len(out["groups"]), out.get("groupsCapped")),
+          (True, len(out["groups"])))
+
+    # --- inside a digest the rounds after the first get a smaller allowance -----------------------
+    # A digest's other sections need the rest of the 60 calls a minute, so its breakdown may not
+    # spend what a lone `summary` may. The first round is not held to it: that costs what the sample
+    # method did, value for value.
+    full_groups = len(out["groups"])
+    api = _FakeCmdb(tail)
+    monkeypatch.setattr(m, "call", api.call)
+    monkeypatch.setattr(m, "field_type", lambda t, f: "String")
+    out = m.summarize_by("asset", "Tag", call_budget=m.SUMMARY_DIGEST_CALL_BUDGET)
+    check("digest allowance: the breakdown stays inside it",
+          len(api.calls) <= m.SUMMARY_DIGEST_CALL_BUDGET, True)
+    check("...it is the later rounds that give way", 0 < len(out["groups"]) < full_groups, True)
+    check("...every count shown is still exact", [v for v, c in groups(out).items() if real[v] != c], [])
+    check("...and what is left out is still exact", out.get("unaccountedRecords"),
+          sum(c for v, c in real.items() if v not in groups(out)))
+    api = _FakeCmdb(wide)
+    monkeypatch.setattr(m, "call", api.call)
+    out = m.summarize_by("asset", "Tag", call_budget=m.SUMMARY_DIGEST_CALL_BUDGET)
+    check("...the first round is not held to it: a wide field still gets the full cap",
+          len(out["groups"]), m.SUMMARY_MAX_GROUPS)
+    # A breakdown cut short under the smaller allowance is not what `summary` would return, so it
+    # must not sit in the cache for `summary` to be served. A complete one is the same either way.
+    monkeypatch.delenv("MERIDIAN_NO_CACHE", raising=False)
+    stamp = "2026-09-24T10:12:12Z"
+
+    def cached(by):
+        return m.rescache_get("summary_by", m.RESCACHE_TTL, table="asset", by=by, where=[],
+                              rebuilt=stamp)[0] is not None
+    m.drop_rescache()
+    monkeypatch.setattr(m, "call", _FakeCmdb(tail).call)
+    m.summarize_by("asset", "Tag", call_budget=m.SUMMARY_DIGEST_CALL_BUDGET, rebuilt=stamp)
+    check("a breakdown cut short under the digest allowance is not cached", cached("Tag"), False)
+    m.summarize_by("asset", "Tag", refresh=True, rebuilt=stamp)
+    check("...the same breakdown under the full allowance is", cached("Tag"), True)
+    monkeypatch.setattr(m, "call", _FakeCmdb(tiers).call)
+    m.summarize_by("asset", "Tier", call_budget=m.SUMMARY_DIGEST_CALL_BUDGET, rebuilt=stamp)
+    check("...and a complete one is cached whatever its allowance", cached("Tier"), True)
+    m.drop_rescache()
+    passed = {}
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "summarize_by", lambda *a_, **k: passed.update(k) or {"groups": []})
+        mp.setattr(m, "stack_metrics", lambda: {"metrics": {}})
+        mp.setattr(m, "summarize_connectors", lambda *a_, **k: {"summary": {}})
+        mp.setattr(m, "top_n", lambda *a_, **k: {"top": []})
+        mp.setattr(m, "ldg_rebuild", lambda: {})
+        m.build_digest("asset")
+    check("a digest gives its breakdown the smaller allowance", passed.get("call_budget"),
+          m.SUMMARY_DIGEST_CALL_BUDGET)
+
+    # --- the round limit: stop, and state the remainder -------------------------------------------
+    blocks = []
+    for i in range(6):
+        blocks += [{"Tag": "b%d" % i}] * 100
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "SUMMARY_SAMPLE_PAGES", 1)        # one page a round: each round finds one block
+        api, out = run(blocks, "Tag")
+    check("round limit: it stops after SUMMARY_ROUNDS", out.get("discoveryRounds"), m.SUMMARY_ROUNDS)
+    check("...with the values found counted exactly", groups(out),
+          {"b%d" % i: 100 for i in range(m.SUMMARY_ROUNDS)})
+    check("...and the rest stated", (out.get("complete"), out.get("unaccountedRecords")),
+          (False, 100 * (6 - m.SUMMARY_ROUNDS)))
+
+    # --- a failed count: named, never complete, and no further round is built on it ---------------
+    api = _FakeCmdb(tiers)
+    api.fail = lambda b: any(c.get("operator") == "==" and c.get("value") == "med"
+                             for g in b["query"] for c in g)
+    monkeypatch.setattr(m, "call", api.call)
+    monkeypatch.setattr(m, "field_type", lambda t, f: "String")
+    out = m.summarize_by("asset", "Tier")
+    check("a failed count is named", out.get("countsUnavailable"), ["med"])
+    check("...the breakdown is not complete", out.get("complete"), False)
+    check("...the count that worked is kept", groups(out), {"low": 2000})
+    check("...and no remainder is asked for from an unknown", [b for b in api.calls
+                                                               if _FakeCmdb.negated(b, "Tier")], [])
+
+    # --- nothing to read, and a result smaller than one round -------------------------------------
+    api, out = run([], "Tier")
+    check("an empty result reads no page", (len(api.calls), out.get("groups"), out.get("discoveryRounds")),
+          (2, [], 0))
+    api, out = run([{"Tier": "low"}] * 20 + [{"Tier": "med"}] * 10, "Tier")
+    check("a small result is read whole and is complete", (groups(out), out.get("complete")),
+          ({"low": 20, "med": 10}, True))
+
+    # --- a dotted field has no gate to take a remainder of: it reads the sample -------------------
+    api, out = run([{"Details": [{"OS": "Linux"}]}] * 60 + [{"Details": [{"OS": "Windows"}]}] * 40,
+                   "Details.OS")
+    check("nested: no round is run", ("discoveryRounds" in out, len(api.pages(ROUND))), (False, 0))
+    check("nested: the sample page is read", len(api.pages(PAGE)), 1)
+
+    # --- the snapshot warning quotes the measured cost --------------------------------------------
+    w = m._breakdown_cost_warnings([{"by": "Tag", "distinctValuesSeen": 20, "apiCalls": 37}])
+    check("a snapshot warns with what the breakdown counted itself spending", w[0]["estimatedCalls"], 37)
+    w = m._breakdown_cost_warnings([{"by": "Tag", "distinctValuesSeen": 20}])
+    check("...and a record from before that key gets the sample method's arithmetic",
+          w[0]["estimatedCalls"], 2 + m.SUMMARY_SAMPLE_PAGES + 20)
+    check("the snapshot record keeps the measured cost", m._snapshot_breakdown(out).get("apiCalls"),
+          out.get("apiCalls"))
 
 
 def test_transport(m, monkeypatch):
@@ -3452,7 +3895,7 @@ def test_snapshots(m, monkeypatch, tmp_path):
     r6 = m.snapshot_record(d)
     w = r6["warnings"][0]
     check("expensive breakdown is flagged", w["breakdown"], "OS")
-    check("...with the measured call cost, not a vague caution", w["estimatedCalls"], 49)
+    check("...with the measured call cost, not a vague caution", w["estimatedCalls"], 50)
     check("...and points at the one-call alternative", "metric" in w["warning"], True)
     check("a 3-group breakdown warns about nothing", "warnings" in rec, False)
 
@@ -3464,7 +3907,7 @@ def test_snapshots(m, monkeypatch, tmp_path):
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         m.take_snapshot(table="asset", by="OS")
-    check("a repeat of an expensive breakdown warns BEFORE running", "49 of the 60 calls" in err.getvalue(), True)
+    check("a repeat of an expensive breakdown warns BEFORE running", "50 of the 60 calls" in err.getvalue(), True)
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         m.take_snapshot(table="asset", by="Risk_Level")
@@ -8639,6 +9082,73 @@ def test_schedule_run(m, monkeypatch, tmp_path):
     check("...and one snapshot in the job's own history",
           len(m.load_snapshots(os.path.join(d, "snapshots.demo.example.com.jsonl"))[0]), 1)
     check("...with no rules, alerts say so rather than nothing", res.get("alerts"), {"rules": 0})
+    history = os.path.join(d, "snapshots.demo.example.com.jsonl")
+    check("...and the snapshot carries the run that wrote it",
+          m.load_snapshots(history)[0][-1].get("run"), res["run"])
+    m.take_snapshot(digest=m.build_digest())
+    check("a snapshot taken by hand carries no run", "run" in m.load_snapshots(history)[0][-1], False)
+
+    # --- the clock steps back mid-run -----------------------------------------------------------
+    # A scheduler's host has its clock corrected as a matter of course. "Written" used to compare the
+    # snapshot's takenAt with the run's start, two wall-clock strings at one-second resolution, so a
+    # step back of a few milliseconds across a second boundary reported a written snapshot as missing
+    # (seen once in CI, on a run where every other check passed), and a larger step credited a run
+    # with an earlier run's snapshot.
+    import time as _real
+
+    class _Clock:
+        """meridian's view of `time`. Every reading is `shift` seconds off; with `first`, the first
+        reading is taken 2 ms past a second boundary and the rest `shift` away from that."""
+
+        def __init__(self, shift, first=False):
+            self.shift, self.first, self.n = shift, first, 0
+            self.base = float(int(_real.time())) + 0.002
+
+        def time(self):
+            self.n += 1
+            if not self.first:
+                return _real.time() + self.shift
+            return self.base if self.n == 1 else self.base + self.shift + 0.0001 * self.n
+
+        def gmtime(self, t=None):
+            return _real.gmtime(self.time() if t is None else t)
+
+        def __getattr__(self, name):
+            return getattr(_real, name)
+
+    for label, back in [("5 ms across a second boundary", 0.005), ("an hour", 3600.0)]:
+        _sched_home(m, monkeypatch, tmp_path)
+        _sched_digest(m, monkeypatch)
+        with monkeypatch.context() as mp:
+            mp.setattr(m, "time", _Clock(-back, first=True))
+            res = m.schedule_run("demo.example.com")
+        check("clock back %s: the snapshot the run wrote is still reported written" % label,
+              (res["exit"], res["ok"], res["snapshotWritten"]), (0, True, True))
+        check("...and its duration is not negative", res["durationS"] >= 0, True)
+
+    # The other direction. An earlier run's snapshot is in the file, the clock is then set back an
+    # hour, and a run that appends nothing must not be credited with it.
+    _sched_home(m, monkeypatch, tmp_path)
+    _sched_digest(m, monkeypatch)
+    earlier = m.schedule_run("demo.example.com")
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "time", _Clock(-3600.0))
+        mp.setattr(m, "take_snapshot", lambda *a, **k: {"written": True, "stackDate": "2026-08-05"})
+        res = m.schedule_run("demo.example.com")
+    check("clock back an hour: an earlier run's snapshot is not credited to a run that wrote none",
+          (earlier["snapshotWritten"], res["snapshotWritten"], res["exit"]), (True, False, 1))
+
+    # At the retention cap every append also drops the oldest record, so the file is the same length
+    # afterwards, and with a stubbed digest the records are the same too. The run id still tells them apart.
+    d = _sched_home(m, monkeypatch, tmp_path)
+    _sched_digest(m, monkeypatch)
+    with monkeypatch.context() as mp:
+        mp.setattr(m, "SNAPSHOT_MAX_RECORDS", 2)
+        runs = [m.schedule_run("demo.example.com") for _ in range(4)]
+    check("at the retention cap each run still finds its own snapshot",
+          [r["snapshotWritten"] for r in runs], [True] * 4)
+    check("...with the history held at the cap",
+          len(m.load_snapshots(os.path.join(d, "snapshots.demo.example.com.jsonl"))[0]), 2)
 
     # --- the wrong stack is refused, and nothing is written anywhere ----------------------------
     d = _sched_home(m, monkeypatch, tmp_path, fqdn="other.example.com")
@@ -9895,13 +10405,15 @@ def test_review_2026_10_19(m, monkeypatch, tmp_path):
                                        for r in page(100, 100 * body["paging"]["page"])]})
     monkeypatch.setattr(m, "count_records", lambda t, q: 1000 if not any(
         c.get("searchFieldName") == "OS" and c.get("operator") == "==" for grp in q for c in grp) else 333)
+    _sample_only(m, monkeypatch)     # this pins the sample path's pages; the rounds have their own test
     out = m.summarize_by("asset", "OS", refresh=True)
     check("summary still discovers every sampled value", sorted(g["value"] for g in out["groups"]),
           ["OS0", "OS1", "OS2"])
     check("...from the whole sample", out["sampledForValues"], 800)
-    # Page 0 comes back raw on purpose (its totalRecords sizes the sample); the 7 sampled pages may not.
-    check("...and only page 0 came back from its task as a raw page",
-          sum(1 for r in seen if isinstance(r, dict) and "data" in r), 1)
+    # Page 0 used to come back raw, because its totalRecords sized the sample. A count does that now,
+    # so page 0 is one of the sampled pages and is reduced inside its task like the rest.
+    check("...and no page came back from its task as a raw page",
+          sum(1 for r in seen if isinstance(r, dict) and "data" in r), 0)
     monkeypatch.setattr(m, "parallel", real_parallel)
 
     # --- P4: identical messages, with the scrub paid once per distinct line -----------------------
